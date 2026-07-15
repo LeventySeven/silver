@@ -127,7 +127,7 @@ fn incompatible_launch_mode_error(flags: &Flags) -> Option<&'static str> {
     }
 
     // The WebGPU preset is Chrome launch flags; it cannot be applied to a
-    // browser agent-browser did not launch. Rejecting (rather than silently
+    // browser silver did not launch. Rejecting (rather than silently
     // ignoring) matches the --extension handling above. `--webgpu false`
     // overrides an env/config-enabled preset for these modes.
     if flags.webgpu && flags.cdp.is_some() {
@@ -246,7 +246,7 @@ fn run_interactive_confirmations(
     output_opts: &OutputOptions,
 ) -> Response {
     while let Some(prompt) = confirmation_prompt_from_response(&resp) {
-        eprintln!("[agent-browser] Action requires confirmation:");
+        eprintln!("[silver] Action requires confirmation:");
         if prompt.category.is_empty() {
             eprintln!("  {}", prompt.description);
         } else {
@@ -555,7 +555,7 @@ fn run_session_info(session: &str, json_mode: bool) {
             "success": true,
             "data": {
                 "session": session,
-                "namespace": env::var("AGENT_BROWSER_NAMESPACE").ok(),
+                "namespace": env::var("SILVER_NAMESPACE").ok(),
                 "socketDir": get_socket_dir().to_string_lossy(),
                 "active": active.is_some(),
                 "pid": active.map(|s| s.pid),
@@ -569,7 +569,7 @@ fn run_session_info(session: &str, json_mode: bool) {
 
     println!("Session: {}", session);
     println!("Socket dir: {}", get_socket_dir().to_string_lossy());
-    if let Ok(namespace) = env::var("AGENT_BROWSER_NAMESPACE") {
+    if let Ok(namespace) = env::var("SILVER_NAMESPACE") {
         println!("Namespace: {}", namespace);
     }
     if let Some(active) = active {
@@ -693,8 +693,8 @@ fn run_dashboard_start(port: u16, json_mode: bool) {
     };
 
     let mut cmd = std::process::Command::new(&exe_path);
-    cmd.env("AGENT_BROWSER_DASHBOARD", "1")
-        .env("AGENT_BROWSER_DASHBOARD_PORT", port.to_string());
+    cmd.env("SILVER_DASHBOARD", "1")
+        .env("SILVER_DASHBOARD_PORT", port.to_string());
 
     #[cfg(unix)]
     {
@@ -904,23 +904,23 @@ fn main() {
         env::set_var("MSYS2_ARG_CONV_EXCL", "*");
     }
 
-    // Native daemon mode: when AGENT_BROWSER_DAEMON is set, run as the daemon process
-    if env::var("AGENT_BROWSER_DAEMON").is_ok() {
+    // Native daemon mode: when SILVER_DAEMON is set, run as the daemon process
+    if env::var("SILVER_DAEMON").is_ok() {
         // Ignore SIGPIPE so the daemon isn't killed when the parent drops
         // the piped stderr handle after confirming the daemon is ready.
         #[cfg(unix)]
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         }
-        let session = env::var("AGENT_BROWSER_SESSION").unwrap_or_else(|_| "default".to_string());
+        let session = env::var("SILVER_SESSION").unwrap_or_else(|_| "default".to_string());
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         rt.block_on(native::daemon::run_daemon(&session));
         return;
     }
 
     // Standalone dashboard server mode
-    if env::var("AGENT_BROWSER_DASHBOARD").is_ok() {
-        let port: u16 = env::var("AGENT_BROWSER_DASHBOARD_PORT")
+    if env::var("SILVER_DASHBOARD").is_ok() {
+        let port: u16 = env::var("SILVER_DASHBOARD_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(4848);
@@ -935,7 +935,7 @@ fn main() {
         flags.restore = Some(flags.session.clone());
     }
     if let Some(ref namespace) = flags.namespace {
-        env::set_var("AGENT_BROWSER_NAMESPACE", namespace);
+        env::set_var("SILVER_NAMESPACE", namespace);
     }
     let clean = clean_args(&args);
 
@@ -983,7 +983,7 @@ fn main() {
             quick: args.iter().any(|a| a == "--quick"),
             fix: args.iter().any(|a| a == "--fix"),
             json: flags.json,
-            // Explicit CLI opt-in only: a global AGENT_BROWSER_WEBGPU/config
+            // Explicit CLI opt-in only: a global SILVER_WEBGPU/config
             // "webgpu": true must not make every doctor run launch the extra
             // Chrome probe (and fail on hosts missing Vulkan deps).
             webgpu: flags.cli_webgpu && flags.webgpu,
@@ -1468,9 +1468,9 @@ fn main() {
             "action": "launch",
         });
         // Only send headless when the user set it on this invocation. When
-        // absent, the daemon falls back to its spawn-time AGENT_BROWSER_HEADED
+        // absent, the daemon falls back to its spawn-time SILVER_HEADED
         // env, so a follow-up command without --headed (common when env vars
-        // like AGENT_BROWSER_ARGS force a launch command on every call) does
+        // like SILVER_ARGS force a launch command on every call) does
         // not flip a headed session back to headless and relaunch the browser
         // onto about:blank.
         if flags.headed || flags.cli_headed {
@@ -2003,7 +2003,7 @@ mod tests {
 
     fn launch_mode_flags(auto_connect: bool, cdp: bool, provider: bool, extensions: bool) -> Flags {
         let mut flags = parse_flags(&[]);
-        // Deterministic regardless of ambient AGENT_BROWSER_WEBGPU.
+        // Deterministic regardless of ambient SILVER_WEBGPU.
         flags.webgpu = false;
         flags.auto_connect = auto_connect;
         flags.cdp = cdp.then(|| "9222".to_string());

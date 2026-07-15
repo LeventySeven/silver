@@ -48,12 +48,12 @@ impl ParseError {
             }
             ParseError::MissingArguments { context, usage } => {
                 format!(
-                    "Missing arguments for: {}\nUsage: agent-browser {}",
+                    "Missing arguments for: {}\nUsage: silver {}",
                     context, usage
                 )
             }
             ParseError::InvalidValue { message, usage } => {
-                format!("{}\nUsage: agent-browser {}", message, usage)
+                format!("{}\nUsage: silver {}", message, usage)
             }
             ParseError::InvalidSessionName { name } => session_name_error(name),
         }
@@ -311,7 +311,7 @@ fn parse_cookie_header(header: &str) -> Result<Vec<Value>, String> {
 pub fn parse_command(args: &[String], flags: &Flags) -> Result<Value, ParseError> {
     let mut result = parse_command_inner(args, flags)?;
 
-    // Inject AGENT_BROWSER_DEFAULT_TIMEOUT into any wait-family command that
+    // Inject SILVER_DEFAULT_TIMEOUT into any wait-family command that
     // doesn't already carry an explicit timeout. Centralised here so that new
     // wait variants automatically inherit the default without per-variant wiring.
     if let Some(action) = result.get("action").and_then(|a| a.as_str()) {
@@ -945,7 +945,7 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                 Some("save") => {
                     let name = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
                         context: "auth save".to_string(),
-                        usage: "agent-browser auth save <name> --url <url> --username <user> --password <pass>",
+                        usage: "silver auth save <name> --url <url> --username <user> --password <pass>",
                     })?;
 
                     let mut url = None;
@@ -990,7 +990,7 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                                 if other.starts_with("--") {
                                     return Err(ParseError::InvalidValue {
                                         message: format!("unknown flag '{}' for auth save", other),
-                                        usage: "agent-browser auth save <name> --url <url> --username <user> --password <pass>",
+                                        usage: "silver auth save <name> --url <url> --username <user> --password <pass>",
                                     });
                                 }
                             }
@@ -1000,17 +1000,17 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
 
                     let url_val = url.ok_or_else(|| ParseError::MissingArguments {
                         context: "auth save".to_string(),
-                        usage: "agent-browser auth save <name> --url <url> --username <user> --password <pass> [--password-stdin]",
+                        usage: "silver auth save <name> --url <url> --username <user> --password <pass> [--password-stdin]",
                     })?;
                     let user_val = username.ok_or_else(|| ParseError::MissingArguments {
                         context: "auth save".to_string(),
-                        usage: "agent-browser auth save <name> --url <url> --username <user> --password <pass> [--password-stdin]",
+                        usage: "silver auth save <name> --url <url> --username <user> --password <pass> [--password-stdin]",
                     })?;
 
                     if !password_stdin && password.is_none() {
                         return Err(ParseError::MissingArguments {
                             context: "auth save".to_string(),
-                            usage: "agent-browser auth save <name> --url <url> --username <user> --password <pass> [--password-stdin]",
+                            usage: "silver auth save <name> --url <url> --username <user> --password <pass> [--password-stdin]",
                         });
                     }
 
@@ -1039,7 +1039,7 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     Ok(cmd)
                 }
                 Some("login") => {
-                    const AUTH_LOGIN_USAGE: &str = "agent-browser auth login <name> [--credential-provider <plugin>] [--item <ref>] [--url <url>] [--username-selector <s>] [--password-selector <s>] [--submit-selector <s>]";
+                    const AUTH_LOGIN_USAGE: &str = "silver auth login <name> [--credential-provider <plugin>] [--item <ref>] [--url <url>] [--username-selector <s>] [--password-selector <s>] [--submit-selector <s>]";
                     let name = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
                         context: "auth login".to_string(),
                         usage: AUTH_LOGIN_USAGE,
@@ -1157,14 +1157,14 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                 Some("delete") | Some("remove") => {
                     let name = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
                         context: "auth delete".to_string(),
-                        usage: "agent-browser auth delete <name>",
+                        usage: "silver auth delete <name>",
                     })?;
                     Ok(json!({ "id": id, "action": "auth_delete", "name": name }))
                 }
                 Some("show") => {
                     let name = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
                         context: "auth show".to_string(),
-                        usage: "agent-browser auth show <name>",
+                        usage: "silver auth show <name>",
                     })?;
                     Ok(json!({ "id": id, "action": "auth_show", "name": name }))
                 }
@@ -1179,14 +1179,14 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
         "confirm" => {
             let cid = rest.first().ok_or_else(|| ParseError::MissingArguments {
                 context: "confirm".to_string(),
-                usage: "agent-browser confirm <confirmation-id>",
+                usage: "silver confirm <confirmation-id>",
             })?;
             Ok(json!({ "id": id, "action": "confirm", "confirmationId": cid }))
         }
         "deny" => {
             let cid = rest.first().ok_or_else(|| ParseError::MissingArguments {
                 context: "deny".to_string(),
-                usage: "agent-browser deny <confirmation-id>",
+                usage: "silver deny <confirmation-id>",
             })?;
             Ok(json!({ "id": id, "action": "deny", "confirmationId": cid }))
         }
@@ -4857,7 +4857,7 @@ mod tests {
         assert_eq!(cmd["path"], "./file.pdf");
     }
 
-    // === Default timeout (AGENT_BROWSER_DEFAULT_TIMEOUT) tests ===
+    // === Default timeout (SILVER_DEFAULT_TIMEOUT) tests ===
 
     fn flags_with_default_timeout(ms: u64) -> Flags {
         let mut f = default_flags();

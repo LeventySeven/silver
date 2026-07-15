@@ -27,7 +27,7 @@ pub(super) fn check(checks: &mut Vec<Check>) {
     };
 
     let client = match reqwest::Client::builder()
-        .user_agent(format!("agent-browser/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("silver/{}", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(3))
         .connect_timeout(Duration::from_secs(3))
         .build()
@@ -70,7 +70,7 @@ pub(super) fn check(checks: &mut Vec<Check>) {
         );
     }
 
-    if let Ok(provider) = env::var("AGENT_BROWSER_PROVIDER") {
+    if let Ok(provider) = env::var("SILVER_PROVIDER") {
         let url: Option<String> = match provider.to_lowercase().as_str() {
             "browserbase" => Some("https://api.browserbase.com".to_string()),
             "browserless" => Some(

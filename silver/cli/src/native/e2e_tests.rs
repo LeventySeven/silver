@@ -136,7 +136,7 @@ async fn create_restore_state_with_cookie(
 }
 
 fn cleanup_restore_state_files(restore_key: &str) {
-    let Some(sessions_dir) = dirs::home_dir().map(|home| home.join(".agent-browser/sessions"))
+    let Some(sessions_dir) = dirs::home_dir().map(|home| home.join(".silver/sessions"))
     else {
         return;
     };
@@ -321,10 +321,10 @@ async fn e2e_lightpanda_auto_launch_can_open_page() {
         _ => return,
     };
 
-    let prev_engine = std::env::var("AGENT_BROWSER_ENGINE").ok();
-    let prev_path = std::env::var("AGENT_BROWSER_EXECUTABLE_PATH").ok();
-    std::env::set_var("AGENT_BROWSER_ENGINE", "lightpanda");
-    std::env::set_var("AGENT_BROWSER_EXECUTABLE_PATH", &lightpanda_bin);
+    let prev_engine = std::env::var("SILVER_ENGINE").ok();
+    let prev_path = std::env::var("SILVER_EXECUTABLE_PATH").ok();
+    std::env::set_var("SILVER_ENGINE", "lightpanda");
+    std::env::set_var("SILVER_EXECUTABLE_PATH", &lightpanda_bin);
 
     let mut state = DaemonState::new();
 
@@ -339,12 +339,12 @@ async fn e2e_lightpanda_auto_launch_can_open_page() {
     .expect("Lightpanda auto-launch should not hang");
 
     match prev_engine {
-        Some(value) => std::env::set_var("AGENT_BROWSER_ENGINE", value),
-        None => std::env::remove_var("AGENT_BROWSER_ENGINE"),
+        Some(value) => std::env::set_var("SILVER_ENGINE", value),
+        None => std::env::remove_var("SILVER_ENGINE"),
     }
     match prev_path {
-        Some(value) => std::env::set_var("AGENT_BROWSER_EXECUTABLE_PATH", value),
-        None => std::env::remove_var("AGENT_BROWSER_EXECUTABLE_PATH"),
+        Some(value) => std::env::set_var("SILVER_EXECUTABLE_PATH", value),
+        None => std::env::remove_var("SILVER_EXECUTABLE_PATH"),
     }
 
     assert_success(&resp);
@@ -363,9 +363,9 @@ async fn e2e_lightpanda_auto_launch_can_open_page() {
 #[tokio::test]
 #[ignore]
 async fn e2e_runtime_stream_enable_before_launch_attaches_and_disables() {
-    let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+    let guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "SILVER_SESSION"]);
     let socket_dir = std::env::temp_dir().join(format!(
-        "agent-browser-e2e-stream-{}-{}",
+        "silver-e2e-stream-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -374,10 +374,10 @@ async fn e2e_runtime_stream_enable_before_launch_attaches_and_disables() {
     ));
     std::fs::create_dir_all(&socket_dir).expect("socket dir should be created");
     guard.set(
-        "AGENT_BROWSER_SOCKET_DIR",
+        "SILVER_SOCKET_DIR",
         socket_dir.to_str().expect("socket dir should be utf-8"),
     );
-    guard.set("AGENT_BROWSER_SESSION", "e2e-runtime-stream");
+    guard.set("SILVER_SESSION", "e2e-runtime-stream");
 
     let mut state = DaemonState::new();
 
@@ -481,7 +481,7 @@ async fn e2e_runtime_stream_enable_before_launch_attaches_and_disables() {
 #[tokio::test]
 #[ignore]
 async fn e2e_stream_command_requires_same_origin_before_daemon_relay() {
-    let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+    let guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "SILVER_SESSION"]);
     let temp_parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join("t");
@@ -491,13 +491,13 @@ async fn e2e_stream_command_requires_same_origin_before_daemon_relay() {
         .tempdir_in(temp_parent)
         .expect("socket dir should be created");
     guard.set(
-        "AGENT_BROWSER_SOCKET_DIR",
+        "SILVER_SOCKET_DIR",
         socket_dir
             .path()
             .to_str()
             .expect("socket dir should be utf-8"),
     );
-    guard.set("AGENT_BROWSER_SESSION", "x");
+    guard.set("SILVER_SESSION", "x");
 
     let mut state = DaemonState::new();
     let resp = execute_command(
@@ -668,7 +668,7 @@ async fn e2e_screenshot() {
 
     // Named screenshot
     let tmp_path = std::env::temp_dir()
-        .join("agent-browser-e2e-test-screenshot.png")
+        .join("silver-e2e-test-screenshot.png")
         .to_string_lossy()
         .to_string();
     let resp = execute_command(
@@ -721,7 +721,7 @@ async fn e2e_screenshot() {
         &json!({
             "id": "7",
             "action": "evaluate",
-            "script": "document.getElementById('__agent_browser_annotations__') === null"
+            "script": "document.getElementById('__silver_annotations__') === null"
         }),
         &mut state,
     )
@@ -2261,7 +2261,7 @@ async fn e2e_state_management() {
 
     // Save state
     let tmp_state = std::env::temp_dir()
-        .join("agent-browser-e2e-state.json")
+        .join("silver-e2e-state.json")
         .to_string_lossy()
         .to_string();
     let resp = execute_command(
@@ -2369,7 +2369,7 @@ async fn e2e_save_state_cross_domain() {
 
     // Save state (currently on example.com)
     let tmp_state = std::env::temp_dir()
-        .join("agent-browser-e2e-cross-domain-state.json")
+        .join("silver-e2e-cross-domain-state.json")
         .to_string_lossy()
         .to_string();
     let resp = execute_command(
@@ -2852,7 +2852,7 @@ async fn e2e_click_reports_covering_overlay() {
 #[ignore]
 async fn e2e_profile_cookie_persistence() {
     let profile_dir = std::env::temp_dir().join(format!(
-        "agent-browser-e2e-profile-{}",
+        "silver-e2e-profile-{}",
         uuid::Uuid::new_v4()
     ));
 
@@ -4439,7 +4439,7 @@ async fn e2e_headers_case_insensitive_no_duplicates() {
 // Regression: externally opened tabs must appear in tab_list (#1037)
 //
 // When connected to Chrome (launched or via --cdp), a tab opened outside of
-// agent-browser (e.g. by the user or another CDP client) should be detected
+// silver (e.g. by the user or another CDP client) should be detected
 // and listed. Previously, chrome://newtab/ was filtered by
 // is_internal_chrome_target, and Target.targetInfoChanged for untracked
 // targets was silently ignored.
@@ -4465,7 +4465,7 @@ async fn e2e_externally_opened_tab_detected() {
 
     // Simulate an external client opening a new tab via the browser-level CDP
     // session (no sessionId). This mirrors what happens when a user manually
-    // opens a tab while agent-browser is connected via --cdp.
+    // opens a tab while silver is connected via --cdp.
     let browser = state.browser.as_ref().expect("browser should be launched");
     let _: Value = browser
         .client
@@ -4558,7 +4558,7 @@ async fn e2e_relaunch_on_options_change() {
             "id": "3",
             "action": "launch",
             "headless": true,
-            "userAgent": "agent-browser-test/1.0"
+            "userAgent": "silver-test/1.0"
         }),
         &mut state,
     )
@@ -4580,9 +4580,9 @@ async fn e2e_relaunch_on_options_change() {
 #[tokio::test]
 #[ignore]
 async fn e2e_stream_frame_metadata_respects_custom_viewport() {
-    let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+    let guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "SILVER_SESSION"]);
     let socket_dir = std::env::temp_dir().join(format!(
-        "agent-browser-e2e-stream-viewport-{}-{}",
+        "silver-e2e-stream-viewport-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4591,10 +4591,10 @@ async fn e2e_stream_frame_metadata_respects_custom_viewport() {
     ));
     std::fs::create_dir_all(&socket_dir).expect("socket dir should be created");
     guard.set(
-        "AGENT_BROWSER_SOCKET_DIR",
+        "SILVER_SOCKET_DIR",
         socket_dir.to_str().expect("socket dir should be utf-8"),
     );
-    guard.set("AGENT_BROWSER_SESSION", "e2e-stream-viewport");
+    guard.set("SILVER_SESSION", "e2e-stream-viewport");
 
     let mut state = DaemonState::new();
 
@@ -4888,7 +4888,7 @@ async fn e2e_recording_inherits_viewport() {
 /// Verify that launching with `storageState` in the launch command restores
 /// cookies that were previously saved with `state_save`.
 ///
-/// This is the e2e equivalent of `agent-browser --state ./auth.json open <url>`.
+/// This is the e2e equivalent of `silver --state ./auth.json open <url>`.
 /// The launch command accepts a `storageState` field that should load the
 /// state file (cookies + localStorage) before the first navigation.
 #[tokio::test]
@@ -4896,7 +4896,7 @@ async fn e2e_recording_inherits_viewport() {
 async fn e2e_state_flag_restores_cookies() {
     let state_path = std::env::temp_dir()
         .join(format!(
-            "agent-browser-e2e-state-flag-{}.json",
+            "silver-e2e-state-flag-{}.json",
             uuid::Uuid::new_v4()
         ))
         .to_string_lossy()
@@ -5004,7 +5004,7 @@ async fn e2e_state_flag_missing_file_fails_launch() {
 
     let missing_path = std::env::temp_dir()
         .join(format!(
-            "agent-browser-e2e-missing-state-{}.json",
+            "silver-e2e-missing-state-{}.json",
             uuid::Uuid::new_v4()
         ))
         .to_string_lossy()
@@ -5044,14 +5044,14 @@ async fn e2e_state_flag_missing_file_fails_launch() {
 async fn e2e_storage_state_launch_restarts_clean_browser() {
     let state_one = std::env::temp_dir()
         .join(format!(
-            "agent-browser-e2e-storage-reuse-1-{}.json",
+            "silver-e2e-storage-reuse-1-{}.json",
             uuid::Uuid::new_v4()
         ))
         .to_string_lossy()
         .to_string();
     let state_two = std::env::temp_dir()
         .join(format!(
-            "agent-browser-e2e-storage-reuse-2-{}.json",
+            "silver-e2e-storage-reuse-2-{}.json",
             uuid::Uuid::new_v4()
         ))
         .to_string_lossy()
@@ -5144,7 +5144,7 @@ async fn e2e_storage_state_launch_restarts_clean_browser() {
     let _ = std::fs::remove_file(&state_two);
 }
 
-/// Verify that AGENT_BROWSER_STATE env var restores cookies at auto-launch
+/// Verify that SILVER_STATE env var restores cookies at auto-launch
 /// time (when the browser is lazily launched by a command like `navigate`
 /// rather than an explicit `launch` command).
 #[tokio::test]
@@ -5152,7 +5152,7 @@ async fn e2e_storage_state_launch_restarts_clean_browser() {
 async fn e2e_state_env_restores_cookies_on_auto_launch() {
     let state_path = std::env::temp_dir()
         .join(format!(
-            "agent-browser-e2e-state-env-{}.json",
+            "silver-e2e-state-env-{}.json",
             uuid::Uuid::new_v4()
         ))
         .to_string_lossy()
@@ -5202,12 +5202,12 @@ async fn e2e_state_env_restores_cookies_on_auto_launch() {
         assert_success(&resp);
     }
 
-    // Session 2: set AGENT_BROWSER_STATE env var and let auto_launch pick it
+    // Session 2: set SILVER_STATE env var and let auto_launch pick it
     // up. No explicit `launch` command — just navigate, which triggers
     // auto_launch internally.
     {
-        let env = EnvGuard::new(&["AGENT_BROWSER_STATE"]);
-        env.set("AGENT_BROWSER_STATE", &state_path);
+        let env = EnvGuard::new(&["SILVER_STATE"]);
+        env.set("SILVER_STATE", &state_path);
 
         let mut state = DaemonState::new();
 
@@ -5228,7 +5228,7 @@ async fn e2e_state_env_restores_cookies_on_auto_launch() {
             .any(|c| c["name"] == "env_state_test" && c["value"] == "from_env_state");
         assert!(
             found,
-            "Cookie should be restored via AGENT_BROWSER_STATE env on auto-launch. \
+            "Cookie should be restored via SILVER_STATE env on auto-launch. \
              Cookies found: {:?}",
             cookies
                 .iter()
@@ -5253,8 +5253,8 @@ async fn e2e_session_name_auto_restores_cookies() {
         &uuid::Uuid::new_v4().to_string()[..8]
     );
 
-    let env = EnvGuard::new(&["AGENT_BROWSER_SESSION_NAME"]);
-    env.set("AGENT_BROWSER_SESSION_NAME", &session_name);
+    let env = EnvGuard::new(&["SILVER_SESSION_NAME"]);
+    env.set("SILVER_SESSION_NAME", &session_name);
 
     // Session 1: launch, set a cookie, close (which auto-saves state)
     {
@@ -5330,7 +5330,7 @@ async fn e2e_session_name_auto_restores_cookies() {
     // Clean up auto-saved state files
     let sessions_dir = dirs::home_dir()
         .unwrap()
-        .join(".agent-browser")
+        .join(".silver")
         .join("sessions");
     if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
         for entry in entries.flatten() {
@@ -5350,15 +5350,15 @@ async fn e2e_restore_loads_during_explicit_launch_before_navigation() {
         &uuid::Uuid::new_v4().to_string()[..8]
     );
     let env = EnvGuard::new(&[
-        "AGENT_BROWSER_SESSION_NAME",
-        "AGENT_BROWSER_RESTORE_SAVE",
-        "AGENT_BROWSER_STATE",
-        "AGENT_BROWSER_ENCRYPTION_KEY",
+        "SILVER_SESSION_NAME",
+        "SILVER_RESTORE_SAVE",
+        "SILVER_STATE",
+        "SILVER_ENCRYPTION_KEY",
     ]);
-    env.remove("AGENT_BROWSER_SESSION_NAME");
-    env.remove("AGENT_BROWSER_RESTORE_SAVE");
-    env.remove("AGENT_BROWSER_STATE");
-    env.remove("AGENT_BROWSER_ENCRYPTION_KEY");
+    env.remove("SILVER_SESSION_NAME");
+    env.remove("SILVER_RESTORE_SAVE");
+    env.remove("SILVER_STATE");
+    env.remove("SILVER_ENCRYPTION_KEY");
 
     {
         let mut state = DaemonState::new();
@@ -5461,15 +5461,15 @@ async fn e2e_periodic_autosave_survives_abrupt_browser_exit() {
         &uuid::Uuid::new_v4().to_string()[..8]
     );
     let env = EnvGuard::new(&[
-        "AGENT_BROWSER_SESSION_NAME",
-        "AGENT_BROWSER_RESTORE_SAVE",
-        "AGENT_BROWSER_STATE",
-        "AGENT_BROWSER_ENCRYPTION_KEY",
+        "SILVER_SESSION_NAME",
+        "SILVER_RESTORE_SAVE",
+        "SILVER_STATE",
+        "SILVER_ENCRYPTION_KEY",
     ]);
-    env.remove("AGENT_BROWSER_SESSION_NAME");
-    env.remove("AGENT_BROWSER_RESTORE_SAVE");
-    env.remove("AGENT_BROWSER_STATE");
-    env.remove("AGENT_BROWSER_ENCRYPTION_KEY");
+    env.remove("SILVER_SESSION_NAME");
+    env.remove("SILVER_RESTORE_SAVE");
+    env.remove("SILVER_STATE");
+    env.remove("SILVER_ENCRYPTION_KEY");
 
     {
         let mut state = DaemonState::new();
@@ -5620,15 +5620,15 @@ async fn e2e_restore_preserves_cookie_login_after_close_and_reopen() {
         &uuid::Uuid::new_v4().to_string()[..8]
     );
     let env = EnvGuard::new(&[
-        "AGENT_BROWSER_SESSION_NAME",
-        "AGENT_BROWSER_RESTORE_SAVE",
-        "AGENT_BROWSER_STATE",
-        "AGENT_BROWSER_ENCRYPTION_KEY",
+        "SILVER_SESSION_NAME",
+        "SILVER_RESTORE_SAVE",
+        "SILVER_STATE",
+        "SILVER_ENCRYPTION_KEY",
     ]);
-    env.remove("AGENT_BROWSER_SESSION_NAME");
-    env.remove("AGENT_BROWSER_RESTORE_SAVE");
-    env.remove("AGENT_BROWSER_STATE");
-    env.remove("AGENT_BROWSER_ENCRYPTION_KEY");
+    env.remove("SILVER_SESSION_NAME");
+    env.remove("SILVER_RESTORE_SAVE");
+    env.remove("SILVER_STATE");
+    env.remove("SILVER_ENCRYPTION_KEY");
 
     let (base_url, _server) = start_cookie_login_server().await;
 
@@ -5842,15 +5842,15 @@ async fn e2e_restore_key_switch_reloads_instead_of_reusing_live_browser() {
     );
     let cookie_name = "restore_switch_test";
     let env = EnvGuard::new(&[
-        "AGENT_BROWSER_SESSION_NAME",
-        "AGENT_BROWSER_RESTORE_SAVE",
-        "AGENT_BROWSER_STATE",
-        "AGENT_BROWSER_ENCRYPTION_KEY",
+        "SILVER_SESSION_NAME",
+        "SILVER_RESTORE_SAVE",
+        "SILVER_STATE",
+        "SILVER_ENCRYPTION_KEY",
     ]);
-    env.remove("AGENT_BROWSER_SESSION_NAME");
-    env.remove("AGENT_BROWSER_RESTORE_SAVE");
-    env.remove("AGENT_BROWSER_STATE");
-    env.remove("AGENT_BROWSER_ENCRYPTION_KEY");
+    env.remove("SILVER_SESSION_NAME");
+    env.remove("SILVER_RESTORE_SAVE");
+    env.remove("SILVER_STATE");
+    env.remove("SILVER_ENCRYPTION_KEY");
 
     create_restore_state_with_cookie(&restore_key_a, cookie_name, "value-a").await;
     create_restore_state_with_cookie(&restore_key_b, cookie_name, "value-b").await;
@@ -5928,7 +5928,7 @@ async fn e2e_restore_key_switch_reloads_instead_of_reusing_live_browser() {
 async fn e2e_explicit_state_load_restores_cookies() {
     let state_path = std::env::temp_dir()
         .join(format!(
-            "agent-browser-e2e-explicit-load-{}.json",
+            "silver-e2e-explicit-load-{}.json",
             uuid::Uuid::new_v4()
         ))
         .to_string_lossy()
@@ -6099,8 +6099,8 @@ async fn e2e_react_tree_errors_without_hook() {
 #[tokio::test]
 #[ignore]
 async fn e2e_react_tree_with_enable_hook() {
-    let guard = EnvGuard::new(&["AGENT_BROWSER_ENABLE"]);
-    guard.set("AGENT_BROWSER_ENABLE", "react-devtools");
+    let guard = EnvGuard::new(&["SILVER_ENABLE"]);
+    guard.set("SILVER_ENABLE", "react-devtools");
     let mut state = DaemonState::new();
 
     let resp = execute_command(

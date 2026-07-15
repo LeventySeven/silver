@@ -19,7 +19,7 @@ use windows_sys::Win32::Foundation::CloseHandle;
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
-pub(crate) const INTERNAL_DAEMON_SHUTDOWN_ACTION: &str = "__agent_browser_internal_shutdown";
+pub(crate) const INTERNAL_DAEMON_SHUTDOWN_ACTION: &str = "__silver_internal_shutdown";
 
 #[derive(Serialize)]
 #[allow(dead_code)]
@@ -93,40 +93,40 @@ impl Connection {
 }
 
 /// Get the base directory for socket/pid files.
-/// Priority: AGENT_BROWSER_SOCKET_DIR > XDG_RUNTIME_DIR > ~/.agent-browser > tmpdir
+/// Priority: SILVER_SOCKET_DIR > XDG_RUNTIME_DIR > ~/.silver > tmpdir
 pub fn get_socket_dir() -> PathBuf {
     // 1. Explicit override (ignore empty string)
-    let base = if let Ok(dir) = env::var("AGENT_BROWSER_SOCKET_DIR") {
+    let base = if let Ok(dir) = env::var("SILVER_SOCKET_DIR") {
         if !dir.is_empty() {
             PathBuf::from(dir)
         } else if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
             if !runtime_dir.is_empty() {
-                PathBuf::from(runtime_dir).join("agent-browser")
+                PathBuf::from(runtime_dir).join("silver")
             } else if let Some(home) = dirs::home_dir() {
-                home.join(".agent-browser")
+                home.join(".silver")
             } else {
-                env::temp_dir().join("agent-browser")
+                env::temp_dir().join("silver")
             }
         } else if let Some(home) = dirs::home_dir() {
-            home.join(".agent-browser")
+            home.join(".silver")
         } else {
-            env::temp_dir().join("agent-browser")
+            env::temp_dir().join("silver")
         }
     } else if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
         if !runtime_dir.is_empty() {
-            PathBuf::from(runtime_dir).join("agent-browser")
+            PathBuf::from(runtime_dir).join("silver")
         } else if let Some(home) = dirs::home_dir() {
-            home.join(".agent-browser")
+            home.join(".silver")
         } else {
-            env::temp_dir().join("agent-browser")
+            env::temp_dir().join("silver")
         }
     } else if let Some(home) = dirs::home_dir() {
-        home.join(".agent-browser")
+        home.join(".silver")
     } else {
-        env::temp_dir().join("agent-browser")
+        env::temp_dir().join("silver")
     };
 
-    if let Ok(namespace) = env::var("AGENT_BROWSER_NAMESPACE") {
+    if let Ok(namespace) = env::var("SILVER_NAMESPACE") {
         let namespace = sanitize_session_component(&namespace);
         if !namespace.is_empty() {
             return base.join("namespaces").join(namespace).join("run");
@@ -364,7 +364,7 @@ fn get_port_path(session: &str) -> PathBuf {
 
 #[cfg(windows)]
 fn port_identity_for_session(session: &str) -> String {
-    if let Ok(namespace) = env::var("AGENT_BROWSER_NAMESPACE") {
+    if let Ok(namespace) = env::var("SILVER_NAMESPACE") {
         let namespace = sanitize_session_component(&namespace);
         if !namespace.is_empty() {
             return format!("{}:{}", namespace, session);
@@ -466,117 +466,117 @@ pub struct DaemonOptions<'a> {
 }
 
 fn apply_daemon_env(cmd: &mut Command, session: &str, opts: &DaemonOptions) {
-    cmd.env("AGENT_BROWSER_DAEMON", "1")
-        .env("AGENT_BROWSER_SESSION", session);
+    cmd.env("SILVER_DAEMON", "1")
+        .env("SILVER_SESSION", session);
 
     if opts.headed {
-        cmd.env("AGENT_BROWSER_HEADED", "1");
+        cmd.env("SILVER_HEADED", "1");
     }
     if opts.debug {
-        cmd.env("AGENT_BROWSER_DEBUG", "1");
+        cmd.env("SILVER_DEBUG", "1");
     }
     if let Some(path) = opts.executable_path {
-        cmd.env("AGENT_BROWSER_EXECUTABLE_PATH", path);
+        cmd.env("SILVER_EXECUTABLE_PATH", path);
     }
     if !opts.extensions.is_empty() {
-        cmd.env("AGENT_BROWSER_EXTENSIONS", opts.extensions.join(","));
+        cmd.env("SILVER_EXTENSIONS", opts.extensions.join(","));
     }
     if !opts.init_scripts.is_empty() {
-        cmd.env("AGENT_BROWSER_INIT_SCRIPTS", opts.init_scripts.join(","));
+        cmd.env("SILVER_INIT_SCRIPTS", opts.init_scripts.join(","));
     }
     if !opts.enable.is_empty() {
-        cmd.env("AGENT_BROWSER_ENABLE", opts.enable.join(","));
+        cmd.env("SILVER_ENABLE", opts.enable.join(","));
     }
     if let Some(a) = opts.args {
-        cmd.env("AGENT_BROWSER_ARGS", a);
+        cmd.env("SILVER_ARGS", a);
     }
     if let Some(ua) = opts.user_agent {
-        cmd.env("AGENT_BROWSER_USER_AGENT", ua);
+        cmd.env("SILVER_USER_AGENT", ua);
     }
     if let Some(p) = opts.proxy {
-        cmd.env("AGENT_BROWSER_PROXY", p);
+        cmd.env("SILVER_PROXY", p);
     }
     if let Some(pb) = opts.proxy_bypass {
-        cmd.env("AGENT_BROWSER_PROXY_BYPASS", pb);
+        cmd.env("SILVER_PROXY_BYPASS", pb);
     }
     if let Some(pu) = opts.proxy_username {
-        cmd.env("AGENT_BROWSER_PROXY_USERNAME", pu);
+        cmd.env("SILVER_PROXY_USERNAME", pu);
     }
     if let Some(pp) = opts.proxy_password {
-        cmd.env("AGENT_BROWSER_PROXY_PASSWORD", pp);
+        cmd.env("SILVER_PROXY_PASSWORD", pp);
     }
     if opts.ignore_https_errors {
-        cmd.env("AGENT_BROWSER_IGNORE_HTTPS_ERRORS", "1");
+        cmd.env("SILVER_IGNORE_HTTPS_ERRORS", "1");
     }
     if opts.allow_file_access {
-        cmd.env("AGENT_BROWSER_ALLOW_FILE_ACCESS", "1");
+        cmd.env("SILVER_ALLOW_FILE_ACCESS", "1");
     }
     cmd.env(
-        "AGENT_BROWSER_HIDE_SCROLLBARS",
+        "SILVER_HIDE_SCROLLBARS",
         if opts.hide_scrollbars { "1" } else { "0" },
     );
     if opts.webgpu {
-        cmd.env("AGENT_BROWSER_WEBGPU", "1");
+        cmd.env("SILVER_WEBGPU", "1");
     }
     if let Some(prof) = opts.profile {
-        cmd.env("AGENT_BROWSER_PROFILE", prof);
+        cmd.env("SILVER_PROFILE", prof);
     }
     if let Some(st) = opts.state {
-        cmd.env("AGENT_BROWSER_STATE", st);
+        cmd.env("SILVER_STATE", st);
     }
     if let Some(p) = opts.provider {
-        cmd.env("AGENT_BROWSER_PROVIDER", p);
+        cmd.env("SILVER_PROVIDER", p);
     }
     if let Some(d) = opts.device {
-        cmd.env("AGENT_BROWSER_IOS_DEVICE", d);
+        cmd.env("SILVER_IOS_DEVICE", d);
     }
     if let Some(sn) = opts.session_name {
-        cmd.env("AGENT_BROWSER_SESSION_NAME", sn);
+        cmd.env("SILVER_SESSION_NAME", sn);
     }
     if let Some(policy) = opts.restore_save {
-        cmd.env("AGENT_BROWSER_RESTORE_SAVE", policy);
+        cmd.env("SILVER_RESTORE_SAVE", policy);
     }
     if let Some(check) = opts.restore_check_url {
-        cmd.env("AGENT_BROWSER_RESTORE_CHECK_URL", check);
+        cmd.env("SILVER_RESTORE_CHECK_URL", check);
     }
     if let Some(check) = opts.restore_check_text {
-        cmd.env("AGENT_BROWSER_RESTORE_CHECK_TEXT", check);
+        cmd.env("SILVER_RESTORE_CHECK_TEXT", check);
     }
     if let Some(check) = opts.restore_check_fn {
-        cmd.env("AGENT_BROWSER_RESTORE_CHECK_FN", check);
+        cmd.env("SILVER_RESTORE_CHECK_FN", check);
     }
     if let Some(dp) = opts.download_path {
-        cmd.env("AGENT_BROWSER_DOWNLOAD_PATH", dp);
+        cmd.env("SILVER_DOWNLOAD_PATH", dp);
     }
     if let Some(ad) = opts.allowed_domains {
-        cmd.env("AGENT_BROWSER_ALLOWED_DOMAINS", ad.join(","));
+        cmd.env("SILVER_ALLOWED_DOMAINS", ad.join(","));
     }
     if let Some(ap) = opts.action_policy {
-        cmd.env("AGENT_BROWSER_ACTION_POLICY", ap);
+        cmd.env("SILVER_ACTION_POLICY", ap);
     }
     if let Some(ca) = opts.confirm_actions {
-        cmd.env("AGENT_BROWSER_CONFIRM_ACTIONS", ca);
+        cmd.env("SILVER_CONFIRM_ACTIONS", ca);
     }
     if let Some(engine) = opts.engine {
-        cmd.env("AGENT_BROWSER_ENGINE", engine);
+        cmd.env("SILVER_ENGINE", engine);
     }
     if opts.auto_connect {
-        cmd.env("AGENT_BROWSER_AUTO_CONNECT", "1");
+        cmd.env("SILVER_AUTO_CONNECT", "1");
     }
     if let Some(idle) = opts.idle_timeout {
-        cmd.env("AGENT_BROWSER_IDLE_TIMEOUT_MS", idle);
+        cmd.env("SILVER_IDLE_TIMEOUT_MS", idle);
     }
     if let Some(timeout) = opts.default_timeout {
-        cmd.env("AGENT_BROWSER_DEFAULT_TIMEOUT", timeout.to_string());
+        cmd.env("SILVER_DEFAULT_TIMEOUT", timeout.to_string());
     }
     if let Some(cdp) = opts.cdp {
-        cmd.env("AGENT_BROWSER_CDP", cdp);
+        cmd.env("SILVER_CDP", cdp);
     }
     if opts.no_auto_dialog {
-        cmd.env("AGENT_BROWSER_NO_AUTO_DIALOG", "1");
+        cmd.env("SILVER_NO_AUTO_DIALOG", "1");
     }
     if let Some(plugins) = opts.plugins {
-        cmd.env("AGENT_BROWSER_PLUGINS", plugins);
+        cmd.env("SILVER_PLUGINS", plugins);
     }
 }
 
@@ -685,7 +685,7 @@ fn wait_for_matching_ready_daemon(session: &str, opts: &DaemonOptions, timeout: 
 
 fn concurrent_daemon_config_error(session: &str) -> String {
     format!(
-        "A daemon for session '{}' started concurrently with different daemon configuration. Retry the command so agent-browser can restart it with the requested configuration.",
+        "A daemon for session '{}' started concurrently with different daemon configuration. Retry the command so silver can restart it with the requested configuration.",
         session
     )
 }
@@ -833,7 +833,7 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
         if path_len > 103 {
             return Err(format!(
                 "Session name '{}' is too long. Socket path would be {} bytes (max 103).\n\
-                 Use a shorter session name or set AGENT_BROWSER_SOCKET_DIR to a shorter path.",
+                 Use a shorter session name or set SILVER_SOCKET_DIR to a shorter path.",
                 session, path_len
             ));
         }
@@ -867,7 +867,7 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
         use std::os::unix::process::CommandExt;
 
         let mut cmd = Command::new(&exe_path);
-        cmd.env("AGENT_BROWSER_DAEMON", "1");
+        cmd.env("SILVER_DAEMON", "1");
         apply_daemon_env(&mut cmd, session, opts);
 
         unsafe {
@@ -891,7 +891,7 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
         use std::os::windows::process::CommandExt;
 
         let mut cmd = Command::new(&exe_path);
-        cmd.env("AGENT_BROWSER_DAEMON", "1");
+        cmd.env("SILVER_DAEMON", "1");
         apply_daemon_env(&mut cmd, session, opts);
 
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
@@ -1076,7 +1076,7 @@ fn has_os_error(error: &str, code: u32) -> bool {
 
 /// Socket read timeout for one request. Ordinary commands get a 30s floor.
 /// Commands carrying an operation timeout (the wait family, which
-/// parse_command stamps with AGENT_BROWSER_DEFAULT_TIMEOUT when no explicit
+/// parse_command stamps with SILVER_DEFAULT_TIMEOUT when no explicit
 /// --timeout is given) get that timeout plus margin, so the daemon can report
 /// a proper operation timeout instead of the client dying with EAGAIN at 30s
 /// and the retry loop re-sending the whole long-running command.
@@ -1121,9 +1121,9 @@ mod tests {
 
     #[test]
     fn test_get_socket_dir_explicit_override() {
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        let _guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
 
-        _guard.set("AGENT_BROWSER_SOCKET_DIR", "/custom/socket/path");
+        _guard.set("SILVER_SOCKET_DIR", "/custom/socket/path");
         _guard.remove("XDG_RUNTIME_DIR");
 
         assert_eq!(get_socket_dir(), PathBuf::from("/custom/socket/path"));
@@ -1131,50 +1131,50 @@ mod tests {
 
     #[test]
     fn test_get_socket_dir_ignores_empty_socket_dir() {
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        let _guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
 
-        _guard.set("AGENT_BROWSER_SOCKET_DIR", "");
+        _guard.set("SILVER_SOCKET_DIR", "");
         _guard.remove("XDG_RUNTIME_DIR");
 
         assert!(get_socket_dir()
             .to_string_lossy()
-            .ends_with(".agent-browser"));
+            .ends_with(".silver"));
     }
 
     #[test]
     fn test_get_socket_dir_xdg_runtime() {
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        let _guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
 
-        _guard.remove("AGENT_BROWSER_SOCKET_DIR");
+        _guard.remove("SILVER_SOCKET_DIR");
         _guard.set("XDG_RUNTIME_DIR", "/run/user/1000");
 
         assert_eq!(
             get_socket_dir(),
-            PathBuf::from("/run/user/1000/agent-browser")
+            PathBuf::from("/run/user/1000/silver")
         );
     }
 
     #[test]
     fn test_get_socket_dir_ignores_empty_xdg_runtime() {
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        let _guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
 
-        _guard.set("AGENT_BROWSER_SOCKET_DIR", "");
+        _guard.set("SILVER_SOCKET_DIR", "");
         _guard.set("XDG_RUNTIME_DIR", "");
 
         assert!(get_socket_dir()
             .to_string_lossy()
-            .ends_with(".agent-browser"));
+            .ends_with(".silver"));
     }
 
     #[test]
     fn test_get_socket_dir_home_fallback() {
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        let _guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
 
-        _guard.remove("AGENT_BROWSER_SOCKET_DIR");
+        _guard.remove("SILVER_SOCKET_DIR");
         _guard.remove("XDG_RUNTIME_DIR");
 
         let result = get_socket_dir();
-        assert!(result.to_string_lossy().ends_with(".agent-browser"));
+        assert!(result.to_string_lossy().ends_with(".silver"));
         assert!(
             result.to_string_lossy().contains("home") || result.to_string_lossy().contains("Users")
         );
@@ -1183,21 +1183,21 @@ mod tests {
     #[test]
     fn test_get_socket_dir_namespace_scopes_base_directory() {
         let _guard = EnvGuard::new(&[
-            "AGENT_BROWSER_SOCKET_DIR",
+            "SILVER_SOCKET_DIR",
             "XDG_RUNTIME_DIR",
-            "AGENT_BROWSER_NAMESPACE",
+            "SILVER_NAMESPACE",
         ]);
 
         _guard.set(
-            "AGENT_BROWSER_SOCKET_DIR",
-            "/tmp/agent-browser-test-sockets",
+            "SILVER_SOCKET_DIR",
+            "/tmp/silver-test-sockets",
         );
         _guard.remove("XDG_RUNTIME_DIR");
-        _guard.set("AGENT_BROWSER_NAMESPACE", "Worktree: One");
+        _guard.set("SILVER_NAMESPACE", "Worktree: One");
 
         assert_eq!(
             get_socket_dir(),
-            PathBuf::from("/tmp/agent-browser-test-sockets")
+            PathBuf::from("/tmp/silver-test-sockets")
                 .join("namespaces")
                 .join("worktree-one")
                 .join("run")
@@ -1207,12 +1207,12 @@ mod tests {
     #[test]
     fn test_walk_daemons_only_lists_current_namespace() {
         let _guard = EnvGuard::new(&[
-            "AGENT_BROWSER_SOCKET_DIR",
+            "SILVER_SOCKET_DIR",
             "XDG_RUNTIME_DIR",
-            "AGENT_BROWSER_NAMESPACE",
+            "SILVER_NAMESPACE",
         ]);
         let dir = tempfile::tempdir().unwrap();
-        _guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        _guard.set("SILVER_SOCKET_DIR", dir.path().to_str().unwrap());
         _guard.remove("XDG_RUNTIME_DIR");
 
         let ns_one = dir.path().join("namespaces").join("one").join("run");
@@ -1223,7 +1223,7 @@ mod tests {
         fs::write(ns_one.join("current.pid"), &pid).unwrap();
         fs::write(ns_two.join("other.pid"), &pid).unwrap();
 
-        _guard.set("AGENT_BROWSER_NAMESPACE", "one");
+        _guard.set("SILVER_NAMESPACE", "one");
         let inventory = walk_daemons();
 
         assert_eq!(inventory.sessions.len(), 1);
@@ -1299,10 +1299,10 @@ mod tests {
 
     #[test]
     fn test_spawn_race_loser_does_not_overwrite_winner_config() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
+        let guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "SILVER_NAMESPACE"]);
         let dir = tempfile::tempdir().unwrap();
-        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
-        guard.remove("AGENT_BROWSER_NAMESPACE");
+        guard.set("SILVER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("SILVER_NAMESPACE");
 
         let session = "race-config";
         let winner_opts = test_daemon_options(Some("1000"), false, None);
@@ -1321,10 +1321,10 @@ mod tests {
 
     #[test]
     fn test_spawn_race_loser_reuses_matching_winner_config() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
+        let guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "SILVER_NAMESPACE"]);
         let dir = tempfile::tempdir().unwrap();
-        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
-        guard.remove("AGENT_BROWSER_NAMESPACE");
+        guard.set("SILVER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("SILVER_NAMESPACE");
 
         let session = "race-config-match";
         let opts = test_daemon_options(Some("1000"), false, None);
@@ -1343,10 +1343,10 @@ mod tests {
 
     #[test]
     fn test_ready_existing_daemon_waits_for_startup_config() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
+        let guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "SILVER_NAMESPACE"]);
         let dir = tempfile::tempdir().unwrap();
-        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
-        guard.remove("AGENT_BROWSER_NAMESPACE");
+        guard.set("SILVER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("SILVER_NAMESPACE");
 
         let session = "startup-config";
         let opts = test_daemon_options(Some("1000"), false, None);
@@ -1370,10 +1370,10 @@ mod tests {
 
     #[test]
     fn test_spawn_owner_writes_config() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
+        let guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "SILVER_NAMESPACE"]);
         let dir = tempfile::tempdir().unwrap();
-        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
-        guard.remove("AGENT_BROWSER_NAMESPACE");
+        guard.set("SILVER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("SILVER_NAMESPACE");
 
         let session = "race-config-owner";
         let opts = test_daemon_options(Some("1000"), false, None);
@@ -1504,8 +1504,8 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn test_get_port_for_session() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_NAMESPACE"]);
-        guard.remove("AGENT_BROWSER_NAMESPACE");
+        let guard = EnvGuard::new(&["SILVER_NAMESPACE"]);
+        guard.remove("SILVER_NAMESPACE");
 
         assert_eq!(get_port_for_session("default"), 50838);
         assert_eq!(get_port_for_session("my-session"), 63105);
@@ -1516,14 +1516,14 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn test_get_port_for_session_includes_namespace() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_NAMESPACE"]);
-        guard.remove("AGENT_BROWSER_NAMESPACE");
+        let guard = EnvGuard::new(&["SILVER_NAMESPACE"]);
+        guard.remove("SILVER_NAMESPACE");
         let unnamespaced = get_port_for_session("work");
 
-        guard.set("AGENT_BROWSER_NAMESPACE", "Worktree: One");
+        guard.set("SILVER_NAMESPACE", "Worktree: One");
         let namespaced_one = get_port_for_session("work");
 
-        guard.set("AGENT_BROWSER_NAMESPACE", "Worktree: Two");
+        guard.set("SILVER_NAMESPACE", "Worktree: Two");
         let namespaced_two = get_port_for_session("work");
 
         assert_ne!(namespaced_one, unnamespaced);
@@ -1537,8 +1537,8 @@ mod tests {
     fn test_daemon_version_matches_same_version() {
         let dir = std::env::temp_dir().join("ab-test-version-match");
         let _ = fs::create_dir_all(&dir);
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
-        _guard.set("AGENT_BROWSER_SOCKET_DIR", dir.to_str().unwrap());
+        let _guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        _guard.set("SILVER_SOCKET_DIR", dir.to_str().unwrap());
 
         let version_path = dir.join("test-session.version");
         let _ = fs::write(&version_path, env!("CARGO_PKG_VERSION"));
@@ -1553,8 +1553,8 @@ mod tests {
     fn test_daemon_version_matches_different_version() {
         let dir = std::env::temp_dir().join("ab-test-version-mismatch");
         let _ = fs::create_dir_all(&dir);
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
-        _guard.set("AGENT_BROWSER_SOCKET_DIR", dir.to_str().unwrap());
+        let _guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        _guard.set("SILVER_SOCKET_DIR", dir.to_str().unwrap());
 
         let version_path = dir.join("test-session.version");
         let _ = fs::write(&version_path, "0.0.0-old");
@@ -1569,8 +1569,8 @@ mod tests {
     fn test_daemon_version_matches_no_file() {
         let dir = std::env::temp_dir().join("ab-test-version-nofile");
         let _ = fs::create_dir_all(&dir);
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
-        _guard.set("AGENT_BROWSER_SOCKET_DIR", dir.to_str().unwrap());
+        let _guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        _guard.set("SILVER_SOCKET_DIR", dir.to_str().unwrap());
 
         // No version file: treated as mismatch so stale pre-version-tracking
         // daemons (including Node.js era) are always restarted.
@@ -1583,8 +1583,8 @@ mod tests {
     fn test_cleanup_stale_files_removes_version() {
         let dir = std::env::temp_dir().join("ab-test-cleanup-version");
         let _ = fs::create_dir_all(&dir);
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
-        _guard.set("AGENT_BROWSER_SOCKET_DIR", dir.to_str().unwrap());
+        let _guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        _guard.set("SILVER_SOCKET_DIR", dir.to_str().unwrap());
 
         let version_path = dir.join("test-session.version");
         let _ = fs::write(&version_path, "0.1.0");

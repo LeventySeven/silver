@@ -1,7 +1,7 @@
 //! Check remote browser providers: API key presence for Browserless,
 //! Browserbase, Browser Use, Kernel, AgentCore (AWS), Appium for iOS, and
 //! the AI Gateway chat key. Info-level unless the provider is selected
-//! via `AGENT_BROWSER_PROVIDER`.
+//! via `SILVER_PROVIDER`.
 
 use std::env;
 
@@ -11,7 +11,7 @@ use super::{Check, Status};
 pub(super) fn check(checks: &mut Vec<Check>) {
     let category = "Providers";
 
-    let active = env::var("AGENT_BROWSER_PROVIDER").ok();
+    let active = env::var("SILVER_PROVIDER").ok();
     let normalized = active
         .as_ref()
         .map(|s| s.to_lowercase())
@@ -48,7 +48,7 @@ pub(super) fn check(checks: &mut Vec<Check>) {
         let mut check = Check::new(format!("providers.{}", provider_id), category, status, msg);
         if status == Status::Fail {
             check = check.with_fix(format!(
-                "set {} (or unset AGENT_BROWSER_PROVIDER={})",
+                "set {} (or unset SILVER_PROVIDER={})",
                 env_keys.first().copied().unwrap_or(""),
                 provider_id
             ));
@@ -122,7 +122,7 @@ pub(super) fn check(checks: &mut Vec<Check>) {
             "providers.active",
             category,
             Status::Info,
-            format!("AGENT_BROWSER_PROVIDER = {}", active),
+            format!("SILVER_PROVIDER = {}", active),
         ));
     }
 }

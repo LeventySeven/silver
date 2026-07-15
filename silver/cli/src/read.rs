@@ -10,7 +10,7 @@ use url::Url;
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 const BODY_LIMIT: usize = 2 * 1024 * 1024;
 const READ_ACCEPT: &str = "text/markdown, text/plain;q=0.9, text/html;q=0.7, */*;q=0.1";
-const USER_AGENT_VALUE: &str = concat!("agent-browser/", env!("CARGO_PKG_VERSION"), " read");
+const USER_AGENT_VALUE: &str = concat!("silver/", env!("CARGO_PKG_VERSION"), " read");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmsMode {
@@ -1273,12 +1273,12 @@ mod tests {
         let html = r#"
           <html><head><title>Skip</title></head><body>
           <header><a href="/">Home</a></header>
-          <article><h1>agent-browser</h1><p>Browser automation CLI.</p></article>
+          <article><h1>silver</h1><p>Browser automation CLI.</p></article>
           </body></html>
         "#;
         let text = html_to_markdownish(html);
         assert!(text.contains("Home"));
-        assert!(text.contains("# agent-browser"));
+        assert!(text.contains("# silver"));
         assert!(text.contains("Browser automation CLI."));
     }
 

@@ -324,7 +324,7 @@ pub async fn save_state(
         }
     };
 
-    if let Ok(key) = std::env::var("AGENT_BROWSER_ENCRYPTION_KEY") {
+    if let Ok(key) = std::env::var("SILVER_ENCRYPTION_KEY") {
         let encrypted = encrypt_data(json_str.as_bytes(), &key)?;
         save_path.push_str(".enc");
         fs::write(&save_path, &encrypted)
@@ -363,7 +363,7 @@ pub async fn save_auto_state_transactional(
 
     let base_name = format!("{}-{}", session_name, session_id_str);
     let final_json_path = dir.join(format!("{}.json", base_name));
-    let final_path = if std::env::var("AGENT_BROWSER_ENCRYPTION_KEY").is_ok() {
+    let final_path = if std::env::var("SILVER_ENCRYPTION_KEY").is_ok() {
         PathBuf::from(format!("{}.enc", final_json_path.to_string_lossy()))
     } else {
         final_json_path
@@ -424,8 +424,8 @@ pub async fn save_auto_state_transactional(
 
 fn read_state_json(path: &str) -> Result<String, String> {
     if is_encrypted_state(std::path::Path::new(path)) {
-        let key = std::env::var("AGENT_BROWSER_ENCRYPTION_KEY").map_err(|_| {
-            "Encrypted state file requires AGENT_BROWSER_ENCRYPTION_KEY".to_string()
+        let key = std::env::var("SILVER_ENCRYPTION_KEY").map_err(|_| {
+            "Encrypted state file requires SILVER_ENCRYPTION_KEY".to_string()
         })?;
         let data =
             fs::read(path).map_err(|e| format!("Failed to read state from {}: {}", path, e))?;
@@ -436,7 +436,7 @@ fn read_state_json(path: &str) -> Result<String, String> {
         match fs::read_to_string(path) {
             Ok(s) => Ok(s),
             Err(e) => {
-                if let Ok(key) = std::env::var("AGENT_BROWSER_ENCRYPTION_KEY") {
+                if let Ok(key) = std::env::var("SILVER_ENCRYPTION_KEY") {
                     let enc_path = format!("{}.enc", path);
                     if let Ok(data) = fs::read(&enc_path) {
                         let decrypted = decrypt_data(&data, &key)?;
@@ -598,8 +598,8 @@ pub fn state_list() -> Result<Value, String> {
 pub fn state_show(path: &str) -> Result<Value, String> {
     let encrypted = is_encrypted_state(std::path::Path::new(path));
     let json_str = if encrypted {
-        let key = std::env::var("AGENT_BROWSER_ENCRYPTION_KEY").map_err(|_| {
-            "Encrypted state file requires AGENT_BROWSER_ENCRYPTION_KEY".to_string()
+        let key = std::env::var("SILVER_ENCRYPTION_KEY").map_err(|_| {
+            "Encrypted state file requires SILVER_ENCRYPTION_KEY".to_string()
         })?;
         let data = fs::read(path).map_err(|e| format!("Failed to read state file: {}", e))?;
         let decrypted = decrypt_data(&data, &key)?;
@@ -822,17 +822,17 @@ pub fn dispatch_state_command(cmd: &Value) -> Option<Result<Value, String>> {
     }
 }
 
-/// Return the agent-browser state root (`~/.agent-browser`, falling back to
-/// `<tempdir>/agent-browser` when the home directory can't be resolved).
+/// Return the silver state root (`~/.silver`, falling back to
+/// `<tempdir>/silver` when the home directory can't be resolved).
 /// This is the parent of `sessions/`, auth storage, and the encryption key.
 pub fn get_state_dir() -> PathBuf {
     let base = if let Some(home) = dirs::home_dir() {
-        home.join(".agent-browser")
+        home.join(".silver")
     } else {
-        std::env::temp_dir().join("agent-browser")
+        std::env::temp_dir().join("silver")
     };
 
-    if let Ok(namespace) = std::env::var("AGENT_BROWSER_NAMESPACE") {
+    if let Ok(namespace) = std::env::var("SILVER_NAMESPACE") {
         let namespace = sanitize_session_component(&namespace);
         if !namespace.is_empty() {
             return base.join("namespaces").join(namespace).join("state");
@@ -897,13 +897,13 @@ mod tests {
 
     #[test]
     fn test_state_show_nonexistent_file() {
-        let result = state_show("/tmp/nonexistent-agent-browser-state-file.json");
+        let result = state_show("/tmp/nonexistent-silver-state-file.json");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_state_clear_nonexistent_file() {
-        let result = state_clear(Some("/tmp/nonexistent-agent-browser-state-file.json"));
+        let result = state_clear(Some("/tmp/nonexistent-silver-state-file.json"));
         assert!(result.is_err());
     }
 
@@ -922,10 +922,10 @@ mod tests {
 
     #[test]
     fn test_state_clear_removes_transactional_backups() {
-        let guard = crate::test_utils::EnvGuard::new(&["HOME", "AGENT_BROWSER_NAMESPACE"]);
+        let guard = crate::test_utils::EnvGuard::new(&["HOME", "SILVER_NAMESPACE"]);
         let dir = tempfile::tempdir().unwrap();
         guard.set("HOME", dir.path().to_str().unwrap());
-        guard.remove("AGENT_BROWSER_NAMESPACE");
+        guard.remove("SILVER_NAMESPACE");
 
         let sessions = get_sessions_dir();
         fs::create_dir_all(&sessions).unwrap();
@@ -943,7 +943,7 @@ mod tests {
 
     #[test]
     fn test_state_rename_nonexistent() {
-        let result = state_rename("/tmp/nonexistent-agent-browser-state-file.json", "new-name");
+        let result = state_rename("/tmp/nonexistent-silver-state-file.json", "new-name");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
@@ -963,11 +963,11 @@ mod tests {
 
     #[test]
     fn test_get_state_dir_namespace_scopes_sessions() {
-        let _guard = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_NAMESPACE"]);
-        _guard.set("AGENT_BROWSER_NAMESPACE", "Worktree: One");
+        let _guard = crate::test_utils::EnvGuard::new(&["SILVER_NAMESPACE"]);
+        _guard.set("SILVER_NAMESPACE", "Worktree: One");
 
         let dir = get_state_dir();
-        let expected_state_suffix = PathBuf::from(".agent-browser")
+        let expected_state_suffix = PathBuf::from(".silver")
             .join("namespaces")
             .join("worktree-one")
             .join("state");

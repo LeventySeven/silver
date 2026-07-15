@@ -5,9 +5,9 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const CONFIG_DIR: &str = ".agent-browser";
+const CONFIG_DIR: &str = ".silver";
 const CONFIG_FILENAME: &str = "config.json";
-const PROJECT_CONFIG_FILENAME: &str = "agent-browser.json";
+const PROJECT_CONFIG_FILENAME: &str = "silver.json";
 
 /// Parse idle timeout from user-friendly format.
 /// Supports: "10s" (seconds), "3m" (minutes), "1h" (hours), or raw milliseconds.
@@ -294,9 +294,9 @@ pub fn load_config(args: &[String]) -> Result<Config, String> {
     let explicit = extract_config_path(args)
         .map(|p| ("--config", p))
         .or_else(|| {
-            env::var("AGENT_BROWSER_CONFIG")
+            env::var("SILVER_CONFIG")
                 .ok()
-                .map(|p| ("AGENT_BROWSER_CONFIG", Some(p)))
+                .map(|p| ("SILVER_CONFIG", Some(p)))
         });
 
     if let Some((source, maybe_path)) = explicit {
@@ -351,7 +351,7 @@ pub struct Flags {
     pub allow_file_access: bool,
     pub hide_scrollbars: bool,
     pub webgpu: bool,
-    /// Env-only (AGENT_BROWSER_NO_XVFB): disable automatic Xvfb for headed
+    /// Env-only (SILVER_NO_XVFB): disable automatic Xvfb for headed
     /// launches on displayless Linux hosts.
     pub no_xvfb: bool,
     pub device: Option<String>,
@@ -370,8 +370,8 @@ pub struct Flags {
     pub screenshot_dir: Option<String>,
     pub screenshot_quality: Option<u32>,
     pub screenshot_format: Option<String>,
-    pub idle_timeout: Option<String>, // Canonical milliseconds string for AGENT_BROWSER_IDLE_TIMEOUT_MS
-    pub default_timeout: Option<u64>, // AGENT_BROWSER_DEFAULT_TIMEOUT in ms
+    pub idle_timeout: Option<String>, // Canonical milliseconds string for SILVER_IDLE_TIMEOUT_MS
+    pub default_timeout: Option<u64>, // SILVER_DEFAULT_TIMEOUT in ms
     pub no_auto_dialog: bool,
     pub model: Option<String>,
     pub plugins: Vec<PluginConfig>,
@@ -405,7 +405,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
         std::process::exit(1);
     });
 
-    let extensions_env = env::var("AGENT_BROWSER_EXTENSIONS")
+    let extensions_env = env::var("SILVER_EXTENSIONS")
         .ok()
         .map(|s| {
             s.split(',')
@@ -421,7 +421,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
         config.extensions.unwrap_or_default()
     };
 
-    let init_scripts_env = env::var("AGENT_BROWSER_INIT_SCRIPTS")
+    let init_scripts_env = env::var("SILVER_INIT_SCRIPTS")
         .ok()
         .map(|s| {
             s.split(',')
@@ -437,7 +437,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
         config.init_scripts.unwrap_or_default()
     };
 
-    let enable_env = env::var("AGENT_BROWSER_ENABLE")
+    let enable_env = env::var("SILVER_ENABLE")
         .ok()
         .map(|s| {
             s.split(',')
@@ -453,14 +453,14 @@ pub fn parse_flags(args: &[String]) -> Flags {
         config.enable.unwrap_or_default()
     };
 
-    let plugins = env::var("AGENT_BROWSER_PLUGINS")
+    let plugins = env::var("SILVER_PLUGINS")
         .ok()
         .and_then(
             |raw| match serde_json::from_str::<Vec<PluginConfig>>(&raw) {
                 Ok(plugins) => Some(plugins),
                 Err(e) => {
                     eprintln!(
-                        "{} invalid AGENT_BROWSER_PLUGINS value: {}",
+                        "{} invalid SILVER_PLUGINS value: {}",
                         color::warning_indicator(),
                         e
                     );
@@ -471,41 +471,41 @@ pub fn parse_flags(args: &[String]) -> Flags {
         .unwrap_or_else(|| config.plugins.unwrap_or_default());
 
     let mut flags = Flags {
-        json: env_var_is_truthy("AGENT_BROWSER_JSON") || config.json.unwrap_or(false),
-        headed: env_var_is_truthy("AGENT_BROWSER_HEADED") || config.headed.unwrap_or(false),
-        debug: env_var_is_truthy("AGENT_BROWSER_DEBUG") || config.debug.unwrap_or(false),
-        session: env::var("AGENT_BROWSER_SESSION")
+        json: env_var_is_truthy("SILVER_JSON") || config.json.unwrap_or(false),
+        headed: env_var_is_truthy("SILVER_HEADED") || config.headed.unwrap_or(false),
+        debug: env_var_is_truthy("SILVER_DEBUG") || config.debug.unwrap_or(false),
+        session: env::var("SILVER_SESSION")
             .ok()
             .or(config.session)
             .unwrap_or_else(|| "default".to_string()),
-        restore: env::var("AGENT_BROWSER_RESTORE").ok().or(config.restore),
-        restore_save: env::var("AGENT_BROWSER_RESTORE_SAVE")
+        restore: env::var("SILVER_RESTORE").ok().or(config.restore),
+        restore_save: env::var("SILVER_RESTORE_SAVE")
             .ok()
             .or(config.restore_save),
-        restore_check_url: env::var("AGENT_BROWSER_RESTORE_CHECK_URL")
+        restore_check_url: env::var("SILVER_RESTORE_CHECK_URL")
             .ok()
             .or(config.restore_check_url),
-        restore_check_text: env::var("AGENT_BROWSER_RESTORE_CHECK_TEXT")
+        restore_check_text: env::var("SILVER_RESTORE_CHECK_TEXT")
             .ok()
             .or(config.restore_check_text),
-        restore_check_fn: env::var("AGENT_BROWSER_RESTORE_CHECK_FN")
+        restore_check_fn: env::var("SILVER_RESTORE_CHECK_FN")
             .ok()
             .or(config.restore_check_fn),
-        namespace: env::var("AGENT_BROWSER_NAMESPACE")
+        namespace: env::var("SILVER_NAMESPACE")
             .ok()
             .or(config.namespace),
         restore_uses_session: false,
         headers: config.headers,
-        executable_path: env::var("AGENT_BROWSER_EXECUTABLE_PATH")
+        executable_path: env::var("SILVER_EXECUTABLE_PATH")
             .ok()
             .or(config.executable_path),
-        cdp: env::var("AGENT_BROWSER_CDP").ok().or(config.cdp),
+        cdp: env::var("SILVER_CDP").ok().or(config.cdp),
         extensions,
         init_scripts,
         enable,
-        profile: env::var("AGENT_BROWSER_PROFILE").ok().or(config.profile),
-        state: env::var("AGENT_BROWSER_STATE").ok().or(config.state),
-        proxy: env::var("AGENT_BROWSER_PROXY")
+        profile: env::var("SILVER_PROFILE").ok().or(config.profile),
+        state: env::var("SILVER_STATE").ok().or(config.state),
+        proxy: env::var("SILVER_PROXY")
             .ok()
             .or(config.proxy)
             .or_else(|| env::var("HTTP_PROXY").ok())
@@ -514,45 +514,45 @@ pub fn parse_flags(args: &[String]) -> Flags {
             .or_else(|| env::var("https_proxy").ok())
             .or_else(|| env::var("ALL_PROXY").ok())
             .or_else(|| env::var("all_proxy").ok()),
-        proxy_bypass: env::var("AGENT_BROWSER_PROXY_BYPASS")
+        proxy_bypass: env::var("SILVER_PROXY_BYPASS")
             .ok()
             .or(config.proxy_bypass)
             .or_else(|| env::var("NO_PROXY").ok())
             .or_else(|| env::var("no_proxy").ok()),
-        args: env::var("AGENT_BROWSER_ARGS").ok().or(config.args),
-        user_agent: env::var("AGENT_BROWSER_USER_AGENT")
+        args: env::var("SILVER_ARGS").ok().or(config.args),
+        user_agent: env::var("SILVER_USER_AGENT")
             .ok()
             .or(config.user_agent),
-        provider: env::var("AGENT_BROWSER_PROVIDER").ok().or(config.provider),
-        ignore_https_errors: env_var_is_truthy("AGENT_BROWSER_IGNORE_HTTPS_ERRORS")
+        provider: env::var("SILVER_PROVIDER").ok().or(config.provider),
+        ignore_https_errors: env_var_is_truthy("SILVER_IGNORE_HTTPS_ERRORS")
             || config.ignore_https_errors.unwrap_or(false),
-        allow_file_access: env_var_is_truthy("AGENT_BROWSER_ALLOW_FILE_ACCESS")
+        allow_file_access: env_var_is_truthy("SILVER_ALLOW_FILE_ACCESS")
             || config.allow_file_access.unwrap_or(false),
-        hide_scrollbars: env_var_bool("AGENT_BROWSER_HIDE_SCROLLBARS")
+        hide_scrollbars: env_var_bool("SILVER_HIDE_SCROLLBARS")
             .or(config.hide_scrollbars)
             .unwrap_or(true),
-        webgpu: env_var_is_truthy("AGENT_BROWSER_WEBGPU") || config.webgpu.unwrap_or(false),
-        no_xvfb: env_var_is_truthy("AGENT_BROWSER_NO_XVFB"),
-        device: env::var("AGENT_BROWSER_IOS_DEVICE").ok().or(config.device),
-        auto_connect: env_var_is_truthy("AGENT_BROWSER_AUTO_CONNECT")
+        webgpu: env_var_is_truthy("SILVER_WEBGPU") || config.webgpu.unwrap_or(false),
+        no_xvfb: env_var_is_truthy("SILVER_NO_XVFB"),
+        device: env::var("SILVER_IOS_DEVICE").ok().or(config.device),
+        auto_connect: env_var_is_truthy("SILVER_AUTO_CONNECT")
             || config.auto_connect.unwrap_or(false),
-        session_name: env::var("AGENT_BROWSER_SESSION_NAME")
+        session_name: env::var("SILVER_SESSION_NAME")
             .ok()
             .or(config.session_name),
-        annotate: env_var_is_truthy("AGENT_BROWSER_ANNOTATE") || config.annotate.unwrap_or(false),
-        color_scheme: env::var("AGENT_BROWSER_COLOR_SCHEME")
+        annotate: env_var_is_truthy("SILVER_ANNOTATE") || config.annotate.unwrap_or(false),
+        color_scheme: env::var("SILVER_COLOR_SCHEME")
             .ok()
             .or(config.color_scheme),
-        download_path: env::var("AGENT_BROWSER_DOWNLOAD_PATH")
+        download_path: env::var("SILVER_DOWNLOAD_PATH")
             .ok()
             .or(config.download_path),
-        content_boundaries: env_var_is_truthy("AGENT_BROWSER_CONTENT_BOUNDARIES")
+        content_boundaries: env_var_is_truthy("SILVER_CONTENT_BOUNDARIES")
             || config.content_boundaries.unwrap_or(false),
-        max_output: env::var("AGENT_BROWSER_MAX_OUTPUT")
+        max_output: env::var("SILVER_MAX_OUTPUT")
             .ok()
             .and_then(|s| s.parse().ok())
             .or(config.max_output),
-        allowed_domains: env::var("AGENT_BROWSER_ALLOWED_DOMAINS")
+        allowed_domains: env::var("SILVER_ALLOWED_DOMAINS")
             .ok()
             .map(|s| {
                 s.split(',')
@@ -561,35 +561,35 @@ pub fn parse_flags(args: &[String]) -> Flags {
                     .collect()
             })
             .or(config.allowed_domains),
-        action_policy: env::var("AGENT_BROWSER_ACTION_POLICY")
+        action_policy: env::var("SILVER_ACTION_POLICY")
             .ok()
             .or(config.action_policy),
-        confirm_actions: env::var("AGENT_BROWSER_CONFIRM_ACTIONS")
+        confirm_actions: env::var("SILVER_CONFIRM_ACTIONS")
             .ok()
             .or(config.confirm_actions),
-        confirm_interactive: env_var_is_truthy("AGENT_BROWSER_CONFIRM_INTERACTIVE")
+        confirm_interactive: env_var_is_truthy("SILVER_CONFIRM_INTERACTIVE")
             || config.confirm_interactive.unwrap_or(false),
-        engine: env::var("AGENT_BROWSER_ENGINE").ok().or(config.engine),
-        screenshot_dir: env::var("AGENT_BROWSER_SCREENSHOT_DIR")
+        engine: env::var("SILVER_ENGINE").ok().or(config.engine),
+        screenshot_dir: env::var("SILVER_SCREENSHOT_DIR")
             .ok()
             .or(config.screenshot_dir),
-        screenshot_quality: env::var("AGENT_BROWSER_SCREENSHOT_QUALITY")
+        screenshot_quality: env::var("SILVER_SCREENSHOT_QUALITY")
             .ok()
             .and_then(|s| s.parse().ok())
             .or(config.screenshot_quality),
-        screenshot_format: env::var("AGENT_BROWSER_SCREENSHOT_FORMAT")
+        screenshot_format: env::var("SILVER_SCREENSHOT_FORMAT")
             .ok()
             .or(config.screenshot_format)
             .filter(|s| s == "png" || s == "jpeg"),
         idle_timeout: parse_idle_timeout_value(
-            env::var("AGENT_BROWSER_IDLE_TIMEOUT_MS").ok(),
-            "AGENT_BROWSER_IDLE_TIMEOUT_MS",
+            env::var("SILVER_IDLE_TIMEOUT_MS").ok(),
+            "SILVER_IDLE_TIMEOUT_MS",
         )
         .or(config.idle_timeout),
-        default_timeout: env::var("AGENT_BROWSER_DEFAULT_TIMEOUT")
+        default_timeout: env::var("SILVER_DEFAULT_TIMEOUT")
             .ok()
             .and_then(|s| s.parse::<u64>().ok()),
-        no_auto_dialog: env_var_is_truthy("AGENT_BROWSER_NO_AUTO_DIALOG")
+        no_auto_dialog: env_var_is_truthy("SILVER_NO_AUTO_DIALOG")
             || config.no_auto_dialog.unwrap_or(false),
         model: env::var("AI_GATEWAY_MODEL").ok().or(config.model),
         plugins,
@@ -1590,7 +1590,7 @@ mod tests {
 
     #[test]
     fn test_load_config_missing_file_returns_none() {
-        let result = read_config_file(&PathBuf::from("/nonexistent/agent-browser.json"));
+        let result = read_config_file(&PathBuf::from("/nonexistent/silver.json"));
         assert!(result.is_none());
     }
 
@@ -1719,8 +1719,8 @@ mod tests {
 
     #[test]
     fn test_webgpu_default_false() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_WEBGPU"]);
-        guard.remove("AGENT_BROWSER_WEBGPU");
+        let guard = EnvGuard::new(&["SILVER_WEBGPU"]);
+        guard.remove("SILVER_WEBGPU");
         let flags = parse_flags(&args("open example.com"));
         assert!(!flags.webgpu);
         assert!(!flags.cli_webgpu);
@@ -1728,8 +1728,8 @@ mod tests {
 
     #[test]
     fn test_webgpu_bare_defaults_true() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_WEBGPU"]);
-        guard.remove("AGENT_BROWSER_WEBGPU");
+        let guard = EnvGuard::new(&["SILVER_WEBGPU"]);
+        guard.remove("SILVER_WEBGPU");
         let flags = parse_flags(&args("--webgpu open example.com"));
         assert!(flags.webgpu);
         assert!(flags.cli_webgpu);
@@ -1737,8 +1737,8 @@ mod tests {
 
     #[test]
     fn test_webgpu_false_explicit() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_WEBGPU"]);
-        guard.remove("AGENT_BROWSER_WEBGPU");
+        let guard = EnvGuard::new(&["SILVER_WEBGPU"]);
+        guard.remove("SILVER_WEBGPU");
         let flags = parse_flags(&args("--webgpu false open example.com"));
         assert!(!flags.webgpu);
         assert!(flags.cli_webgpu);
@@ -1746,19 +1746,19 @@ mod tests {
 
     #[test]
     fn test_cdp_env_var_resolves_into_flags() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_CDP"]);
-        guard.set("AGENT_BROWSER_CDP", "9222");
+        let guard = EnvGuard::new(&["SILVER_CDP"]);
+        guard.set("SILVER_CDP", "9222");
         let flags = parse_flags(&args("open example.com"));
         assert_eq!(flags.cdp.as_deref(), Some("9222"));
-        guard.remove("AGENT_BROWSER_CDP");
+        guard.remove("SILVER_CDP");
         let flags = parse_flags(&args("open example.com"));
         assert!(flags.cdp.is_none());
     }
 
     #[test]
     fn test_webgpu_env_var() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_WEBGPU"]);
-        guard.set("AGENT_BROWSER_WEBGPU", "1");
+        let guard = EnvGuard::new(&["SILVER_WEBGPU"]);
+        guard.set("SILVER_WEBGPU", "1");
         let flags = parse_flags(&args("open example.com"));
         assert!(flags.webgpu);
         assert!(!flags.cli_webgpu);
@@ -1791,8 +1791,8 @@ mod tests {
 
     #[test]
     fn test_hide_scrollbars_default_true() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_HIDE_SCROLLBARS"]);
-        guard.remove("AGENT_BROWSER_HIDE_SCROLLBARS");
+        let guard = EnvGuard::new(&["SILVER_HIDE_SCROLLBARS"]);
+        guard.remove("SILVER_HIDE_SCROLLBARS");
         let flags = parse_flags(&args("open example.com"));
         assert!(flags.hide_scrollbars);
         assert!(!flags.cli_hide_scrollbars);
@@ -1800,8 +1800,8 @@ mod tests {
 
     #[test]
     fn test_hide_scrollbars_false() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_HIDE_SCROLLBARS"]);
-        guard.remove("AGENT_BROWSER_HIDE_SCROLLBARS");
+        let guard = EnvGuard::new(&["SILVER_HIDE_SCROLLBARS"]);
+        guard.remove("SILVER_HIDE_SCROLLBARS");
         let flags = parse_flags(&args("--hide-scrollbars false open"));
         assert!(!flags.hide_scrollbars);
         assert!(flags.cli_hide_scrollbars);
@@ -1809,8 +1809,8 @@ mod tests {
 
     #[test]
     fn test_hide_scrollbars_bare_defaults_true() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_HIDE_SCROLLBARS"]);
-        guard.remove("AGENT_BROWSER_HIDE_SCROLLBARS");
+        let guard = EnvGuard::new(&["SILVER_HIDE_SCROLLBARS"]);
+        guard.remove("SILVER_HIDE_SCROLLBARS");
         let flags = parse_flags(&args("--hide-scrollbars open"));
         assert!(flags.hide_scrollbars);
         assert!(flags.cli_hide_scrollbars);

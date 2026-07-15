@@ -16,21 +16,21 @@ use crate::connection::{cleanup_stale_files, ensure_daemon, send_command, Daemon
 pub(super) fn check(checks: &mut Vec<Check>, opts: &DoctorOptions) {
     let category = "Launch test";
 
-    if env::var("AGENT_BROWSER_PROVIDER").is_ok() {
+    if env::var("SILVER_PROVIDER").is_ok() {
         checks.push(Check::new(
             "launch.skipped.provider",
             category,
             Status::Info,
-            "Skipped (AGENT_BROWSER_PROVIDER is set; would consume cloud quota)",
+            "Skipped (SILVER_PROVIDER is set; would consume cloud quota)",
         ));
         return;
     }
-    if env::var("AGENT_BROWSER_CDP").is_ok() {
+    if env::var("SILVER_CDP").is_ok() {
         checks.push(Check::new(
             "launch.skipped.cdp",
             category,
             Status::Info,
-            "Skipped (AGENT_BROWSER_CDP is set; would attach to a real browser)",
+            "Skipped (SILVER_CDP is set; would attach to a real browser)",
         ));
         return;
     }
@@ -119,7 +119,7 @@ pub(super) fn check(checks: &mut Vec<Check>, opts: &DoctorOptions) {
                 Status::Fail,
                 format!("Browser launch failed: {}", e),
             )
-            .with_fix("agent-browser install   # or check --debug output"),
+            .with_fix("silver install   # or check --debug output"),
         );
         return;
     }

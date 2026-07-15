@@ -36,7 +36,7 @@ pub(super) fn check(checks: &mut Vec<Check>) {
                 Status::Fail,
                 "No Chrome binary found",
             )
-            .with_fix("agent-browser install"),
+            .with_fix("silver install"),
         ),
     }
 
@@ -88,7 +88,7 @@ pub(super) fn check(checks: &mut Vec<Check>) {
         }
     }
 
-    if let Ok(engine) = env::var("AGENT_BROWSER_ENGINE") {
+    if let Ok(engine) = env::var("SILVER_ENGINE") {
         if engine == "lightpanda" {
             // Best-effort PATH lookup; absence is FAIL only when the user
             // explicitly opted into the lightpanda engine.
@@ -105,9 +105,9 @@ pub(super) fn check(checks: &mut Vec<Check>) {
                         "chrome.engine_lightpanda",
                         category,
                         Status::Fail,
-                        "AGENT_BROWSER_ENGINE=lightpanda but no lightpanda binary on PATH",
+                        "SILVER_ENGINE=lightpanda but no lightpanda binary on PATH",
                     )
-                    .with_fix("install lightpanda or unset AGENT_BROWSER_ENGINE"),
+                    .with_fix("install lightpanda or unset SILVER_ENGINE"),
                 );
             }
         }

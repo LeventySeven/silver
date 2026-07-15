@@ -97,7 +97,7 @@ impl Drop for ChromeProcess {
 /// canvas presentation into screenshots (upstream limitation), so WebGPU
 /// capture requires a real or virtual display. When headed mode is requested,
 /// no DISPLAY is set, and Xvfb is installed, launch spawns a private server
-/// instead of failing. Opt out with AGENT_BROWSER_NO_XVFB=1.
+/// instead of failing. Opt out with SILVER_NO_XVFB=1.
 ///
 /// The server requires MIT-MAGIC-COOKIE-1 authentication (`-auth`): without
 /// authorization records an X server allows any local user to connect, which
@@ -189,7 +189,7 @@ fn maybe_start_xvfb(options: &LaunchOptions) -> Option<XvfbServer> {
     // Private MIT-MAGIC-COOKIE-1 authority file; passed to the server via
     // -auth and to the paired Chrome via XAUTHORITY. Removed on Drop.
     let auth_file =
-        std::env::temp_dir().join(format!("agent-browser-xauth-{}", uuid::Uuid::new_v4()));
+        std::env::temp_dir().join(format!("silver-xauth-{}", uuid::Uuid::new_v4()));
     if write_xauth_file(&auth_file).is_err() {
         return None;
     }
@@ -322,7 +322,7 @@ pub struct LaunchOptions {
     /// compositing so it works without a GPU or display.
     pub webgpu: bool,
     /// Disable automatic Xvfb for headed launches on displayless Linux
-    /// hosts (AGENT_BROWSER_NO_XVFB). Carried as a launch option so the
+    /// hosts (SILVER_NO_XVFB). Carried as a launch option so the
     /// CLI's current environment wins over the env a long-lived daemon was
     /// spawned with.
     pub no_xvfb: bool,
@@ -440,7 +440,7 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         args.push("--headless=new".to_string());
         // Linux paints native scrollbars into viewport screenshots unless
         // Chrome is launched with this flag. `--hide-scrollbars` is
-        // presence-based, so agent-browser exposes --hide-scrollbars false
+        // presence-based, so silver exposes --hide-scrollbars false
         // as the public opt-out instead of forwarding a fake inverse switch.
         if options.hide_scrollbars {
             args.push("--hide-scrollbars".to_string());
@@ -467,7 +467,7 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         (dir, None)
     } else {
         let dir =
-            std::env::temp_dir().join(format!("agent-browser-chrome-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("silver-chrome-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("Failed to create temp profile dir: {}", e))?;
         args.push(format!("--user-data-dir={}", dir.display()));
@@ -525,11 +525,11 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
             let cache_dir = crate::install::get_browsers_dir();
             format!(
                 "Chrome not found. Checked:\n  \
-                 - agent-browser cache: {}\n  \
+                 - silver cache: {}\n  \
                  - System Chrome installations\n  \
                  - Puppeteer browser cache\n  \
                  - Playwright browser cache\n\
-                 Run `agent-browser install` to download Chrome, or use --executable-path.",
+                 Run `silver install` to download Chrome, or use --executable-path.",
                 cache_dir.display()
             )
         })?,
@@ -828,7 +828,7 @@ fn chrome_launch_error(message: &str, stderr_lines: &[String]) -> String {
 }
 
 pub fn find_chrome() -> Option<PathBuf> {
-    // 1. Check Chrome downloaded by `agent-browser install`
+    // 1. Check Chrome downloaded by `silver install`
     if let Some(p) = crate::install::find_installed_chrome() {
         return Some(p);
     }
@@ -840,7 +840,7 @@ pub fn find_chrome() -> Option<PathBuf> {
         let _ = writeln!(
             std::io::stderr(),
             "Warning: Chrome cache directory exists ({}) but no Chrome binary found inside. \
-             Falling back to system Chrome. Run `agent-browser install` to re-download.",
+             Falling back to system Chrome. Run `silver install` to re-download.",
             cache_dir.display()
         );
     }
@@ -1213,7 +1213,7 @@ pub fn copy_chrome_profile(
     profile_directory: &str,
 ) -> Result<PathBuf, String> {
     let temp_dir =
-        std::env::temp_dir().join(format!("agent-browser-profile-{}", uuid::Uuid::new_v4()));
+        std::env::temp_dir().join(format!("silver-profile-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_dir)
         .map_err(|e| format!("Failed to create temp profile dir: {}", e))?;
 
@@ -1622,7 +1622,7 @@ mod tests {
         guard.set("PLAYWRIGHT_BROWSERS_PATH", "/nonexistent/path");
 
         let temp_home = std::env::temp_dir().join(format!(
-            "agent-browser-test-home-{}-{}",
+            "silver-test-home-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1732,7 +1732,7 @@ mod tests {
         let result = build_chrome_args(&opts).unwrap();
         assert!(
             !result.args.iter().any(|a| a == "--hide-scrollbars"),
-            "--hide-scrollbars false should suppress agent-browser's default hide switch"
+            "--hide-scrollbars false should suppress silver's default hide switch"
         );
         if let Some(ref dir) = result.temp_user_data_dir {
             let _ = std::fs::remove_dir_all(dir);
@@ -1983,7 +1983,7 @@ mod tests {
     #[test]
     fn test_chrome_process_drop_cleans_temp_dir() {
         let dir = std::env::temp_dir().join(format!(
-            "agent-browser-chrome-drop-test-{}",
+            "silver-chrome-drop-test-{}",
             uuid::Uuid::new_v4()
         ));
         let _ = std::fs::create_dir_all(&dir);
@@ -2086,7 +2086,7 @@ mod tests {
     impl TempDir {
         fn new(name: &str) -> Self {
             Self(std::env::temp_dir().join(format!(
-                "agent-browser-test-{}-{}-{}",
+                "silver-test-{}-{}-{}",
                 name,
                 std::process::id(),
                 std::time::SystemTime::now()

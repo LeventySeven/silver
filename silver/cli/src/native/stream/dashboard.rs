@@ -700,9 +700,9 @@ async fn exec_cli(body: &str) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.args(&args)
         .arg("--json")
-        .env_remove("AGENT_BROWSER_DASHBOARD")
-        .env_remove("AGENT_BROWSER_DASHBOARD_PORT")
-        .env_remove("AGENT_BROWSER_STREAM_PORT");
+        .env_remove("SILVER_DASHBOARD")
+        .env_remove("SILVER_DASHBOARD_PORT")
+        .env_remove("SILVER_STREAM_PORT");
 
     let output = cmd
         .output()

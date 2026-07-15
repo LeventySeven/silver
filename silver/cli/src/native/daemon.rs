@@ -30,7 +30,7 @@ pub async fn run_daemon(session: &str) {
     // output can be inspected (the daemon normally has stderr piped to its
     // parent which drops the read end after startup).
     #[cfg(unix)]
-    if env::var("AGENT_BROWSER_DEBUG").is_ok() {
+    if env::var("SILVER_DEBUG").is_ok() {
         let log_path = socket_dir.join(format!("{}.log", session));
         if let Ok(file) = fs::File::create(&log_path) {
             use std::os::unix::io::IntoRawFd;
@@ -89,7 +89,7 @@ pub async fn run_daemon(session: &str) {
     let _ = fs::remove_file(socket_dir.join(format!("{}.provider", session)));
     let _ = fs::remove_file(socket_dir.join(format!("{}.extensions", session)));
 
-    if let Ok(days_str) = env::var("AGENT_BROWSER_STATE_EXPIRE_DAYS") {
+    if let Ok(days_str) = env::var("SILVER_STATE_EXPIRE_DAYS") {
         if let Ok(days) = days_str.parse::<u64>() {
             if days > 0 {
                 let _ = state::state_clean(days);
@@ -99,7 +99,7 @@ pub async fn run_daemon(session: &str) {
 
     let mut stream_client: Option<Arc<RwLock<Option<Arc<CdpClient>>>>> = None;
     let mut stream_server_instance: Option<Arc<StreamServer>> = None;
-    let preferred_port = env::var("AGENT_BROWSER_STREAM_PORT")
+    let preferred_port = env::var("SILVER_STREAM_PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(0);
@@ -118,7 +118,7 @@ pub async fn run_daemon(session: &str) {
 
     // Auto-shutdown the daemon after this many ms of inactivity (no commands received).
     // Disabled when unset or 0.
-    let idle_timeout_ms = env::var("AGENT_BROWSER_IDLE_TIMEOUT_MS")
+    let idle_timeout_ms = env::var("SILVER_IDLE_TIMEOUT_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&ms| ms > 0);
@@ -159,7 +159,7 @@ pub async fn run_daemon(session: &str) {
 /// Minimum ms between periodic session autosaves while the browser is open.
 /// Defaults to 30s; 0 disables periodic autosave (save-on-close still runs).
 fn autosave_interval_ms_from_env() -> u64 {
-    env::var("AGENT_BROWSER_AUTOSAVE_INTERVAL_MS")
+    env::var("SILVER_AUTOSAVE_INTERVAL_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(30_000)
@@ -566,14 +566,14 @@ mod tests {
     #[test]
     fn test_daemon_socket_dir_matches_client_namespace() {
         let guard = crate::test_utils::EnvGuard::new(&[
-            "AGENT_BROWSER_SOCKET_DIR",
+            "SILVER_SOCKET_DIR",
             "XDG_RUNTIME_DIR",
-            "AGENT_BROWSER_NAMESPACE",
+            "SILVER_NAMESPACE",
         ]);
         let dir = tempfile::tempdir().unwrap();
-        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.set("SILVER_SOCKET_DIR", dir.path().to_str().unwrap());
         guard.remove("XDG_RUNTIME_DIR");
-        guard.set("AGENT_BROWSER_NAMESPACE", "Worktree: One");
+        guard.set("SILVER_NAMESPACE", "Worktree: One");
 
         let socket_dir = get_daemon_socket_dir();
 
@@ -588,8 +588,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn test_port_matches_client_algorithm() {
-        let guard = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_NAMESPACE"]);
-        guard.remove("AGENT_BROWSER_NAMESPACE");
+        let guard = crate::test_utils::EnvGuard::new(&["SILVER_NAMESPACE"]);
+        guard.remove("SILVER_NAMESPACE");
 
         assert_eq!(get_port_for_session("default"), 50838);
         assert_eq!(get_port_for_session("my-session"), 63105);

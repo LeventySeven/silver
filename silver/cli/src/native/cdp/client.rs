@@ -108,7 +108,7 @@ impl CdpClient {
                         Err(_) => continue,
                     },
                     Ok(Message::Close(frame)) => {
-                        if std::env::var("AGENT_BROWSER_DEBUG").is_ok() {
+                        if std::env::var("SILVER_DEBUG").is_ok() {
                             let reason = frame
                                 .as_ref()
                                 .map(|f| format!("code={}, reason={}", f.code, f.reason))
@@ -121,7 +121,7 @@ impl CdpClient {
                     Ok(Message::Pong(_)) => continue,
                     Ok(_) => continue,
                     Err(e) => {
-                        if std::env::var("AGENT_BROWSER_DEBUG").is_ok() {
+                        if std::env::var("SILVER_DEBUG").is_ok() {
                             let _ = writeln!(std::io::stderr(), "[cdp] WebSocket Error: {}", e);
                         }
                         break;

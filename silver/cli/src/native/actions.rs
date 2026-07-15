@@ -334,7 +334,7 @@ pub struct DaemonState {
     launch_hash: Option<u64>,
     /// Browser engine name (e.g. "chrome", "lightpanda") for observability.
     pub engine: String,
-    /// Default timeout for wait operations, from AGENT_BROWSER_DEFAULT_TIMEOUT env var.
+    /// Default timeout for wait operations, from SILVER_DEFAULT_TIMEOUT env var.
     pub default_timeout_ms: u64,
     /// Last viewport settings (width, height, deviceScaleFactor, mobile),
     /// re-applied to new contexts (e.g., recording).
@@ -357,19 +357,19 @@ impl DaemonState {
             backend_type: BackendType::Cdp,
             ref_map: RefMap::new(),
             domain_filter: Arc::new(RwLock::new(
-                env::var("AGENT_BROWSER_ALLOWED_DOMAINS")
+                env::var("SILVER_ALLOWED_DOMAINS")
                     .ok()
                     .filter(|s| !s.is_empty())
                     .map(|s| DomainFilter::new(&s)),
             )),
             event_tracker: EventTracker::new(),
-            session_name: env::var("AGENT_BROWSER_SESSION_NAME").ok(),
-            restore_save: env::var("AGENT_BROWSER_RESTORE_SAVE")
+            session_name: env::var("SILVER_SESSION_NAME").ok(),
+            restore_save: env::var("SILVER_RESTORE_SAVE")
                 .ok()
                 .unwrap_or_else(|| "auto".to_string()),
-            restore_check_url: env::var("AGENT_BROWSER_RESTORE_CHECK_URL").ok(),
-            restore_check_text: env::var("AGENT_BROWSER_RESTORE_CHECK_TEXT").ok(),
-            restore_check_fn: env::var("AGENT_BROWSER_RESTORE_CHECK_FN").ok(),
+            restore_check_url: env::var("SILVER_RESTORE_CHECK_URL").ok(),
+            restore_check_text: env::var("SILVER_RESTORE_CHECK_TEXT").ok(),
+            restore_check_fn: env::var("SILVER_RESTORE_CHECK_FN").ok(),
             restore_status: "not_configured".to_string(),
             restore_status_detail: None,
             restore_loaded_path: None,
@@ -379,7 +379,7 @@ impl DaemonState {
             restore_saved_path: None,
             last_command_finished: None,
             last_autosave_attempt: None,
-            session_id: env::var("AGENT_BROWSER_SESSION").unwrap_or_else(|_| "default".to_string()),
+            session_id: env::var("SILVER_SESSION").unwrap_or_else(|_| "default".to_string()),
             tracing_state: TracingState::new(),
             recording_state: RecordingState::new(),
             event_rx: None,
@@ -403,17 +403,17 @@ impl DaemonState {
             pending_dialog: None,
             pending_pointer_release: None,
             auto_dialog: !matches!(
-                env::var("AGENT_BROWSER_NO_AUTO_DIALOG").as_deref(),
+                env::var("SILVER_NO_AUTO_DIALOG").as_deref(),
                 Ok("1" | "true" | "yes")
             ),
             stream_client: None,
             stream_server: None,
             launch_hash: None,
-            engine: env::var("AGENT_BROWSER_ENGINE").unwrap_or_else(|_| "chrome".to_string()),
+            engine: env::var("SILVER_ENGINE").unwrap_or_else(|_| "chrome".to_string()),
             // README documents 25s, intentionally below the CLI's 30s IPC
             // read timeout so the daemon reports a proper timeout error
             // instead of the client dying with EAGAIN and retrying.
-            default_timeout_ms: env::var("AGENT_BROWSER_DEFAULT_TIMEOUT")
+            default_timeout_ms: env::var("SILVER_DEFAULT_TIMEOUT")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(25_000),
@@ -425,7 +425,7 @@ impl DaemonState {
     }
 
     /// Extract the timeout from a command JSON, falling back to the
-    /// configured `default_timeout_ms` (from `AGENT_BROWSER_DEFAULT_TIMEOUT`).
+    /// configured `default_timeout_ms` (from `SILVER_DEFAULT_TIMEOUT`).
     /// All wait-family handlers should use this instead of reading the
     /// timeout field and providing their own fallback.
     fn timeout_ms(&self, cmd: &Value) -> u64 {
@@ -1224,7 +1224,7 @@ impl DaemonState {
                 }
                 Err(broadcast::error::TryRecvError::Empty) => break,
                 Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                    eprintln!("[agent-browser] Warning: CDP event buffer overflowed, {} events dropped. Network requests may be missing from HAR output.", n);
+                    eprintln!("[silver] Warning: CDP event buffer overflowed, {} events dropped. Network requests may be missing from HAR output.", n);
                     continue;
                 }
                 Err(broadcast::error::TryRecvError::Closed) => {
@@ -1573,7 +1573,7 @@ fn policy_actions_for_command(
         }
     } else if !skip_launch_action(action) && needs_implicit_launch {
         let plugins = plugins_from_command_or_env(cmd);
-        let provider_launch = env::var("AGENT_BROWSER_PROVIDER")
+        let provider_launch = env::var("SILVER_PROVIDER")
             .ok()
             .map(|provider| provider.to_lowercase())
             .filter(|provider| !provider.is_empty() && provider != "ios" && provider != "safari");
@@ -1704,7 +1704,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         }
     }
 
-    // Check AGENT_BROWSER_CONFIRM_ACTIONS (category-based, independent of policy file)
+    // Check SILVER_CONFIRM_ACTIONS (category-based, independent of policy file)
     if action != "confirm" && action != "deny" {
         if let Some(ref ca) = state.confirm_actions {
             for policy_action in &policy_actions {
@@ -2089,7 +2089,7 @@ async fn auto_launch(
     if let Some(ref server) = state.stream_server {
         options.viewport_size = Some(server.viewport().await);
     }
-    let engine = env::var("AGENT_BROWSER_ENGINE").ok();
+    let engine = env::var("SILVER_ENGINE").ok();
     let enable_features = launch_enable_features_from_env();
     let init_script_paths = launch_init_script_paths_from_env();
 
@@ -2110,7 +2110,7 @@ async fn auto_launch(
     write_engine_file(&state.session_id, &state.engine);
     write_extensions_file(&state.session_id);
 
-    if let Ok(cdp) = env::var("AGENT_BROWSER_CDP") {
+    if let Ok(cdp) = env::var("SILVER_CDP") {
         let mgr = BrowserManager::connect_cdp(&cdp).await?;
         let hash = launch_hash(
             &options,
@@ -2134,7 +2134,7 @@ async fn auto_launch(
         return Ok(());
     }
 
-    if env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok() {
+    if env::var("SILVER_AUTO_CONNECT").is_ok() {
         let hash = launch_hash(
             &options,
             &state.plugin_init_scripts,
@@ -2157,11 +2157,11 @@ async fn auto_launch(
         return Ok(());
     }
 
-    // Cloud provider: when AGENT_BROWSER_PROVIDER is set, connect via the
+    // Cloud provider: when SILVER_PROVIDER is set, connect via the
     // provider API instead of launching a local Chrome instance.  This mirrors
     // the logic in handle_launch() so that auto_launch (triggered by any
     // command arriving before an explicit "launch") honours the provider env.
-    if let Ok(provider) = env::var("AGENT_BROWSER_PROVIDER") {
+    if let Ok(provider) = env::var("SILVER_PROVIDER") {
         let p = provider.to_lowercase();
         // ios/safari are device providers handled via explicit launch command
         if !p.is_empty() && p != "ios" && p != "safari" {
@@ -2248,13 +2248,13 @@ async fn auto_launch(
     Ok(())
 }
 
-/// Apply AGENT_BROWSER_ENABLE (built-in init scripts like `react-devtools`)
-/// and AGENT_BROWSER_INIT_SCRIPTS (user-provided files) to the browser so the
+/// Apply SILVER_ENABLE (built-in init scripts like `react-devtools`)
+/// and SILVER_INIT_SCRIPTS (user-provided files) to the browser so the
 /// scripts are registered before any page JS runs on the next navigation.
 /// Also evaluates each script on the current page (if any) so the effect is
 /// immediate for already-loaded pages.
 fn launch_enable_features_from_env() -> Vec<String> {
-    env::var("AGENT_BROWSER_ENABLE")
+    env::var("SILVER_ENABLE")
         .ok()
         .map(|raw| {
             raw.split([',', '\n'])
@@ -2266,7 +2266,7 @@ fn launch_enable_features_from_env() -> Vec<String> {
 }
 
 fn launch_init_script_paths_from_env() -> Vec<String> {
-    env::var("AGENT_BROWSER_INIT_SCRIPTS")
+    env::var("SILVER_INIT_SCRIPTS")
         .ok()
         .map(|raw| {
             raw.split([',', '\n'])
@@ -2335,7 +2335,7 @@ async fn apply_launch_mutator_plugins(
         "session": state.session_id,
         "launchOptions": {
             "headless": options.headless,
-            "engine": env::var("AGENT_BROWSER_ENGINE").unwrap_or_else(|_| "chrome".to_string()),
+            "engine": env::var("SILVER_ENGINE").unwrap_or_else(|_| "chrome".to_string()),
             "args": options.args.clone(),
             "extensions": options.extensions.clone(),
             "userAgent": options.user_agent.clone(),
@@ -2368,7 +2368,7 @@ async fn apply_launch_mutator_plugins(
 fn launch_options_from_env() -> LaunchOptions {
     let headed = headed_from_env();
 
-    let extensions: Option<Vec<String>> = env::var("AGENT_BROWSER_EXTENSIONS").ok().map(|v| {
+    let extensions: Option<Vec<String>> = env::var("SILVER_EXTENSIONS").ok().map(|v| {
         v.split([',', '\n'])
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -2377,16 +2377,16 @@ fn launch_options_from_env() -> LaunchOptions {
 
     LaunchOptions {
         headless: !headed,
-        executable_path: env::var("AGENT_BROWSER_EXECUTABLE_PATH").ok(),
-        proxy: env::var("AGENT_BROWSER_PROXY").ok(),
-        proxy_bypass: env::var("AGENT_BROWSER_PROXY_BYPASS").ok(),
-        proxy_username: env::var("AGENT_BROWSER_PROXY_USERNAME").ok(),
-        proxy_password: env::var("AGENT_BROWSER_PROXY_PASSWORD").ok(),
-        profile: env::var("AGENT_BROWSER_PROFILE").ok(),
-        allow_file_access: env::var("AGENT_BROWSER_ALLOW_FILE_ACCESS")
+        executable_path: env::var("SILVER_EXECUTABLE_PATH").ok(),
+        proxy: env::var("SILVER_PROXY").ok(),
+        proxy_bypass: env::var("SILVER_PROXY_BYPASS").ok(),
+        proxy_username: env::var("SILVER_PROXY_USERNAME").ok(),
+        proxy_password: env::var("SILVER_PROXY_PASSWORD").ok(),
+        profile: env::var("SILVER_PROFILE").ok(),
+        allow_file_access: env::var("SILVER_ALLOW_FILE_ACCESS")
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false),
-        args: env::var("AGENT_BROWSER_ARGS")
+        args: env::var("SILVER_ARGS")
             .map(|v| {
                 v.split([',', '\n'])
                     .map(|s| s.trim().to_string())
@@ -2395,13 +2395,13 @@ fn launch_options_from_env() -> LaunchOptions {
             })
             .unwrap_or_default(),
         extensions,
-        storage_state: env::var("AGENT_BROWSER_STATE").ok(),
-        user_agent: env::var("AGENT_BROWSER_USER_AGENT").ok(),
-        ignore_https_errors: env::var("AGENT_BROWSER_IGNORE_HTTPS_ERRORS")
+        storage_state: env::var("SILVER_STATE").ok(),
+        user_agent: env::var("SILVER_USER_AGENT").ok(),
+        ignore_https_errors: env::var("SILVER_IGNORE_HTTPS_ERRORS")
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false),
-        color_scheme: env::var("AGENT_BROWSER_COLOR_SCHEME").ok(),
-        download_path: env::var("AGENT_BROWSER_DOWNLOAD_PATH").ok(),
+        color_scheme: env::var("SILVER_COLOR_SCHEME").ok(),
+        download_path: env::var("SILVER_DOWNLOAD_PATH").ok(),
         hide_scrollbars: hide_scrollbars_from_env(),
         viewport_size: None,
         use_real_keychain: false,
@@ -2411,7 +2411,7 @@ fn launch_options_from_env() -> LaunchOptions {
 }
 
 fn hide_scrollbars_from_env() -> bool {
-    env::var("AGENT_BROWSER_HIDE_SCROLLBARS")
+    env::var("SILVER_HIDE_SCROLLBARS")
         .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no" | ""))
         .unwrap_or(true)
 }
@@ -2423,13 +2423,13 @@ fn hide_scrollbars_from_launch_cmd(cmd: &Value) -> bool {
 }
 
 fn headed_from_env() -> bool {
-    env::var("AGENT_BROWSER_HEADED")
+    env::var("SILVER_HEADED")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false)
 }
 
 fn webgpu_from_env() -> bool {
-    env::var("AGENT_BROWSER_WEBGPU")
+    env::var("SILVER_WEBGPU")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false)
 }
@@ -2441,7 +2441,7 @@ fn webgpu_from_launch_cmd(cmd: &Value) -> bool {
 }
 
 fn no_xvfb_from_env() -> bool {
-    env::var("AGENT_BROWSER_NO_XVFB")
+    env::var("SILVER_NO_XVFB")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false)
 }
@@ -2724,7 +2724,7 @@ async fn load_storage_state_or_rollback(
     Ok(())
 }
 
-/// Load storage state from AGENT_BROWSER_STATE if set.
+/// Load storage state from SILVER_STATE if set.
 async fn try_load_storage_state(state: &mut DaemonState, path: &Option<String>) {
     let _ = load_storage_state(state, path).await;
 }
@@ -2765,7 +2765,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         .get("engine")
         .and_then(|v| v.as_str())
         .map(String::from)
-        .or_else(|| env::var("AGENT_BROWSER_ENGINE").ok());
+        .or_else(|| env::var("SILVER_ENGINE").ok());
 
     let mut launch_options = LaunchOptions {
         headless,
@@ -2773,7 +2773,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             .get("executablePath")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .or_else(|| env::var("AGENT_BROWSER_EXECUTABLE_PATH").ok()),
+            .or_else(|| env::var("SILVER_EXECUTABLE_PATH").ok()),
         proxy: cmd.get("proxy").and_then(|v| {
             v.as_str().map(|s| s.to_string()).or_else(|| {
                 v.get("server")
@@ -2791,13 +2791,13 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             .and_then(|v| v.get("username"))
             .and_then(|v| v.as_str())
             .map(String::from)
-            .or_else(|| env::var("AGENT_BROWSER_PROXY_USERNAME").ok()),
+            .or_else(|| env::var("SILVER_PROXY_USERNAME").ok()),
         proxy_password: cmd
             .get("proxy")
             .and_then(|v| v.get("password"))
             .and_then(|v| v.as_str())
             .map(String::from)
-            .or_else(|| env::var("AGENT_BROWSER_PROXY_PASSWORD").ok()),
+            .or_else(|| env::var("SILVER_PROXY_PASSWORD").ok()),
         profile: cmd
             .get("profile")
             .and_then(|v| v.as_str())
@@ -4562,7 +4562,7 @@ async fn handle_errors(state: &DaemonState) -> Result<Value, String> {
 async fn handle_session_info(state: &DaemonState) -> Result<Value, String> {
     Ok(json!({
         "session": state.session_id,
-        "namespace": env::var("AGENT_BROWSER_NAMESPACE").ok(),
+        "namespace": env::var("SILVER_NAMESPACE").ok(),
         "socketDir": get_socket_dir().to_string_lossy(),
         "backgroundPid": std::process::id(),
         "browserLaunched": state.browser.is_some(),
@@ -5430,7 +5430,7 @@ async fn handle_pdf(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
         None => {
             let dir = dirs::home_dir()
                 .unwrap_or_else(std::env::temp_dir)
-                .join(".agent-browser")
+                .join(".silver")
                 .join("tmp")
                 .join("pdfs");
             let _ = std::fs::create_dir_all(&dir);
@@ -6419,7 +6419,7 @@ fn extensions_file_path(session_id: &str) -> PathBuf {
 }
 
 fn write_extensions_file(session_id: &str) {
-    if let Ok(val) = env::var("AGENT_BROWSER_EXTENSIONS") {
+    if let Ok(val) = env::var("SILVER_EXTENSIONS") {
         let trimmed = val.trim();
         if !trimmed.is_empty() {
             let _ = fs::write(extensions_file_path(session_id), trimmed);
@@ -7749,7 +7749,7 @@ async fn handle_har_stop(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     let mut log = json!({
         "version": "1.2",
         "creator": {
-            "name": "agent-browser",
+            "name": "silver",
             "version": env!("CARGO_PKG_VERSION")
         },
         "entries": entries
@@ -8048,9 +8048,9 @@ fn har_output_path(explicit_path: Option<&str>) -> String {
 
 fn get_har_dir() -> PathBuf {
     if let Some(home) = dirs::home_dir() {
-        home.join(".agent-browser").join("tmp").join("har")
+        home.join(".silver").join("tmp").join("har")
     } else {
-        std::env::temp_dir().join("agent-browser").join("har")
+        std::env::temp_dir().join("silver").join("har")
     }
 }
 
@@ -9565,7 +9565,7 @@ mod tests {
             .expect("system clock should be after unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "agent-browser-{label}-{}-{nanos}",
+            "silver-{label}-{}-{nanos}",
             std::process::id()
         ))
     }
@@ -9821,8 +9821,8 @@ mod tests {
 
     #[test]
     fn test_policy_actions_use_command_plugins_for_auto_launch_mutators() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_PROVIDER"]);
-        guard.remove("AGENT_BROWSER_PROVIDER");
+        let guard = EnvGuard::new(&["SILVER_PROVIDER"]);
+        guard.remove("SILVER_PROVIDER");
         let cmd = json!({
             "action": "navigate",
             "id": "policy-plugin-1",
@@ -9844,8 +9844,8 @@ mod tests {
 
     #[test]
     fn test_policy_actions_skip_auto_launch_mutators_when_browser_is_healthy() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_PROVIDER"]);
-        guard.remove("AGENT_BROWSER_PROVIDER");
+        let guard = EnvGuard::new(&["SILVER_PROVIDER"]);
+        guard.remove("SILVER_PROVIDER");
         let cmd = json!({
             "action": "navigate",
             "id": "policy-plugin-healthy",
@@ -9866,8 +9866,8 @@ mod tests {
 
     #[test]
     fn test_policy_actions_use_command_plugins_for_provider_auto_launch() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_PROVIDER"]);
-        guard.set("AGENT_BROWSER_PROVIDER", "browserbox");
+        let guard = EnvGuard::new(&["SILVER_PROVIDER"]);
+        guard.set("SILVER_PROVIDER", "browserbox");
         let cmd = json!({
             "action": "navigate",
             "id": "policy-plugin-2",
@@ -9894,8 +9894,8 @@ mod tests {
 
     #[test]
     fn test_policy_actions_use_resolved_provider_plugin_capability() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_PROVIDER"]);
-        guard.set("AGENT_BROWSER_PROVIDER", "browserbox");
+        let guard = EnvGuard::new(&["SILVER_PROVIDER"]);
+        guard.set("SILVER_PROVIDER", "browserbox");
         let cmd = json!({
             "action": "navigate",
             "id": "policy-plugin-duplicate-provider",
@@ -9947,8 +9947,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_policy_denies_plugin_action_before_base_confirmation() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_PROVIDER"]);
-        guard.remove("AGENT_BROWSER_PROVIDER");
+        let guard = EnvGuard::new(&["SILVER_PROVIDER"]);
+        guard.remove("SILVER_PROVIDER");
         let dir = tempfile::tempdir().unwrap();
         let policy_path = dir.path().join("policy.json");
         fs::write(
@@ -10191,8 +10191,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_confirm_rechecks_unapproved_plugin_action() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_PROVIDER"]);
-        guard.remove("AGENT_BROWSER_PROVIDER");
+        let guard = EnvGuard::new(&["SILVER_PROVIDER"]);
+        guard.remove("SILVER_PROVIDER");
         let dir = tempfile::tempdir().unwrap();
         let policy_path = dir.path().join("policy.json");
         fs::write(
@@ -10328,14 +10328,14 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
     #[tokio::test]
     async fn test_stream_enable_disable_and_status_without_browser() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+        let guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "SILVER_SESSION"]);
         let socket_dir = unique_socket_dir("stream-runtime");
         fs::create_dir_all(&socket_dir).expect("socket dir should be created");
         guard.set(
-            "AGENT_BROWSER_SOCKET_DIR",
+            "SILVER_SOCKET_DIR",
             socket_dir.to_str().expect("socket dir should be utf-8"),
         );
-        guard.set("AGENT_BROWSER_SESSION", "stream-runtime-session");
+        guard.set("SILVER_SESSION", "stream-runtime-session");
 
         let mut state = DaemonState::new();
 
@@ -10401,15 +10401,15 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
     #[tokio::test]
     async fn test_stream_disable_preserves_existing_screencast_state() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+        let guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "SILVER_SESSION"]);
         let socket_dir = unique_socket_dir("stream-preserve-screencast");
         fs::create_dir_all(&socket_dir).expect("socket dir should be created");
         guard.set(
-            "AGENT_BROWSER_SOCKET_DIR",
+            "SILVER_SOCKET_DIR",
             socket_dir.to_str().expect("socket dir should be utf-8"),
         );
         guard.set(
-            "AGENT_BROWSER_SESSION",
+            "SILVER_SESSION",
             "stream-preserve-screencast-session",
         );
 
@@ -10433,14 +10433,14 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
     #[tokio::test]
     async fn test_stream_disable_clears_state_when_stream_file_removal_fails() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+        let guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "SILVER_SESSION"]);
         let socket_dir = unique_socket_dir("stream-disable-cleanup");
         fs::create_dir_all(&socket_dir).expect("socket dir should be created");
         guard.set(
-            "AGENT_BROWSER_SOCKET_DIR",
+            "SILVER_SOCKET_DIR",
             socket_dir.to_str().expect("socket dir should be utf-8"),
         );
-        guard.set("AGENT_BROWSER_SESSION", "stream-disable-cleanup-session");
+        guard.set("SILVER_SESSION", "stream-disable-cleanup-session");
 
         let mut state = DaemonState::new();
         handle_stream_enable(&json!({ "port": 0 }), &mut state)
@@ -10469,14 +10469,14 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
     #[tokio::test]
     async fn test_stream_enable_port_conflict_returns_error() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+        let guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "SILVER_SESSION"]);
         let socket_dir = unique_socket_dir("stream-port-conflict");
         fs::create_dir_all(&socket_dir).expect("socket dir should be created");
         guard.set(
-            "AGENT_BROWSER_SOCKET_DIR",
+            "SILVER_SOCKET_DIR",
             socket_dir.to_str().expect("socket dir should be utf-8"),
         );
-        guard.set("AGENT_BROWSER_SESSION", "stream-port-conflict-session");
+        guard.set("SILVER_SESSION", "stream-port-conflict-session");
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0")
             .expect("test should reserve an ephemeral port");
@@ -10523,13 +10523,13 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
     #[tokio::test]
     async fn test_daemon_state_new() {
         let guard = EnvGuard::new(&[
-            "AGENT_BROWSER_ALLOWED_DOMAINS",
-            "AGENT_BROWSER_SESSION_NAME",
-            "AGENT_BROWSER_SESSION",
+            "SILVER_ALLOWED_DOMAINS",
+            "SILVER_SESSION_NAME",
+            "SILVER_SESSION",
         ]);
-        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
-        guard.remove("AGENT_BROWSER_SESSION_NAME");
-        guard.remove("AGENT_BROWSER_SESSION");
+        guard.remove("SILVER_ALLOWED_DOMAINS");
+        guard.remove("SILVER_SESSION_NAME");
+        guard.remove("SILVER_SESSION");
 
         let state = DaemonState::new();
         assert!(state.browser.is_none());
@@ -10631,9 +10631,9 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
     #[test]
     fn test_launch_options_from_env_defaults() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_HEADED", "AGENT_BROWSER_HIDE_SCROLLBARS"]);
-        guard.remove("AGENT_BROWSER_HEADED");
-        guard.remove("AGENT_BROWSER_HIDE_SCROLLBARS");
+        let guard = EnvGuard::new(&["SILVER_HEADED", "SILVER_HIDE_SCROLLBARS"]);
+        guard.remove("SILVER_HEADED");
+        guard.remove("SILVER_HIDE_SCROLLBARS");
         let opts = launch_options_from_env();
         assert!(opts.headless);
         assert!(opts.args.is_empty());
@@ -10643,55 +10643,55 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
     #[test]
     fn test_launch_options_from_env_headed_flag() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_HEADED", "AGENT_BROWSER_HIDE_SCROLLBARS"]);
-        guard.set("AGENT_BROWSER_HEADED", "1");
-        guard.remove("AGENT_BROWSER_HIDE_SCROLLBARS");
+        let guard = EnvGuard::new(&["SILVER_HEADED", "SILVER_HIDE_SCROLLBARS"]);
+        guard.set("SILVER_HEADED", "1");
+        guard.remove("SILVER_HIDE_SCROLLBARS");
         let opts = launch_options_from_env();
         assert!(
             !opts.headless,
-            "AGENT_BROWSER_HEADED=1 should set headless=false"
+            "SILVER_HEADED=1 should set headless=false"
         );
     }
 
     #[test]
     fn test_launch_options_from_env_hide_scrollbars_false() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_HIDE_SCROLLBARS"]);
-        guard.set("AGENT_BROWSER_HIDE_SCROLLBARS", "false");
+        let guard = EnvGuard::new(&["SILVER_HIDE_SCROLLBARS"]);
+        guard.set("SILVER_HIDE_SCROLLBARS", "false");
         let opts = launch_options_from_env();
         assert!(!opts.hide_scrollbars);
     }
 
     #[test]
     fn test_launch_options_from_env_webgpu() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_WEBGPU"]);
-        guard.remove("AGENT_BROWSER_WEBGPU");
+        let guard = EnvGuard::new(&["SILVER_WEBGPU"]);
+        guard.remove("SILVER_WEBGPU");
         assert!(!launch_options_from_env().webgpu);
-        guard.set("AGENT_BROWSER_WEBGPU", "1");
+        guard.set("SILVER_WEBGPU", "1");
         assert!(launch_options_from_env().webgpu);
     }
 
     #[test]
     fn test_webgpu_from_launch_cmd() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_WEBGPU"]);
-        guard.remove("AGENT_BROWSER_WEBGPU");
+        let guard = EnvGuard::new(&["SILVER_WEBGPU"]);
+        guard.remove("SILVER_WEBGPU");
         assert!(webgpu_from_launch_cmd(&json!({ "webgpu": true })));
         assert!(!webgpu_from_launch_cmd(&json!({ "webgpu": false })));
         // Falls back to the env var when the command omits the field.
         assert!(!webgpu_from_launch_cmd(&json!({})));
-        guard.set("AGENT_BROWSER_WEBGPU", "1");
+        guard.set("SILVER_WEBGPU", "1");
         assert!(webgpu_from_launch_cmd(&json!({})));
         assert!(!webgpu_from_launch_cmd(&json!({ "webgpu": false })));
     }
 
     #[test]
     fn test_no_xvfb_from_launch_cmd() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_NO_XVFB"]);
-        guard.remove("AGENT_BROWSER_NO_XVFB");
+        let guard = EnvGuard::new(&["SILVER_NO_XVFB"]);
+        guard.remove("SILVER_NO_XVFB");
         assert!(no_xvfb_from_launch_cmd(&json!({ "noXvfb": true })));
         assert!(!no_xvfb_from_launch_cmd(&json!({ "noXvfb": false })));
         // Falls back to the daemon env when the command omits the field.
         assert!(!no_xvfb_from_launch_cmd(&json!({})));
-        guard.set("AGENT_BROWSER_NO_XVFB", "1");
+        guard.set("SILVER_NO_XVFB", "1");
         assert!(no_xvfb_from_launch_cmd(&json!({})));
         assert!(!no_xvfb_from_launch_cmd(&json!({ "noXvfb": false })));
     }
@@ -10815,10 +10815,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
     #[test]
     fn test_write_extensions_file_from_paths_uses_final_extensions() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_EXTENSIONS"]);
+        let guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "SILVER_EXTENSIONS"]);
         let dir = tempfile::tempdir().unwrap();
-        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
-        guard.set("AGENT_BROWSER_EXTENSIONS", "/env/ext");
+        guard.set("SILVER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.set("SILVER_EXTENSIONS", "/env/ext");
         let extensions = vec![
             " /plugin/ext ".to_string(),
             "".to_string(),
@@ -10833,10 +10833,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
     #[test]
     fn test_write_extensions_file_from_paths_falls_back_to_env() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_EXTENSIONS"]);
+        let guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "SILVER_EXTENSIONS"]);
         let dir = tempfile::tempdir().unwrap();
-        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
-        guard.set("AGENT_BROWSER_EXTENSIONS", "/env/ext");
+        guard.set("SILVER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.set("SILVER_EXTENSIONS", "/env/ext");
 
         write_extensions_file_from_paths("metadata-env-test", None);
 
@@ -10846,8 +10846,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
     #[test]
     fn test_launch_cmd_hide_scrollbars_missing_uses_env_default() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_HIDE_SCROLLBARS"]);
-        guard.set("AGENT_BROWSER_HIDE_SCROLLBARS", "false");
+        let guard = EnvGuard::new(&["SILVER_HIDE_SCROLLBARS"]);
+        guard.set("SILVER_HIDE_SCROLLBARS", "false");
 
         assert!(!hide_scrollbars_from_launch_cmd(&json!({
             "action": "launch"
@@ -10856,8 +10856,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
     #[test]
     fn test_launch_cmd_hide_scrollbars_explicit_overrides_env_default() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_HIDE_SCROLLBARS"]);
-        guard.set("AGENT_BROWSER_HIDE_SCROLLBARS", "false");
+        let guard = EnvGuard::new(&["SILVER_HIDE_SCROLLBARS"]);
+        guard.set("SILVER_HIDE_SCROLLBARS", "false");
 
         assert!(hide_scrollbars_from_launch_cmd(&json!({
             "action": "launch",
@@ -11052,7 +11052,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
         let har: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(har["log"]["version"], "1.2");
-        assert_eq!(har["log"]["creator"]["name"], "agent-browser");
+        assert_eq!(har["log"]["creator"]["name"], "silver");
         assert!(har["log"].get("browser").is_none());
         assert_eq!(har["log"]["entries"][0]["response"]["content"]["size"], 128);
 
@@ -11062,7 +11062,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
     #[tokio::test]
     async fn test_execute_har_stop_skips_browser_auto_launch() {
         let path = std::env::temp_dir().join(format!(
-            "agent-browser-har-stop-{}.har",
+            "silver-har-stop-{}.har",
             unix_timestamp_millis()
         ));
         let mut state = DaemonState::new();
@@ -11114,19 +11114,19 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
     #[test]
     fn test_default_timeout_ms_from_env() {
-        let env = EnvGuard::new(&["AGENT_BROWSER_DEFAULT_TIMEOUT"]);
-        // When AGENT_BROWSER_DEFAULT_TIMEOUT is set, DaemonState should use it
-        env.set("AGENT_BROWSER_DEFAULT_TIMEOUT", "3000");
+        let env = EnvGuard::new(&["SILVER_DEFAULT_TIMEOUT"]);
+        // When SILVER_DEFAULT_TIMEOUT is set, DaemonState should use it
+        env.set("SILVER_DEFAULT_TIMEOUT", "3000");
         let state = DaemonState::new();
         assert_eq!(state.default_timeout_ms, 3000);
     }
 
     #[test]
     fn test_default_timeout_ms_fallback() {
-        let env = EnvGuard::new(&["AGENT_BROWSER_DEFAULT_TIMEOUT"]);
-        // When AGENT_BROWSER_DEFAULT_TIMEOUT is unset, DaemonState uses the
+        let env = EnvGuard::new(&["SILVER_DEFAULT_TIMEOUT"]);
+        // When SILVER_DEFAULT_TIMEOUT is unset, DaemonState uses the
         // documented 25s default (below the CLI's 30s IPC read timeout).
-        env.remove("AGENT_BROWSER_DEFAULT_TIMEOUT");
+        env.remove("SILVER_DEFAULT_TIMEOUT");
         let state = DaemonState::new();
         assert_eq!(state.default_timeout_ms, 25_000);
     }
@@ -11185,7 +11185,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
     #[allow(clippy::await_holding_lock)]
     async fn test_credentials_roundtrip_via_actions() {
         let _lock = crate::native::auth::AUTH_TEST_MUTEX.lock().unwrap();
-        let key_var = "AGENT_BROWSER_ENCRYPTION_KEY";
+        let key_var = "SILVER_ENCRYPTION_KEY";
         let original = std::env::var(key_var).ok();
         // SAFETY: AUTH_TEST_MUTEX serializes all test access so no concurrent mutation.
         unsafe { std::env::set_var(key_var, "a".repeat(64)) };
@@ -11491,8 +11491,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
     #[tokio::test]
     async fn test_auto_dialog_enabled_by_default() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_NO_AUTO_DIALOG"]);
-        std::env::remove_var("AGENT_BROWSER_NO_AUTO_DIALOG");
+        let guard = EnvGuard::new(&["SILVER_NO_AUTO_DIALOG"]);
+        std::env::remove_var("SILVER_NO_AUTO_DIALOG");
         let state = DaemonState::new();
         assert!(state.auto_dialog, "auto_dialog should be true by default");
         drop(guard);
@@ -11500,32 +11500,32 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
     #[tokio::test]
     async fn test_auto_dialog_disabled_by_env() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_NO_AUTO_DIALOG"]);
-        guard.set("AGENT_BROWSER_NO_AUTO_DIALOG", "1");
+        let guard = EnvGuard::new(&["SILVER_NO_AUTO_DIALOG"]);
+        guard.set("SILVER_NO_AUTO_DIALOG", "1");
         let state = DaemonState::new();
         assert!(
             !state.auto_dialog,
-            "auto_dialog should be false when AGENT_BROWSER_NO_AUTO_DIALOG=1"
+            "auto_dialog should be false when SILVER_NO_AUTO_DIALOG=1"
         );
         drop(guard);
     }
 
     #[tokio::test]
     async fn test_auto_dialog_disabled_by_env_true() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_NO_AUTO_DIALOG"]);
-        guard.set("AGENT_BROWSER_NO_AUTO_DIALOG", "true");
+        let guard = EnvGuard::new(&["SILVER_NO_AUTO_DIALOG"]);
+        guard.set("SILVER_NO_AUTO_DIALOG", "true");
         let state = DaemonState::new();
         assert!(
             !state.auto_dialog,
-            "auto_dialog should be false when AGENT_BROWSER_NO_AUTO_DIALOG=true"
+            "auto_dialog should be false when SILVER_NO_AUTO_DIALOG=true"
         );
         drop(guard);
     }
 
     #[tokio::test]
     async fn test_auto_dialog_not_disabled_by_random_value() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_NO_AUTO_DIALOG"]);
-        guard.set("AGENT_BROWSER_NO_AUTO_DIALOG", "no");
+        let guard = EnvGuard::new(&["SILVER_NO_AUTO_DIALOG"]);
+        guard.set("SILVER_NO_AUTO_DIALOG", "no");
         let state = DaemonState::new();
         assert!(
             state.auto_dialog,

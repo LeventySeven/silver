@@ -1,6 +1,6 @@
-//! Check user config files: `~/.agent-browser/config.json`,
-//! `./agent-browser.json`, and any file referenced by
-//! `AGENT_BROWSER_CONFIG`.
+//! Check user config files: `~/.silver/config.json`,
+//! `./silver.json`, and any file referenced by
+//! `SILVER_CONFIG`.
 
 use std::env;
 use std::path::PathBuf;
@@ -11,7 +11,7 @@ use super::{Check, Status};
 pub(super) fn check(checks: &mut Vec<Check>) {
     let category = "Config";
 
-    let user_path = dirs::home_dir().map(|d| d.join(".agent-browser").join("config.json"));
+    let user_path = dirs::home_dir().map(|d| d.join(".silver").join("config.json"));
     if let Some(p) = user_path {
         if p.exists() {
             match parse_json_file(&p) {
@@ -34,7 +34,7 @@ pub(super) fn check(checks: &mut Vec<Check>) {
         }
     }
 
-    let project_path = PathBuf::from("agent-browser.json");
+    let project_path = PathBuf::from("silver.json");
     if project_path.exists() {
         match parse_json_file(&project_path) {
             Ok(_) => checks.push(Check::new(
@@ -55,7 +55,7 @@ pub(super) fn check(checks: &mut Vec<Check>) {
         }
     }
 
-    if let Ok(custom) = env::var("AGENT_BROWSER_CONFIG") {
+    if let Ok(custom) = env::var("SILVER_CONFIG") {
         let p = PathBuf::from(&custom);
         if !p.exists() {
             checks.push(
@@ -63,9 +63,9 @@ pub(super) fn check(checks: &mut Vec<Check>) {
                     "config.custom",
                     category,
                     Status::Fail,
-                    format!("AGENT_BROWSER_CONFIG points to missing file: {}", custom),
+                    format!("SILVER_CONFIG points to missing file: {}", custom),
                 )
-                .with_fix("update or unset AGENT_BROWSER_CONFIG"),
+                .with_fix("update or unset SILVER_CONFIG"),
             );
         } else {
             match parse_json_file(&p) {
@@ -73,14 +73,14 @@ pub(super) fn check(checks: &mut Vec<Check>) {
                     "config.custom",
                     category,
                     Status::Pass,
-                    format!("AGENT_BROWSER_CONFIG: {} (valid JSON)", custom),
+                    format!("SILVER_CONFIG: {} (valid JSON)", custom),
                 )),
                 Err(e) => checks.push(
                     Check::new(
                         "config.custom",
                         category,
                         Status::Fail,
-                        format!("AGENT_BROWSER_CONFIG: {}: {}", custom, e),
+                        format!("SILVER_CONFIG: {}: {}", custom, e),
                     )
                     .with_fix(format!("edit {}", custom)),
                 ),

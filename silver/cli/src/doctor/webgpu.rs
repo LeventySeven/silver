@@ -2,7 +2,7 @@
 //! enabled, render through a real WebGPU pass, and assert on actual pixels
 //! twice: an offscreen buffer readback and a decoded screenshot. WebGPU
 //! failures are silent black (a screenshot request still returns 200), so
-//! only pixel values prove anything. Opt-in via `agent-browser doctor
+//! only pixel values prove anything. Opt-in via `silver doctor
 //! --webgpu` because it launches a second Chrome.
 //!
 //! Subtleties this probe encodes (each verified on real machines):
@@ -109,21 +109,21 @@ const PROBE_JS: &str = r#"(async () => {
 })()"#;
 
 pub(super) fn check(checks: &mut Vec<Check>, opts: &DoctorOptions) {
-    if env::var("AGENT_BROWSER_PROVIDER").is_ok() {
+    if env::var("SILVER_PROVIDER").is_ok() {
         checks.push(Check::new(
             "webgpu.skipped.provider",
             CATEGORY,
             Status::Info,
-            "Skipped (AGENT_BROWSER_PROVIDER is set; would consume cloud quota)",
+            "Skipped (SILVER_PROVIDER is set; would consume cloud quota)",
         ));
         return;
     }
-    if env::var("AGENT_BROWSER_CDP").is_ok() {
+    if env::var("SILVER_CDP").is_ok() {
         checks.push(Check::new(
             "webgpu.skipped.cdp",
             CATEGORY,
             Status::Info,
-            "Skipped (AGENT_BROWSER_CDP is set; would attach to a real browser)",
+            "Skipped (SILVER_CDP is set; would attach to a real browser)",
         ));
         return;
     }
@@ -143,7 +143,7 @@ pub(super) fn check(checks: &mut Vec<Check>, opts: &DoctorOptions) {
     // writes; the page file additionally uses create_new so an existing
     // path is never followed.
     let work_dir = env::temp_dir().join(format!(
-        "agent-browser-doctor-webgpu-{}",
+        "silver-doctor-webgpu-{}",
         uuid::Uuid::new_v4()
     ));
     let mut dir_builder = std::fs::DirBuilder::new();
@@ -221,7 +221,7 @@ pub(super) fn check(checks: &mut Vec<Check>, opts: &DoctorOptions) {
         action_policy: None,
         confirm_actions: None,
         // Pinned: the probe is Chrome-specific, and an inherited
-        // AGENT_BROWSER_ENGINE=lightpanda would otherwise test the wrong
+        // SILVER_ENGINE=lightpanda would otherwise test the wrong
         // browser and report a false WebGPU failure.
         engine: Some("chrome"),
         auto_connect: false,
@@ -261,7 +261,7 @@ pub(super) fn check(checks: &mut Vec<Check>, opts: &DoctorOptions) {
                 Status::Fail,
                 format!("Browser launch failed: {}", e),
             )
-            .with_fix("agent-browser install   # or check --debug output"),
+            .with_fix("silver install   # or check --debug output"),
         );
         return;
     }
@@ -454,7 +454,7 @@ fn probe_fail(id: &str, message: String) -> Check {
             "apt-get install -y libvulkan1 mesa-vulkan-drivers   # WebGPU on Linux needs a Vulkan loader + Mesa ICD",
         )
     } else {
-        check.with_fix("update Chrome to the latest stable (agent-browser install)")
+        check.with_fix("update Chrome to the latest stable (silver install)")
     }
 }
 

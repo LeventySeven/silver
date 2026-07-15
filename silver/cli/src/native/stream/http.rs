@@ -548,9 +548,9 @@ mod tests {
             .prefix("ab-")
             .tempdir_in(temp_parent)
             .unwrap();
-        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        let guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
         guard.set(
-            "AGENT_BROWSER_SOCKET_DIR",
+            "SILVER_SOCKET_DIR",
             socket_dir.path().to_str().unwrap(),
         );
         guard.remove("XDG_RUNTIME_DIR");
@@ -675,9 +675,9 @@ mod tests {
             .prefix("ab-")
             .tempdir_in(temp_parent)
             .unwrap();
-        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        let guard = EnvGuard::new(&["SILVER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
         guard.set(
-            "AGENT_BROWSER_SOCKET_DIR",
+            "SILVER_SOCKET_DIR",
             socket_dir.path().to_str().unwrap(),
         );
         guard.remove("XDG_RUNTIME_DIR");

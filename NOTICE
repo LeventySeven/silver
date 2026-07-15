@@ -1,0 +1,14 @@
+Silver
+======
+
+Silver is a fork of vercel-labs/agent-browser (https://github.com/vercel-labs/agent-browser),
+originally released under the Apache License 2.0. Silver has been rebranded and enhanced
+while preserving the upstream license and attribution.
+
+Original work: vercel-labs/agent-browser (Apache-2.0)
+Original license: see silver/LICENSE (Apache License 2.0), retained unmodified.
+
+Portions of this project remain (C) their original authors. Upstream repository URLs,
+plugin-ecosystem package names (agent-browser-plugin-*), and the plugin wire-protocol
+identifier (agent-browser.plugin.v1) are retained intact for compatibility and to credit
+the origin.

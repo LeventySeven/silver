@@ -16,7 +16,7 @@ use crate::native::state::{get_sessions_dir, get_state_dir};
 pub(super) fn check(checks: &mut Vec<Check>) {
     let category = "Security";
 
-    let key_env = env::var("AGENT_BROWSER_ENCRYPTION_KEY").ok();
+    let key_env = env::var("SILVER_ENCRYPTION_KEY").ok();
     let key_file = get_state_dir().join(".encryption-key");
     if let Some(hex) = &key_env {
         if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -24,7 +24,7 @@ pub(super) fn check(checks: &mut Vec<Check>) {
                 "security.encryption_key",
                 category,
                 Status::Pass,
-                "AGENT_BROWSER_ENCRYPTION_KEY set (64-char hex)",
+                "SILVER_ENCRYPTION_KEY set (64-char hex)",
             ));
         } else {
             checks.push(
@@ -32,9 +32,9 @@ pub(super) fn check(checks: &mut Vec<Check>) {
                     "security.encryption_key",
                     category,
                     Status::Fail,
-                    "AGENT_BROWSER_ENCRYPTION_KEY is not a 64-char hex string",
+                    "SILVER_ENCRYPTION_KEY is not a 64-char hex string",
                 )
-                .with_fix("export AGENT_BROWSER_ENCRYPTION_KEY=$(openssl rand -hex 32)"),
+                .with_fix("export SILVER_ENCRYPTION_KEY=$(openssl rand -hex 32)"),
             );
         }
     } else if key_file.exists() {
@@ -67,13 +67,13 @@ pub(super) fn check(checks: &mut Vec<Check>) {
                 Status::Info,
                 "No encryption key set (will be auto-generated on first auth save)",
             )
-            .with_fix("export AGENT_BROWSER_ENCRYPTION_KEY=$(openssl rand -hex 32)"),
+            .with_fix("export SILVER_ENCRYPTION_KEY=$(openssl rand -hex 32)"),
         );
     }
 
     let sessions_dir = get_sessions_dir();
     if sessions_dir.exists() {
-        let expire_days = env::var("AGENT_BROWSER_STATE_EXPIRE_DAYS")
+        let expire_days = env::var("SILVER_STATE_EXPIRE_DAYS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(30);
@@ -115,7 +115,7 @@ pub(super) fn check(checks: &mut Vec<Check>) {
                     ),
                 )
                 .with_fix(format!(
-                    "agent-browser state clean --older-than {}",
+                    "silver state clean --older-than {}",
                     expire_days
                 )),
             );
@@ -129,7 +129,7 @@ pub(super) fn check(checks: &mut Vec<Check>) {
         }
     }
 
-    if let Ok(policy_path) = env::var("AGENT_BROWSER_ACTION_POLICY") {
+    if let Ok(policy_path) = env::var("SILVER_ACTION_POLICY") {
         let p = PathBuf::from(&policy_path);
         if !p.exists() {
             checks.push(
@@ -138,11 +138,11 @@ pub(super) fn check(checks: &mut Vec<Check>) {
                     category,
                     Status::Fail,
                     format!(
-                        "AGENT_BROWSER_ACTION_POLICY points to missing file: {}",
+                        "SILVER_ACTION_POLICY points to missing file: {}",
                         policy_path
                     ),
                 )
-                .with_fix("update or unset AGENT_BROWSER_ACTION_POLICY"),
+                .with_fix("update or unset SILVER_ACTION_POLICY"),
             );
         } else {
             match parse_json_file(&p) {

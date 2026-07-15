@@ -1,7 +1,7 @@
 //! Color output utilities.
 //!
 //! Colors are off by default (agent-friendly). Enable with
-//! `AGENT_BROWSER_COLOR=1`. Setting `NO_COLOR` to any value disables
+//! `SILVER_COLOR=1`. Setting `NO_COLOR` to any value disables
 //! colors per <https://no-color.org/>.
 
 use std::env;
@@ -16,14 +16,14 @@ fn env_is_truthy(name: &str) -> Option<bool> {
 /// Returns true if color output is enabled.
 ///
 /// Priority: `NO_COLOR` (presence disables, per spec) >
-/// `AGENT_BROWSER_COLOR` (truthy enables) > default (off).
+/// `SILVER_COLOR` (truthy enables) > default (off).
 pub fn is_enabled() -> bool {
     static COLORS_ENABLED: OnceLock<bool> = OnceLock::new();
     *COLORS_ENABLED.get_or_init(|| {
         if env::var_os("NO_COLOR").is_some() {
             return false;
         }
-        env_is_truthy("AGENT_BROWSER_COLOR").unwrap_or(false)
+        env_is_truthy("SILVER_COLOR").unwrap_or(false)
     })
 }
 

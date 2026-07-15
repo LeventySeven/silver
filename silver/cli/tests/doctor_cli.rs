@@ -1,14 +1,14 @@
-//! Integration tests for `agent-browser doctor`.
+//! Integration tests for `silver doctor`.
 //!
 //! These tests spawn the real CLI binary via `env!("CARGO_BIN_EXE_*")` and
 //! verify the doctor command produces sane output. They override
-//! `AGENT_BROWSER_SOCKET_DIR` and `HOME` / `USERPROFILE` so the doctor
+//! `SILVER_SOCKET_DIR` and `HOME` / `USERPROFILE` so the doctor
 //! inspects a throwaway directory and never touches the user's real state.
 
 use std::process::Command;
 use tempfile::TempDir;
 
-const BIN: &str = env!("CARGO_BIN_EXE_agent-browser");
+const BIN: &str = env!("CARGO_BIN_EXE_silver");
 
 fn build_doctor_cmd(tmp: &TempDir, args: &[&str]) -> Command {
     let socket_dir = tmp.path().join("sockets");
@@ -18,12 +18,12 @@ fn build_doctor_cmd(tmp: &TempDir, args: &[&str]) -> Command {
 
     let mut cmd = Command::new(BIN);
     cmd.args(args)
-        .env("AGENT_BROWSER_SOCKET_DIR", &socket_dir)
+        .env("SILVER_SOCKET_DIR", &socket_dir)
         .env("HOME", &home)
         .env("USERPROFILE", &home)
         // Keep the launch test's skip-logic deterministic across hosts.
-        .env_remove("AGENT_BROWSER_PROVIDER")
-        .env_remove("AGENT_BROWSER_CDP")
+        .env_remove("SILVER_PROVIDER")
+        .env_remove("SILVER_CDP")
         // Don't emit color codes into captured stdout.
         .env("NO_COLOR", "1");
     cmd
@@ -35,7 +35,7 @@ fn doctor_offline_quick_json_emits_valid_payload() {
 
     let output = build_doctor_cmd(&tmp, &["doctor", "--offline", "--quick", "--json"])
         .output()
-        .expect("failed to invoke agent-browser doctor");
+        .expect("failed to invoke silver doctor");
 
     let code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
@@ -113,7 +113,7 @@ fn doctor_help_describes_flags_and_examples() {
 
     let output = build_doctor_cmd(&tmp, &["doctor", "--help"])
         .output()
-        .expect("failed to invoke agent-browser doctor --help");
+        .expect("failed to invoke silver doctor --help");
 
     assert!(
         output.status.success(),
@@ -124,7 +124,7 @@ fn doctor_help_describes_flags_and_examples() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
 
     for needle in [
-        "agent-browser doctor",
+        "silver doctor",
         "--offline",
         "--quick",
         "--fix",

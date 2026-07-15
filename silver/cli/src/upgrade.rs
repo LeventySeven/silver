@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::{exit, Command, Stdio};
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org/agent-browser/latest";
+const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org/silver/latest";
 
 enum InstallMethod {
     Npm,
@@ -62,7 +62,7 @@ fn detect_install_method() -> InstallMethod {
             return InstallMethod::Cargo;
         }
 
-        if path_str.contains("/Cellar/agent-browser/")
+        if path_str.contains("/Cellar/silver/")
             || path_str.contains("/homebrew/")
             || path_str.contains("/linuxbrew/")
         {
@@ -81,8 +81,8 @@ fn detect_install_method() -> InstallMethod {
             return InstallMethod::Bun;
         }
 
-        if path_str.contains("node_modules/agent-browser")
-            || path_str.contains("node_modules\\agent-browser")
+        if path_str.contains("node_modules/silver")
+            || path_str.contains("node_modules\\silver")
         {
             return InstallMethod::Npm;
         }
@@ -92,28 +92,28 @@ fn detect_install_method() -> InstallMethod {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        if command_succeeds("brew", &["list", "agent-browser"]) {
+        if command_succeeds("brew", &["list", "silver"]) {
             return InstallMethod::Homebrew;
         }
     }
 
     if command_output_contains(
         "pnpm",
-        &["list", "-g", "agent-browser", "--depth=0"],
-        "agent-browser",
+        &["list", "-g", "silver", "--depth=0"],
+        "silver",
     ) {
         return InstallMethod::Pnpm;
     }
 
-    if command_output_contains("yarn", &["global", "list", "--depth=0"], "agent-browser") {
+    if command_output_contains("yarn", &["global", "list", "--depth=0"], "silver") {
         return InstallMethod::Yarn;
     }
 
-    if command_output_contains("bun", &["pm", "ls", "-g"], "agent-browser") {
+    if command_output_contains("bun", &["pm", "ls", "-g"], "silver") {
         return InstallMethod::Bun;
     }
 
-    if command_succeeds("npm", &["list", "-g", "agent-browser", "--depth=0"]) {
+    if command_succeeds("npm", &["list", "-g", "silver", "--depth=0"]) {
         return InstallMethod::Npm;
     }
 
@@ -143,35 +143,35 @@ fn run_upgrade_command(method: &InstallMethod) -> bool {
     let (cmd, args, display): (&str, &[&str], &str) = match method {
         InstallMethod::Npm => (
             "npm",
-            &["install", "-g", "agent-browser@latest"],
-            "npm install -g agent-browser@latest",
+            &["install", "-g", "silver@latest"],
+            "npm install -g silver@latest",
         ),
         InstallMethod::Pnpm => (
             "pnpm",
-            &["add", "-g", "agent-browser@latest"],
-            "pnpm add -g agent-browser@latest",
+            &["add", "-g", "silver@latest"],
+            "pnpm add -g silver@latest",
         ),
         // NOTE: `yarn global` is Yarn Classic (v1) only; Yarn Berry (v2+) removed it.
         // Users on Yarn v2+ won't reach this path — detection falls through to Unknown.
         InstallMethod::Yarn => (
             "yarn",
-            &["global", "add", "agent-browser@latest"],
-            "yarn global add agent-browser@latest",
+            &["global", "add", "silver@latest"],
+            "yarn global add silver@latest",
         ),
         InstallMethod::Bun => (
             "bun",
-            &["install", "-g", "agent-browser@latest"],
-            "bun install -g agent-browser@latest",
+            &["install", "-g", "silver@latest"],
+            "bun install -g silver@latest",
         ),
         InstallMethod::Homebrew => (
             "brew",
-            &["upgrade", "agent-browser"],
-            "brew upgrade agent-browser",
+            &["upgrade", "silver"],
+            "brew upgrade silver",
         ),
         InstallMethod::Cargo => (
             "cargo",
-            &["install", "agent-browser", "--force"],
-            "cargo install agent-browser --force",
+            &["install", "silver", "--force"],
+            "cargo install silver --force",
         ),
         InstallMethod::Unknown => return false,
     };
@@ -213,7 +213,7 @@ pub fn run_upgrade() {
 
     if !latest.is_empty() && current == latest.as_str() {
         println!(
-            "{} agent-browser is already at the latest version (v{})",
+            "{} silver is already at the latest version (v{})",
             color::success_indicator(),
             current
         );
@@ -238,12 +238,12 @@ pub fn run_upgrade() {
             color::error_indicator()
         );
         eprintln!("  To update manually, run one of:");
-        eprintln!("    npm install -g agent-browser@latest       # npm");
-        eprintln!("    pnpm add -g agent-browser@latest          # pnpm");
-        eprintln!("    yarn global add agent-browser@latest       # yarn");
-        eprintln!("    bun install -g agent-browser@latest        # bun");
-        eprintln!("    brew upgrade agent-browser                 # Homebrew");
-        eprintln!("    cargo install agent-browser --force        # Cargo");
+        eprintln!("    npm install -g silver@latest       # npm");
+        eprintln!("    pnpm add -g silver@latest          # pnpm");
+        eprintln!("    yarn global add silver@latest       # yarn");
+        eprintln!("    bun install -g silver@latest        # bun");
+        eprintln!("    brew upgrade silver                 # Homebrew");
+        eprintln!("    cargo install silver --force        # Cargo");
         exit(1);
     }
 
@@ -253,14 +253,14 @@ pub fn run_upgrade() {
         println!(
             "{}",
             color::cyan(&format!(
-                "Upgrading agent-browser... v{} → v{}",
+                "Upgrading silver... v{} → v{}",
                 current, latest
             ))
         );
     } else {
         println!(
             "{}",
-            color::cyan(&format!("Upgrading agent-browser (v{})...", current))
+            color::cyan(&format!("Upgrading silver (v{})...", current))
         );
     }
 

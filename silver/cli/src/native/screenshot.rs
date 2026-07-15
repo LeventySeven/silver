@@ -8,7 +8,7 @@ use super::cdp::client::CdpClient;
 use super::cdp::types::*;
 use super::element::RefMap;
 
-const ANNOTATION_OVERLAY_ID: &str = "__agent_browser_annotations__";
+const ANNOTATION_OVERLAY_ID: &str = "__silver_annotations__";
 
 #[derive(Debug, Clone)]
 struct Rect {
@@ -260,7 +260,7 @@ async fn collect_annotations(
                 "DOM.resolveNode",
                 Some(serde_json::json!({
                     "backendNodeId": backend_node_id,
-                    "objectGroup": "agent-browser-annotate"
+                    "objectGroup": "silver-annotate"
                 })),
                 Some(session_id),
             )
@@ -589,10 +589,10 @@ fn round(value: f64) -> i64 {
 
 fn get_screenshot_dir() -> PathBuf {
     if let Some(home) = dirs::home_dir() {
-        home.join(".agent-browser").join("tmp").join("screenshots")
+        home.join(".silver").join("tmp").join("screenshots")
     } else {
         std::env::temp_dir()
-            .join("agent-browser")
+            .join("silver")
             .join("screenshots")
     }
 }

@@ -32,7 +32,7 @@ const SKILL_DIRS: &[&str] = &["skills", "skill-data"];
 /// Locate the package root that contains the skill directories.
 ///
 /// Resolution order:
-/// 1. AGENT_BROWSER_SKILLS_DIR env var (points directly at a single directory)
+/// 1. SILVER_SKILLS_DIR env var (points directly at a single directory)
 /// 2. ../  relative to the executable (npm installs: binary is in bin/)
 /// 3. Walk up from the executable to find a project root with skills/
 ///    (dev builds where binary is in target/debug/ or target/release/)
@@ -40,7 +40,7 @@ fn find_package_root() -> Option<PathBuf> {
     if let Ok(exe) = env::current_exe() {
         let exe = exe.canonicalize().unwrap_or(exe);
         if let Some(parent) = exe.parent() {
-            // npm install layout: bin/agent-browser-* -> ../
+            // npm install layout: bin/silver-* -> ../
             let candidate = parent.join("..");
             if candidate.join("skills").is_dir() {
                 return Some(candidate.canonicalize().unwrap_or(candidate));
@@ -66,7 +66,7 @@ fn find_package_root() -> Option<PathBuf> {
 /// Collect all skill directories to search, respecting the env var override.
 fn find_skills_dirs() -> Vec<PathBuf> {
     // Env var override: single directory, used as-is
-    if let Ok(dir) = env::var("AGENT_BROWSER_SKILLS_DIR") {
+    if let Ok(dir) = env::var("SILVER_SKILLS_DIR") {
         let p = PathBuf::from(dir);
         if p.is_dir() {
             return vec![p];
@@ -299,13 +299,13 @@ fn run_get(skills_dirs: &[PathBuf], names: &[String], get_all: bool, full: bool,
                 "{}",
                 serde_json::to_string(&json!({
                     "success": false,
-                    "error": "No skill name provided. Usage: agent-browser skills get <name>",
+                    "error": "No skill name provided. Usage: silver skills get <name>",
                 }))
                 .unwrap_or_default()
             );
         } else {
             eprintln!(
-                "{} No skill name provided. Usage: agent-browser skills get <name>",
+                "{} No skill name provided. Usage: silver skills get <name>",
                 color::error_indicator()
             );
         }
@@ -433,13 +433,13 @@ pub fn run_skills(args: &[String], json_mode: bool) {
                 "{}",
                 serde_json::to_string(&json!({
                     "success": false,
-                    "error": "Skills directory not found. Set AGENT_BROWSER_SKILLS_DIR or reinstall via npm.",
+                    "error": "Skills directory not found. Set SILVER_SKILLS_DIR or reinstall via npm.",
                 }))
                 .unwrap_or_default()
             );
         } else {
             eprintln!(
-                "{} Skills directory not found. Set AGENT_BROWSER_SKILLS_DIR or reinstall via npm.",
+                "{} Skills directory not found. Set SILVER_SKILLS_DIR or reinstall via npm.",
                 color::error_indicator()
             );
         }

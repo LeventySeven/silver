@@ -64,12 +64,12 @@ fn format_with_boundaries(content: &str, origin: Option<&str>, opts: &OutputOpti
         let origin_str = origin.unwrap_or("unknown");
         let nonce = get_boundary_nonce();
         format!(
-            "--- AGENT_BROWSER_PAGE_CONTENT nonce={} origin={} ---",
+            "--- SILVER_PAGE_CONTENT nonce={} origin={} ---",
             nonce, origin_str
         ) + "\n"
             + &content
             + "\n"
-            + &format!("--- END_AGENT_BROWSER_PAGE_CONTENT nonce={} ---", nonce)
+            + &format!("--- END_SILVER_PAGE_CONTENT nonce={} ---", nonce)
     } else {
         content
     }
@@ -182,8 +182,8 @@ fn print_confirmation_required(data: &serde_json::Value) {
     } else {
         println!("  {}: {}", category, description);
     }
-    println!("  Run: agent-browser confirm {}", cid);
-    println!("  Or:  agent-browser deny {}", cid);
+    println!("  Run: silver confirm {}", cid);
+    println!("  Or:  silver deny {}", cid);
 }
 
 fn format_metric_ms(value: Option<f64>) -> String {
@@ -1237,7 +1237,7 @@ fn print_lifecycle_note(data: &serde_json::Value) {
     }
 
     if !parts.is_empty() {
-        eprintln!("{} {}", color::dim("[agent-browser]"), parts.join("; "));
+        eprintln!("{} {}", color::dim("[silver]"), parts.join("; "));
     }
 }
 
@@ -1253,9 +1253,9 @@ pub fn print_command_help(command: &str) -> bool {
         // === Navigation ===
         "open" | "goto" | "navigate" => {
             r##"
-agent-browser open - Launch the browser, optionally navigate
+silver open - Launch the browser, optionally navigate
 
-Usage: agent-browser open [url]
+Usage: silver open [url]
 
 Without a URL, launches the browser but stays on about:blank. This lets
 you stage state (network routes, cookies, init scripts) before the first
@@ -1276,15 +1276,15 @@ Global Options:
   --init-script <path>      Register a page init script (repeatable)
 
 Examples:
-  agent-browser open                     # Launch, no nav
-  agent-browser open example.com
-  agent-browser open https://github.com
-  agent-browser open localhost:3000
-  agent-browser open api.example.com --headers '{"Authorization": "Bearer token"}'
+  silver open                     # Launch, no nav
+  silver open example.com
+  silver open https://github.com
+  silver open localhost:3000
+  silver open api.example.com --headers '{"Authorization": "Bearer token"}'
     # ^ Headers only sent to api.example.com, not other domains
 
   # Pre-navigation setup in one turn:
-  agent-browser batch \
+  silver batch \
     '["open"]' \
     '["network","route","*","--abort","--resource-type","script"]' \
     '["navigate","http://localhost:3000/target"]'
@@ -1292,9 +1292,9 @@ Examples:
         }
         "back" => {
             r##"
-agent-browser back - Navigate back in history
+silver back - Navigate back in history
 
-Usage: agent-browser back
+Usage: silver back
 
 Goes back one page in the browser history, equivalent to clicking
 the browser's back button.
@@ -1304,14 +1304,14 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser back
+  silver back
 "##
         }
         "forward" => {
             r##"
-agent-browser forward - Navigate forward in history
+silver forward - Navigate forward in history
 
-Usage: agent-browser forward
+Usage: silver forward
 
 Goes forward one page in the browser history, equivalent to clicking
 the browser's forward button.
@@ -1321,14 +1321,14 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser forward
+  silver forward
 "##
         }
         "reload" => {
             r##"
-agent-browser reload - Reload the current page
+silver reload - Reload the current page
 
-Usage: agent-browser reload
+Usage: silver reload
 
 Reloads the current page, equivalent to pressing F5 or clicking
 the browser's reload button.
@@ -1338,15 +1338,15 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser reload
+  silver reload
 "##
         }
 
         "read" => {
             r##"
-agent-browser read - Fetch a URL as agent-readable text
+silver read - Fetch a URL as agent-readable text
 
-Usage: agent-browser read [url] [--raw] [--require-md] [--llms <index|full>] [--outline] [--filter <text>] [--timeout <ms>]
+Usage: silver read [url] [--raw] [--require-md] [--llms <index|full>] [--outline] [--filter <text>] [--timeout <ms>]
 
 Fetches a URL as agent-readable text. Omit the URL to read the rendered DOM of
 the active tab in the current browser session. Explicit URL reads prefer
@@ -1374,28 +1374,28 @@ Global Options:
   --max-output <chars> Truncate read output to N chars
 
 Examples:
-  agent-browser read
-  agent-browser read https://docs.example.com/guide
-  agent-browser read https://docs.example.com/guide --filter auth
-  agent-browser read https://docs.example.com/guide --outline
-  agent-browser read https://docs.example.com --llms index --filter auth
-  agent-browser read https://docs.example.com --llms full --filter auth
-  agent-browser read docs.example.com/guide --require-md
-  agent-browser read https://api.example.com/docs --headers '{"Authorization":"Bearer token"}'
+  silver read
+  silver read https://docs.example.com/guide
+  silver read https://docs.example.com/guide --filter auth
+  silver read https://docs.example.com/guide --outline
+  silver read https://docs.example.com --llms index --filter auth
+  silver read https://docs.example.com --llms full --filter auth
+  silver read docs.example.com/guide --require-md
+  silver read https://api.example.com/docs --headers '{"Authorization":"Bearer token"}'
 "##
         }
 
         // === Core Actions ===
         "click" => {
             r##"
-agent-browser click - Click an element
+silver click - Click an element
 
-Usage: agent-browser click <selector> [--new-tab]
+Usage: silver click <selector> [--new-tab]
 
 Clicks on the specified element. The selector can be a CSS selector,
 XPath, or an element reference from snapshot (e.g., @e1).
 
-If another element covers the click point, agent-browser reports the
+If another element covers the click point, silver reports the
 covering element instead of dispatching a click to the wrong target.
 
 Options:
@@ -1407,18 +1407,18 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser click "#submit-button"
-  agent-browser click @e1
-  agent-browser click "button.primary"
-  agent-browser click "//button[@type='submit']"
-  agent-browser click @e3 --new-tab
+  silver click "#submit-button"
+  silver click @e1
+  silver click "button.primary"
+  silver click "//button[@type='submit']"
+  silver click @e3 --new-tab
 "##
         }
         "dblclick" => {
             r##"
-agent-browser dblclick - Double-click an element
+silver dblclick - Double-click an element
 
-Usage: agent-browser dblclick <selector>
+Usage: silver dblclick <selector>
 
 Double-clicks on the specified element. Useful for text selection
 or triggering double-click handlers.
@@ -1428,15 +1428,15 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser dblclick "#editable-text"
-  agent-browser dblclick @e5
+  silver dblclick "#editable-text"
+  silver dblclick @e5
 "##
         }
         "fill" => {
             r##"
-agent-browser fill - Clear and fill an input field
+silver fill - Clear and fill an input field
 
-Usage: agent-browser fill <selector> <text>
+Usage: silver fill <selector> <text>
 
 Clears the input field and fills it with the specified text.
 This replaces any existing content in the field.
@@ -1446,16 +1446,16 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser fill "#email" "user@example.com"
-  agent-browser fill @e3 "Hello World"
-  agent-browser fill "input[name='search']" "query"
+  silver fill "#email" "user@example.com"
+  silver fill @e3 "Hello World"
+  silver fill "input[name='search']" "query"
 "##
         }
         "type" => {
             r##"
-agent-browser type - Type text into an element
+silver type - Type text into an element
 
-Usage: agent-browser type <selector> <text>
+Usage: silver type <selector> <text>
 
 Types text into the specified element character by character.
 Unlike fill, this does not clear existing content first.
@@ -1465,20 +1465,20 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser type "#search" "hello"
-  agent-browser type @e2 "additional text"
+  silver type "#search" "hello"
+  silver type @e2 "additional text"
 
 See Also:
   For typing into contenteditable editors (Lexical, ProseMirror, etc.)
   without a selector, use 'keyboard type' instead:
-    agent-browser keyboard type "# My Heading"
+    silver keyboard type "# My Heading"
 "##
         }
         "hover" => {
             r##"
-agent-browser hover - Hover over an element
+silver hover - Hover over an element
 
-Usage: agent-browser hover <selector>
+Usage: silver hover <selector>
 
 Moves the mouse to hover over the specified element. Useful for
 triggering hover states or dropdown menus.
@@ -1488,15 +1488,15 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser hover "#dropdown-trigger"
-  agent-browser hover @e4
+  silver hover "#dropdown-trigger"
+  silver hover @e4
 "##
         }
         "focus" => {
             r##"
-agent-browser focus - Focus an element
+silver focus - Focus an element
 
-Usage: agent-browser focus <selector>
+Usage: silver focus <selector>
 
 Sets keyboard focus to the specified element.
 
@@ -1505,15 +1505,15 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser focus "#input-field"
-  agent-browser focus @e2
+  silver focus "#input-field"
+  silver focus @e2
 "##
         }
         "check" => {
             r##"
-agent-browser check - Check a checkbox
+silver check - Check a checkbox
 
-Usage: agent-browser check <selector>
+Usage: silver check <selector>
 
 Checks a checkbox element. If already checked, no action is taken.
 
@@ -1522,15 +1522,15 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser check "#terms-checkbox"
-  agent-browser check @e7
+  silver check "#terms-checkbox"
+  silver check @e7
 "##
         }
         "uncheck" => {
             r##"
-agent-browser uncheck - Uncheck a checkbox
+silver uncheck - Uncheck a checkbox
 
-Usage: agent-browser uncheck <selector>
+Usage: silver uncheck <selector>
 
 Unchecks a checkbox element. If already unchecked, no action is taken.
 
@@ -1539,15 +1539,15 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser uncheck "#newsletter-opt-in"
-  agent-browser uncheck @e8
+  silver uncheck "#newsletter-opt-in"
+  silver uncheck @e8
 "##
         }
         "select" => {
             r##"
-agent-browser select - Select a dropdown option
+silver select - Select a dropdown option
 
-Usage: agent-browser select <selector> <value...>
+Usage: silver select <selector> <value...>
 
 Selects one or more options in a <select> dropdown by value.
 
@@ -1556,16 +1556,16 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser select "#country" "US"
-  agent-browser select @e5 "option2"
-  agent-browser select "#menu" "opt1" "opt2" "opt3"
+  silver select "#country" "US"
+  silver select @e5 "option2"
+  silver select "#menu" "opt1" "opt2" "opt3"
 "##
         }
         "drag" => {
             r##"
-agent-browser drag - Drag and drop
+silver drag - Drag and drop
 
-Usage: agent-browser drag <source> <target>
+Usage: silver drag <source> <target>
 
 Drags an element from source to target location.
 
@@ -1574,15 +1574,15 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser drag "#draggable" "#drop-zone"
-  agent-browser drag @e1 @e2
+  silver drag "#draggable" "#drop-zone"
+  silver drag @e1 @e2
 "##
         }
         "upload" => {
             r##"
-agent-browser upload - Upload files
+silver upload - Upload files
 
-Usage: agent-browser upload <selector> <files...>
+Usage: silver upload <selector> <files...>
 
 Uploads one or more files to a file input element.
 
@@ -1591,15 +1591,15 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser upload "#file-input" ./document.pdf
-  agent-browser upload @e3 ./image1.png ./image2.png
+  silver upload "#file-input" ./document.pdf
+  silver upload @e3 ./image1.png ./image2.png
 "##
         }
         "download" => {
             r##"
-agent-browser download - Download a file by clicking an element
+silver download - Download a file by clicking an element
 
-Usage: agent-browser download <selector> <path>
+Usage: silver download <selector> <path>
 
 Clicks an element that triggers a download and saves the file to the specified path.
 
@@ -1612,18 +1612,18 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser download "#download-btn" ./file.pdf
-  agent-browser download @e5 ./report.xlsx
-  agent-browser download "a[href$='.zip']" ./archive.zip
+  silver download "#download-btn" ./file.pdf
+  silver download @e5 ./report.xlsx
+  silver download "a[href$='.zip']" ./archive.zip
 "##
         }
 
         // === Keyboard ===
         "press" | "key" => {
             r##"
-agent-browser press - Press a key or key combination
+silver press - Press a key or key combination
 
-Usage: agent-browser press <key>
+Usage: silver press <key>
 
 Presses a key or key combination. Supports special keys and modifiers.
 
@@ -1643,18 +1643,18 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser press Enter
-  agent-browser press Tab
-  agent-browser press Control+a
-  agent-browser press Control+Shift+s
-  agent-browser press Escape
+  silver press Enter
+  silver press Tab
+  silver press Control+a
+  silver press Control+Shift+s
+  silver press Escape
 "##
         }
         "keydown" => {
             r##"
-agent-browser keydown - Press a key down (without release)
+silver keydown - Press a key down (without release)
 
-Usage: agent-browser keydown <key>
+Usage: silver keydown <key>
 
 Presses a key down without releasing it. Use keyup to release.
 Useful for holding modifier keys.
@@ -1664,15 +1664,15 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser keydown Shift
-  agent-browser keydown Control
+  silver keydown Shift
+  silver keydown Control
 "##
         }
         "keyup" => {
             r##"
-agent-browser keyup - Release a key
+silver keyup - Release a key
 
-Usage: agent-browser keyup <key>
+Usage: silver keyup <key>
 
 Releases a key that was pressed with keydown.
 
@@ -1681,15 +1681,15 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser keyup Shift
-  agent-browser keyup Control
+  silver keyup Shift
+  silver keyup Control
 "##
         }
         "keyboard" => {
             r##"
-agent-browser keyboard - Raw keyboard input (no selector needed)
+silver keyboard - Raw keyboard input (no selector needed)
 
-Usage: agent-browser keyboard <subcommand> <text>
+Usage: silver keyboard <subcommand> <text>
 
 Sends keyboard input to whatever element currently has focus.
 Unlike 'type' which requires a selector, 'keyboard' operates on
@@ -1709,25 +1709,25 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser keyboard type "Hello, World!"
-  agent-browser keyboard type "# My Heading"
-  agent-browser keyboard inserttext "pasted content"
+  silver keyboard type "Hello, World!"
+  silver keyboard type "# My Heading"
+  silver keyboard inserttext "pasted content"
 
 Use Cases:
   # Type into a Lexical/ProseMirror contenteditable editor:
-  agent-browser click "[contenteditable]"
-  agent-browser keyboard type "# My Heading"
-  agent-browser press Enter
-  agent-browser keyboard type "Some paragraph text"
+  silver click "[contenteditable]"
+  silver keyboard type "# My Heading"
+  silver press Enter
+  silver keyboard type "Some paragraph text"
 "##
         }
 
         // === Scroll ===
         "scroll" => {
             r##"
-agent-browser scroll - Scroll the page
+silver scroll - Scroll the page
 
-Usage: agent-browser scroll [direction] [amount] [options]
+Usage: silver scroll [direction] [amount] [options]
 
 Scrolls the page or a specific element in the specified direction.
 
@@ -1743,18 +1743,18 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser scroll
-  agent-browser scroll down 500
-  agent-browser scroll up 200
-  agent-browser scroll left 100
-  agent-browser scroll down 500 --selector "div.scroll-container"
+  silver scroll
+  silver scroll down 500
+  silver scroll up 200
+  silver scroll left 100
+  silver scroll down 500 --selector "div.scroll-container"
 "##
         }
         "scrollintoview" | "scrollinto" => {
             r##"
-agent-browser scrollintoview - Scroll element into view
+silver scrollintoview - Scroll element into view
 
-Usage: agent-browser scrollintoview <selector>
+Usage: silver scrollintoview <selector>
 
 Scrolls the page until the specified element is visible in the viewport.
 
@@ -1765,17 +1765,17 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser scrollintoview "#footer"
-  agent-browser scrollintoview @e15
+  silver scrollintoview "#footer"
+  silver scrollintoview @e15
 "##
         }
 
         // === Wait ===
         "wait" => {
             r##"
-agent-browser wait - Wait for condition
+silver wait - Wait for condition
 
-Usage: agent-browser wait <selector|ms|option>
+Usage: silver wait <selector|ms|option>
 
 Waits for an element to appear, a timeout, or other conditions.
 
@@ -1802,24 +1802,24 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser wait "#loading-spinner"
-  agent-browser wait 2000
-  agent-browser wait --url "**/dashboard"
-  agent-browser wait --load networkidle
-  agent-browser wait --fn "window.appReady === true"
-  agent-browser wait --text "Welcome back"
-  agent-browser wait --download ./file.pdf
-  agent-browser wait --download ./report.xlsx --timeout 30000
-  agent-browser wait --fn "!document.body.innerText.includes('Loading...')"
+  silver wait "#loading-spinner"
+  silver wait 2000
+  silver wait --url "**/dashboard"
+  silver wait --load networkidle
+  silver wait --fn "window.appReady === true"
+  silver wait --text "Welcome back"
+  silver wait --download ./file.pdf
+  silver wait --download ./report.xlsx --timeout 30000
+  silver wait --fn "!document.body.innerText.includes('Loading...')"
 "##
         }
 
         // === Screenshot/PDF ===
         "screenshot" => {
             r##"
-agent-browser screenshot - Take a screenshot
+silver screenshot - Take a screenshot
 
-Usage: agent-browser screenshot [selector] [path]
+Usage: silver screenshot [selector] [path]
 
 Captures a screenshot of the current page. If no path is provided,
 saves to a temporary directory with a generated filename.
@@ -1834,32 +1834,32 @@ Options:
                        With --json, annotations are included in the response.
                        Supported on Chromium and Lightpanda.
   --screenshot-dir <path>  Default output directory for screenshots
-                       (or AGENT_BROWSER_SCREENSHOT_DIR env)
+                       (or SILVER_SCREENSHOT_DIR env)
   --screenshot-quality <0-100>  JPEG quality (0-100, only applies to jpeg format)
-                       (or AGENT_BROWSER_SCREENSHOT_QUALITY env)
+                       (or SILVER_SCREENSHOT_QUALITY env)
   --screenshot-format <fmt>  Image format: png (default) or jpeg
-                       (or AGENT_BROWSER_SCREENSHOT_FORMAT env)
+                       (or SILVER_SCREENSHOT_FORMAT env)
 
 Global Options:
   --json               Output as JSON
   --session <name>     Use specific session
 
 Examples:
-  agent-browser screenshot
-  agent-browser screenshot ./screenshot.png
-  agent-browser screenshot --full ./full-page.png
-  agent-browser screenshot --annotate              # Labeled screenshot + legend
-  agent-browser screenshot --annotate ./page.png   # Save annotated screenshot
-  agent-browser screenshot --annotate --json       # JSON output with annotations
-  agent-browser screenshot --screenshot-dir ./shots # Save to custom directory
-  agent-browser screenshot --screenshot-format jpeg --screenshot-quality 80
+  silver screenshot
+  silver screenshot ./screenshot.png
+  silver screenshot --full ./full-page.png
+  silver screenshot --annotate              # Labeled screenshot + legend
+  silver screenshot --annotate ./page.png   # Save annotated screenshot
+  silver screenshot --annotate --json       # JSON output with annotations
+  silver screenshot --screenshot-dir ./shots # Save to custom directory
+  silver screenshot --screenshot-format jpeg --screenshot-quality 80
 "##
         }
         "pdf" => {
             r##"
-agent-browser pdf - Save page as PDF
+silver pdf - Save page as PDF
 
-Usage: agent-browser pdf <path>
+Usage: silver pdf <path>
 
 Saves the current page as a PDF file.
 
@@ -1868,17 +1868,17 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser pdf ./page.pdf
-  agent-browser pdf ~/Documents/report.pdf
+  silver pdf ./page.pdf
+  silver pdf ~/Documents/report.pdf
 "##
         }
 
         // === Snapshot ===
         "snapshot" => {
             r##"
-agent-browser snapshot - Get accessibility tree snapshot
+silver snapshot - Get accessibility tree snapshot
 
-Usage: agent-browser snapshot [options]
+Usage: silver snapshot [options]
 
 Returns an accessibility tree representation of the page with element
 references (like @e1, @e2) that can be used in subsequent commands.
@@ -1896,20 +1896,20 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser snapshot
-  agent-browser snapshot -i
-  agent-browser snapshot -i --urls
-  agent-browser snapshot --compact --depth 5
-  agent-browser snapshot -s "#main-content"
+  silver snapshot
+  silver snapshot -i
+  silver snapshot -i --urls
+  silver snapshot --compact --depth 5
+  silver snapshot -s "#main-content"
 "##
         }
 
         // === Eval ===
         "eval" => {
             r##"
-agent-browser eval - Execute JavaScript
+silver eval - Execute JavaScript
 
-Usage: agent-browser eval [options] <script>
+Usage: silver eval [options] <script>
 
 Executes JavaScript code in the browser context and returns the result.
 
@@ -1922,13 +1922,13 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser eval "document.title"
-  agent-browser eval "window.location.href"
-  agent-browser eval "document.querySelectorAll('a').length"
-  agent-browser eval -b "ZG9jdW1lbnQudGl0bGU="
+  silver eval "document.title"
+  silver eval "window.location.href"
+  silver eval "document.querySelectorAll('a').length"
+  silver eval -b "ZG9jdW1lbnQudGl0bGU="
 
   # Read from stdin with heredoc
-  cat <<'EOF' | agent-browser eval --stdin
+  cat <<'EOF' | silver eval --stdin
   const links = document.querySelectorAll('a');
   links.length;
   EOF
@@ -1938,9 +1938,9 @@ Examples:
         // === Close ===
         "close" | "quit" | "exit" => {
             r##"
-agent-browser close - Close the browser
+silver close - Close the browser
 
-Usage: agent-browser close [options]
+Usage: silver close [options]
 
 Closes the browser instance for the current session.
 
@@ -1954,37 +1954,37 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser close
-  agent-browser close --session mysession
-  agent-browser close --all
+  silver close
+  silver close --session mysession
+  silver close --all
 "##
         }
 
         // === Inspect ===
         "inspect" => {
             r##"
-agent-browser inspect - Open Chrome DevTools for the active page
+silver inspect - Open Chrome DevTools for the active page
 
 Starts a local WebSocket proxy and opens Chrome's DevTools frontend in your
 default browser. The proxy routes DevTools traffic through the daemon's
-existing CDP connection, so both DevTools and agent-browser commands work
+existing CDP connection, so both DevTools and silver commands work
 simultaneously.
 
-Usage: agent-browser inspect
+Usage: silver inspect
 
 Examples:
-  agent-browser open example.com
-  agent-browser inspect          # opens DevTools in your browser
-  agent-browser click "Submit"   # commands still work while DevTools is open
+  silver open example.com
+  silver inspect          # opens DevTools in your browser
+  silver click "Submit"   # commands still work while DevTools is open
 "##
         }
 
         // === Get ===
         "get" => {
             r##"
-agent-browser get - Retrieve information from elements or page
+silver get - Retrieve information from elements or page
 
-Usage: agent-browser get <subcommand> [args]
+Usage: silver get <subcommand> [args]
 
 Retrieves various types of information from elements or the page.
 
@@ -2005,25 +2005,25 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser get text @e1
-  agent-browser get html "#content"
-  agent-browser get value "#email-input"
-  agent-browser get attr "#link" href
-  agent-browser get title
-  agent-browser get url
-  agent-browser get count "li.item"
-  agent-browser get box "#header"
-  agent-browser get styles "button"
-  agent-browser get styles @e1
+  silver get text @e1
+  silver get html "#content"
+  silver get value "#email-input"
+  silver get attr "#link" href
+  silver get title
+  silver get url
+  silver get count "li.item"
+  silver get box "#header"
+  silver get styles "button"
+  silver get styles @e1
 "##
         }
 
         // === Is ===
         "is" => {
             r##"
-agent-browser is - Check element state
+silver is - Check element state
 
-Usage: agent-browser is <subcommand> <selector>
+Usage: silver is <subcommand> <selector>
 
 Checks the state of an element and returns true/false.
 
@@ -2037,18 +2037,18 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser is visible "#modal"
-  agent-browser is enabled "#submit-btn"
-  agent-browser is checked "#agree-checkbox"
+  silver is visible "#modal"
+  silver is enabled "#submit-btn"
+  silver is checked "#agree-checkbox"
 "##
         }
 
         // === Find ===
         "find" => {
             r##"
-agent-browser find - Find and interact with elements by locator
+silver find - Find and interact with elements by locator
 
-Usage: agent-browser find <locator> <value> [action] [text]
+Usage: silver find <locator> <value> [action] [text]
 
 Finds elements using semantic locators and optionally performs an action.
 
@@ -2076,22 +2076,22 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser find role button click --name Submit
-  agent-browser find text "Sign In" click
-  agent-browser find label "Email" fill "user@example.com"
-  agent-browser find placeholder "Search..." type "query"
-  agent-browser find testid "login-form" click
-  agent-browser find first "li.item" click
-  agent-browser find nth 2 ".card" hover
+  silver find role button click --name Submit
+  silver find text "Sign In" click
+  silver find label "Email" fill "user@example.com"
+  silver find placeholder "Search..." type "query"
+  silver find testid "login-form" click
+  silver find first "li.item" click
+  silver find nth 2 ".card" hover
 "##
         }
 
         // === Mouse ===
         "mouse" => {
             r##"
-agent-browser mouse - Low-level mouse operations
+silver mouse - Low-level mouse operations
 
-Usage: agent-browser mouse <subcommand> [args]
+Usage: silver mouse <subcommand> [args]
 
 Performs low-level mouse operations for precise control.
 
@@ -2106,21 +2106,21 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser mouse move 100 200
-  agent-browser mouse down
-  agent-browser mouse up
-  agent-browser mouse down right
-  agent-browser mouse wheel 100
-  agent-browser mouse wheel -50 0
+  silver mouse move 100 200
+  silver mouse down
+  silver mouse up
+  silver mouse down right
+  silver mouse wheel 100
+  silver mouse wheel -50 0
 "##
         }
 
         // === Set ===
         "set" => {
             r##"
-agent-browser set - Configure browser settings
+silver set - Configure browser settings
 
-Usage: agent-browser set <setting> [args]
+Usage: silver set <setting> [args]
 
 Configures various browser settings and emulation options.
 
@@ -2139,24 +2139,24 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser set viewport 1920 1080
-  agent-browser set viewport 1920 1080 2    # 2x retina
-  agent-browser set device "iPhone 12"
-  agent-browser set geo 37.7749 -122.4194
-  agent-browser set offline on
-  agent-browser set headers '{"X-Custom": "value"}'
-  agent-browser set credentials admin secret123
-  agent-browser set media dark
-  agent-browser set media light reduced-motion
+  silver set viewport 1920 1080
+  silver set viewport 1920 1080 2    # 2x retina
+  silver set device "iPhone 12"
+  silver set geo 37.7749 -122.4194
+  silver set offline on
+  silver set headers '{"X-Custom": "value"}'
+  silver set credentials admin secret123
+  silver set media dark
+  silver set media light reduced-motion
 "##
         }
 
         // === Network ===
         "network" => {
             r##"
-agent-browser network - Network interception and monitoring
+silver network - Network interception and monitoring
 
-Usage: agent-browser network <subcommand> [args]
+Usage: silver network <subcommand> [args]
 
 Intercept, mock, or monitor network requests.
 
@@ -2179,26 +2179,26 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser network route "**/api/*" --abort
-  agent-browser network route "**/data.json" --body '{"mock": true}'
-  agent-browser network unroute
-  agent-browser network requests
-  agent-browser network requests --filter "api"
-  agent-browser network requests --type xhr,fetch
-  agent-browser network requests --method POST --status 2xx
-  agent-browser network requests --clear
-  agent-browser network request 1234.5
-  agent-browser network har start
-  agent-browser network har stop ./capture.har
+  silver network route "**/api/*" --abort
+  silver network route "**/data.json" --body '{"mock": true}'
+  silver network unroute
+  silver network requests
+  silver network requests --filter "api"
+  silver network requests --type xhr,fetch
+  silver network requests --method POST --status 2xx
+  silver network requests --clear
+  silver network request 1234.5
+  silver network har start
+  silver network har stop ./capture.har
 "##
         }
 
         // === Storage ===
         "storage" => {
             r##"
-agent-browser storage - Manage web storage
+silver storage - Manage web storage
 
-Usage: agent-browser storage <type> [operation] [key] [value]
+Usage: silver storage <type> [operation] [key] [value]
 
 Manage localStorage and sessionStorage.
 
@@ -2216,20 +2216,20 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser storage local
-  agent-browser storage local get authToken
-  agent-browser storage local set theme "dark"
-  agent-browser storage local clear
-  agent-browser storage session get userId
+  silver storage local
+  silver storage local get authToken
+  silver storage local set theme "dark"
+  silver storage local clear
+  silver storage session get userId
 "##
         }
 
         // === Cookies ===
         "cookies" => {
             r##"
-agent-browser cookies - Manage browser cookies
+silver cookies - Manage browser cookies
 
-Usage: agent-browser cookies [operation] [args]
+Usage: silver cookies [operation] [args]
 
 Manage browser cookies for the current context.
 
@@ -2256,34 +2256,34 @@ Global Options:
 
 Examples:
   # Simple cookie for current page
-  agent-browser cookies set session_id "abc123"
+  silver cookies set session_id "abc123"
 
   # Set cookie for a URL before loading it (useful for authentication)
-  agent-browser cookies set session_id "abc123" --url https://app.example.com
+  silver cookies set session_id "abc123" --url https://app.example.com
 
   # Set secure, httpOnly cookie with domain and path
-  agent-browser cookies set auth_token "xyz789" --domain example.com --path /api --httpOnly --secure
+  silver cookies set auth_token "xyz789" --domain example.com --path /api --httpOnly --secure
 
   # Set cookie with SameSite policy
-  agent-browser cookies set tracking_consent "yes" --sameSite Strict
+  silver cookies set tracking_consent "yes" --sameSite Strict
 
   # Set cookie with expiration (Unix timestamp)
-  agent-browser cookies set temp_token "temp123" --expires 1735689600
+  silver cookies set temp_token "temp123" --expires 1735689600
 
   # Get all cookies
-  agent-browser cookies
+  silver cookies
 
   # Clear all cookies
-  agent-browser cookies clear
+  silver cookies clear
 "##
         }
 
         // === Tabs ===
         "tab" => {
             r##"
-agent-browser tab - Manage browser tabs
+silver tab - Manage browser tabs
 
-Usage: agent-browser tab [operation] [args]
+Usage: silver tab [operation] [args]
 
 Manage browser tabs in the current window. Stable tab ids look like `t1`,
 `t2`, `t3`. An id is never reused within a session, so scripts can keep
@@ -2303,25 +2303,25 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser tab
-  agent-browser tab list
-  agent-browser tab new
-  agent-browser tab new https://example.com
-  agent-browser tab new --label docs https://docs.example.com
-  agent-browser tab t2
-  agent-browser tab docs
-  agent-browser tab close
-  agent-browser tab close t1
-  agent-browser tab close docs
+  silver tab
+  silver tab list
+  silver tab new
+  silver tab new https://example.com
+  silver tab new --label docs https://docs.example.com
+  silver tab t2
+  silver tab docs
+  silver tab close
+  silver tab close t1
+  silver tab close docs
 "##
         }
 
         // === Window ===
         "window" => {
             r##"
-agent-browser window - Manage browser windows
+silver window - Manage browser windows
 
-Usage: agent-browser window <operation>
+Usage: silver window <operation>
 
 Manage browser windows.
 
@@ -2333,16 +2333,16 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser window new
+  silver window new
 "##
         }
 
         // === Frame ===
         "frame" => {
             r##"
-agent-browser frame - Switch frame context
+silver frame - Switch frame context
 
-Usage: agent-browser frame <selector|main>
+Usage: silver frame <selector|main>
 
 Switch to an iframe or back to the main frame.
 
@@ -2355,18 +2355,18 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser frame "#embed-iframe"
-  agent-browser frame "iframe[name='content']"
-  agent-browser frame main
+  silver frame "#embed-iframe"
+  silver frame "iframe[name='content']"
+  silver frame main
 "##
         }
 
         // === Auth ===
         "auth" => {
             r##"
-agent-browser auth - Manage authentication profiles
+silver auth - Manage authentication profiles
 
-Usage: agent-browser auth <subcommand> [args]
+Usage: silver auth <subcommand> [args]
 
 Subcommands:
   save <name>              Save credentials for a login profile
@@ -2402,24 +2402,24 @@ Global Options:
   --session <name>         Use specific session
 
 Examples:
-  echo "pass" | agent-browser auth save github --url https://github.com/login --username user --password-stdin
-  agent-browser auth save github --url https://github.com/login --username user --password pass
-  agent-browser auth login github
-  agent-browser auth login my-app --credential-provider vault --item "My App"
-  agent-browser auth list
-  agent-browser auth show github
-  agent-browser auth delete github
+  echo "pass" | silver auth save github --url https://github.com/login --username user --password-stdin
+  silver auth save github --url https://github.com/login --username user --password pass
+  silver auth login github
+  silver auth login my-app --credential-provider vault --item "My App"
+  silver auth list
+  silver auth show github
+  silver auth delete github
 "##
         }
 
         // === Confirm/Deny ===
         "confirm" | "deny" => {
             r##"
-agent-browser confirm/deny - Approve or deny pending actions
+silver confirm/deny - Approve or deny pending actions
 
 Usage:
-  agent-browser confirm <confirmation-id>
-  agent-browser deny <confirmation-id>
+  silver confirm <confirmation-id>
+  silver deny <confirmation-id>
 
 When --confirm-actions is set, certain action categories return a
 confirmation_required response with a confirmation ID. Use confirm/deny
@@ -2428,17 +2428,17 @@ to approve or reject the action.
 Pending confirmations auto-deny after 60 seconds.
 
 Examples:
-  agent-browser confirm c_8f3a1234
-  agent-browser deny c_8f3a1234
+  silver confirm c_8f3a1234
+  silver deny c_8f3a1234
 "##
         }
 
         // === Dialog ===
         "dialog" => {
             r##"
-agent-browser dialog - Handle browser dialogs
+silver dialog - Handle browser dialogs
 
-Usage: agent-browser dialog <accept|dismiss|status> [text]
+Usage: silver dialog <accept|dismiss|status> [text]
 
 Respond to or check for browser dialogs (alert, confirm, prompt).
 
@@ -2452,20 +2452,20 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser dialog accept
-  agent-browser dialog accept "my input"
-  agent-browser dialog dismiss
-  agent-browser dialog status
+  silver dialog accept
+  silver dialog accept "my input"
+  silver dialog dismiss
+  silver dialog status
 "##
         }
 
         // === Trace ===
         "trace" => {
             r##"
-agent-browser trace - Record execution trace
+silver trace - Record execution trace
 
-Usage: agent-browser trace start
-       agent-browser trace stop [path]
+Usage: silver trace start
+       silver trace stop [path]
 
 Record a Chrome DevTools trace for debugging.
 
@@ -2478,18 +2478,18 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser trace start
-  agent-browser trace stop
-  agent-browser trace stop ./debug-trace.json
+  silver trace start
+  silver trace stop
+  silver trace stop ./debug-trace.json
 "##
         }
 
         // === Profile (CDP Tracing) ===
         "profiler" => {
             r##"
-agent-browser profiler - Record Chrome DevTools performance profile
+silver profiler - Record Chrome DevTools performance profile
 
-Usage: agent-browser profiler <operation> [options]
+Usage: silver profiler <operation> [options]
 
 Record a performance profile using Chrome DevTools Protocol (CDP) Tracing.
 The output JSON file can be loaded into Chrome DevTools Performance panel,
@@ -2509,14 +2509,14 @@ Global Options:
 
 Examples:
   # Basic profiling
-  agent-browser profiler start
-  agent-browser navigate https://example.com
-  agent-browser click "#button"
-  agent-browser profiler stop ./trace.json
+  silver profiler start
+  silver navigate https://example.com
+  silver click "#button"
+  silver profiler stop ./trace.json
 
   # With custom categories
-  agent-browser profiler start --categories "devtools.timeline,v8.execute,blink.user_timing"
-  agent-browser profiler stop ./custom-trace.json
+  silver profiler start --categories "devtools.timeline,v8.execute,blink.user_timing"
+  silver profiler stop ./custom-trace.json
 
 The output file can be viewed in:
   - Chrome DevTools: Performance panel > Load profile
@@ -2527,11 +2527,11 @@ The output file can be viewed in:
         // === Record (video) ===
         "record" => {
             r##"
-agent-browser record - Record browser session to video
+silver record - Record browser session to video
 
-Usage: agent-browser record start <path.webm> [url]
-       agent-browser record stop
-       agent-browser record restart <path.webm> [url]
+Usage: silver record start <path.webm> [url]
+       silver record stop
+       silver record restart <path.webm> [url]
 
 Record the browser to a WebM video file.
 Creates a fresh browser context but preserves cookies and localStorage.
@@ -2548,26 +2548,26 @@ Global Options:
 
 Examples:
   # Record from current page (preserves login state)
-  agent-browser open https://app.example.com/dashboard
-  agent-browser snapshot -i            # Explore and plan
-  agent-browser record start ./demo.webm
-  agent-browser click @e3              # Execute planned actions
-  agent-browser record stop
+  silver open https://app.example.com/dashboard
+  silver snapshot -i            # Explore and plan
+  silver record start ./demo.webm
+  silver click @e3              # Execute planned actions
+  silver record stop
 
   # Or specify a different URL
-  agent-browser record start ./demo.webm https://example.com
+  silver record start ./demo.webm https://example.com
 
   # Restart recording with a new file (stops previous, starts new)
-  agent-browser record restart ./take2.webm
+  silver record restart ./take2.webm
 "##
         }
 
         // === Console/Errors ===
         "console" => {
             r##"
-agent-browser console - View console logs
+silver console - View console logs
 
-Usage: agent-browser console [--clear]
+Usage: silver console [--clear]
 
 View browser console output (log, warn, error, info).
 
@@ -2579,15 +2579,15 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser console
-  agent-browser console --clear
+  silver console
+  silver console --clear
 "##
         }
         "errors" => {
             r##"
-agent-browser errors - View page errors
+silver errors - View page errors
 
-Usage: agent-browser errors [--clear]
+Usage: silver errors [--clear]
 
 View JavaScript errors and uncaught exceptions.
 
@@ -2599,17 +2599,17 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser errors
-  agent-browser errors --clear
+  silver errors
+  silver errors --clear
 "##
         }
 
         // === Highlight ===
         "highlight" => {
             r##"
-agent-browser highlight - Highlight an element
+silver highlight - Highlight an element
 
-Usage: agent-browser highlight <selector>
+Usage: silver highlight <selector>
 
 Visually highlights an element on the page for debugging.
 
@@ -2618,17 +2618,17 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser highlight "#target-element"
-  agent-browser highlight @e5
+  silver highlight "#target-element"
+  silver highlight @e5
 "##
         }
 
         // === Clipboard ===
         "clipboard" => {
             r##"
-agent-browser clipboard - Read and write clipboard
+silver clipboard - Read and write clipboard
 
-Usage: agent-browser clipboard <operation> [text]
+Usage: silver clipboard <operation> [text]
 
 Read from or write to the browser clipboard.
 
@@ -2643,19 +2643,19 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser clipboard read
-  agent-browser clipboard write "Hello, World!"
-  agent-browser clipboard copy
-  agent-browser clipboard paste
+  silver clipboard read
+  silver clipboard write "Hello, World!"
+  silver clipboard copy
+  silver clipboard paste
 "##
         }
 
         // === State ===
         "state" => {
             r##"
-agent-browser state - Manage browser state
+silver state - Manage browser state
 
-Usage: agent-browser state <operation> [args]
+Usage: silver state <operation> [args]
 
 Save, restore, list, and manage browser state (cookies, localStorage, sessionStorage).
 
@@ -2670,11 +2670,11 @@ Operations:
 
 Automatic State Persistence:
   Use --restore to auto-save/restore state across restarts:
-  agent-browser --session myapp --restore open https://example.com
-  Or set AGENT_BROWSER_RESTORE environment variable.
+  silver --session myapp --restore open https://example.com
+  Or set SILVER_RESTORE environment variable.
 
 State Encryption:
-  Set AGENT_BROWSER_ENCRYPTION_KEY (64-char hex) for AES-256-GCM encryption.
+  Set SILVER_ENCRYPTION_KEY (64-char hex) for AES-256-GCM encryption.
   Generate a key: openssl rand -hex 32
 
 Global Options:
@@ -2682,22 +2682,22 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser state save ./auth-state.json
-  agent-browser state load ./auth-state.json
-  agent-browser state list
-  agent-browser state show myapp-default.json
-  agent-browser state rename old-name new-name
-  agent-browser state clear --all
-  agent-browser state clean --older-than 7
+  silver state save ./auth-state.json
+  silver state load ./auth-state.json
+  silver state list
+  silver state show myapp-default.json
+  silver state rename old-name new-name
+  silver state clear --all
+  silver state clean --older-than 7
 "##
         }
 
         // === Session ===
         "session" => {
             r##"
-agent-browser session - Manage sessions
+silver session - Manage sessions
 
-Usage: agent-browser session [operation]
+Usage: silver session [operation]
 
 Manage isolated browser sessions. Each session has its own browser
 instance with separate cookies, storage, and state.
@@ -2709,8 +2709,8 @@ Operations:
   list                 List all active sessions
 
 Environment:
-  AGENT_BROWSER_SESSION    Default session name
-  AGENT_BROWSER_NAMESPACE  Namespace for daemon sockets and restore state
+  SILVER_SESSION    Default session name
+  SILVER_NAMESPACE  Namespace for daemon sockets and restore state
 
 Global Options:
   --json               Output as JSON
@@ -2718,20 +2718,20 @@ Global Options:
   --namespace <name>   Use specific namespace
 
 Examples:
-  agent-browser session
-  agent-browser session id --scope worktree --prefix next-dev-loop
-  agent-browser session info --json
-  agent-browser session list
-  agent-browser --session test open example.com
+  silver session
+  silver session id --scope worktree --prefix next-dev-loop
+  silver session info --json
+  silver session list
+  silver --session test open example.com
 "##
         }
 
         // === Install ===
         "install" => {
             r##"
-agent-browser install - Install browser binaries
+silver install - Install browser binaries
 
-Usage: agent-browser install [--with-deps]
+Usage: silver install [--with-deps]
 
 Downloads and installs browser binaries required for automation.
 
@@ -2739,33 +2739,33 @@ Options:
   -d, --with-deps      Also install system dependencies (Linux only; fails if deps fail)
 
 Examples:
-  agent-browser install
-  agent-browser install --with-deps
+  silver install
+  silver install --with-deps
 "##
         }
 
         // === Upgrade ===
         "upgrade" => {
             r##"
-agent-browser upgrade - Upgrade to the latest version
+silver upgrade - Upgrade to the latest version
 
-Usage: agent-browser upgrade
+Usage: silver upgrade
 
 Detects the current installation method (npm, Homebrew, or Cargo) and runs
 the appropriate update command. Displays the version change on success, or
 informs you if you are already on the latest version.
 
 Examples:
-  agent-browser upgrade
+  silver upgrade
 "##
         }
 
         // === Doctor ===
         "doctor" => {
             r##"
-agent-browser doctor - Diagnose and repair your install
+silver doctor - Diagnose and repair your install
 
-Usage: agent-browser doctor [options]
+Usage: silver doctor [options]
 
 Runs a battery of checks across environment, Chrome install, daemon state,
 config files, encryption key, providers, network reachability, and a live
@@ -2792,21 +2792,21 @@ Exit codes:
   1  At least one check failed
 
 Examples:
-  agent-browser doctor
-  agent-browser doctor --offline --quick
-  agent-browser doctor --webgpu
-  agent-browser doctor --webgpu --headed
-  agent-browser doctor --fix
-  agent-browser doctor --json
+  silver doctor
+  silver doctor --offline --quick
+  silver doctor --webgpu
+  silver doctor --webgpu --headed
+  silver doctor --fix
+  silver doctor --json
 "##
         }
 
         // === Dashboard ===
         "dashboard" => {
             r##"
-agent-browser dashboard - Observability dashboard
+silver dashboard - Observability dashboard
 
-Usage: agent-browser dashboard [start|stop] [options]
+Usage: silver dashboard [start|stop] [options]
 
 Manage the observability dashboard, a local web UI that shows live
 browser viewports and command activity feeds for all sessions.
@@ -2816,7 +2816,7 @@ Subcommands:
   start [--port <n>]   Start the dashboard server (default port: 4848)
   stop                 Stop the dashboard server
 
-Running 'agent-browser dashboard' with no subcommand is equivalent to 'dashboard start'.
+Running 'silver dashboard' with no subcommand is equivalent to 'dashboard start'.
 
 The dashboard runs as a standalone background process, independent of
 browser sessions. All sessions automatically stream to the dashboard.
@@ -2833,18 +2833,18 @@ Global Options:
   --json               Output as JSON
 
 Examples:
-  agent-browser dashboard start
-  agent-browser dashboard start --port 8080
-  agent-browser dashboard stop
+  silver dashboard start
+  silver dashboard start --port 8080
+  silver dashboard stop
 "##
         }
 
         // === Connect ===
         "connect" => {
             r##"
-agent-browser connect - Connect to browser via CDP
+silver connect - Connect to browser via CDP
 
-Usage: agent-browser connect <port|url>
+Usage: silver connect <port|url>
 
 Connects to a running browser instance via Chrome DevTools Protocol (CDP).
 This allows controlling browsers, Electron apps, or remote browser services.
@@ -2865,39 +2865,39 @@ Global Options:
 Examples:
   # Connect to local Chrome with remote debugging
   # Start Chrome: google-chrome --remote-debugging-port=9222
-  agent-browser connect 9222
+  silver connect 9222
 
   # Connect using WebSocket URL from /json/version endpoint
-  agent-browser connect "ws://localhost:9222/devtools/browser/abc123"
+  silver connect "ws://localhost:9222/devtools/browser/abc123"
 
   # Connect to remote browser service
-  agent-browser connect "wss://browser-service.example.com/cdp?token=xyz"
+  silver connect "wss://browser-service.example.com/cdp?token=xyz"
 
   # After connecting, run commands normally
-  agent-browser snapshot
-  agent-browser click @e1
+  silver snapshot
+  silver click @e1
 "##
         }
 
         // === Runtime streaming ===
         "stream" => {
             r##"
-agent-browser stream - Manage live WebSocket browser streaming
+silver stream - Manage live WebSocket browser streaming
 
 Usage:
-  agent-browser stream enable [--port <port>]
-  agent-browser stream disable
-  agent-browser stream status
+  silver stream enable [--port <port>]
+  silver stream disable
+  silver stream status
 
 Enables or disables the session-scoped WebSocket stream server without restarting
-an already-running daemon. If --port is omitted, agent-browser binds an
+an already-running daemon. If --port is omitted, silver binds an
 available localhost port automatically and reports it back.
 
 Notes:
   - 'stream enable' creates the WebSocket server.
   - WebSocket clients trigger frame streaming automatically.
   - 'screencast_start' and 'screencast_stop' still control explicit CDP screencasts.
-  - Streaming is always enabled. Set AGENT_BROWSER_STREAM_PORT to bind to a
+  - Streaming is always enabled. Set SILVER_STREAM_PORT to bind to a
     specific port instead of the default OS-assigned port.
 
 Global Options:
@@ -2905,19 +2905,19 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser stream status
-  agent-browser stream enable
-  agent-browser stream enable --port 9223
-  agent-browser stream disable
+  silver stream status
+  silver stream enable
+  silver stream enable --port 9223
+  silver stream disable
 "##
         }
 
         // === iOS Commands ===
         "tap" => {
             r##"
-agent-browser tap - Tap an element (touch gesture)
+silver tap - Tap an element (touch gesture)
 
-Usage: agent-browser tap <selector>
+Usage: silver tap <selector>
 
 Taps an element. This is an alias for 'click' that provides semantic clarity
 for touch-based interfaces like iOS Safari.
@@ -2927,16 +2927,16 @@ Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser tap "#submit-button"
-  agent-browser tap @e1
-  agent-browser -p ios tap "button:has-text('Sign In')"
+  silver tap "#submit-button"
+  silver tap @e1
+  silver -p ios tap "button:has-text('Sign In')"
 "##
         }
         "swipe" => {
             r##"
-agent-browser swipe - Swipe gesture (iOS)
+silver swipe - Swipe gesture (iOS)
 
-Usage: agent-browser swipe <direction> [distance]
+Usage: silver swipe <direction> [distance]
 
 Performs a swipe gesture on iOS Safari. The direction determines
 which way the content moves (swipe up scrolls down, etc.).
@@ -2950,16 +2950,16 @@ Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser -p ios swipe up
-  agent-browser -p ios swipe down 500
-  agent-browser -p ios swipe left
+  silver -p ios swipe up
+  silver -p ios swipe down 500
+  silver -p ios swipe left
 "##
         }
         "device" => {
             r##"
-agent-browser device - Manage iOS simulators
+silver device - Manage iOS simulators
 
-Usage: agent-browser device <subcommand>
+Usage: silver device <subcommand>
 
 Subcommands:
   list    List available iOS simulators
@@ -2969,14 +2969,14 @@ Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser device list
-  agent-browser -p ios device list
+  silver device list
+  silver -p ios device list
 "##
         }
 
         "diff" => {
             r##"
-agent-browser diff - Compare page states
+silver diff - Compare page states
 
 Subcommands:
 
@@ -2986,7 +2986,7 @@ Subcommands:
 
 Snapshot Diff:
 
-  Usage: agent-browser diff snapshot [options]
+  Usage: silver diff snapshot [options]
 
   Options:
     -b, --baseline <file>    Compare against a saved snapshot file
@@ -2998,7 +2998,7 @@ Snapshot Diff:
 
 Screenshot Diff:
 
-  Usage: agent-browser diff screenshot --baseline <file> [options]
+  Usage: silver diff screenshot --baseline <file> [options]
 
   Options:
     -b, --baseline <file>    Baseline image to compare against (required)
@@ -3009,7 +3009,7 @@ Screenshot Diff:
 
 URL Diff:
 
-  Usage: agent-browser diff url <url1> <url2> [options]
+  Usage: silver diff url <url1> <url2> [options]
 
   Options:
     --screenshot             Also compare screenshots (default: snapshot only)
@@ -3024,21 +3024,21 @@ Global Options:
   --session <name>     Use specific session
 
 Examples:
-  agent-browser diff snapshot
-  agent-browser diff snapshot --baseline before.txt
-  agent-browser diff screenshot --baseline before.png
-  agent-browser diff screenshot --baseline before.png --output diff.png --threshold 0.2
-  agent-browser diff url https://staging.example.com https://prod.example.com
-  agent-browser diff url https://v1.example.com https://v2.example.com --screenshot
+  silver diff snapshot
+  silver diff snapshot --baseline before.txt
+  silver diff screenshot --baseline before.png
+  silver diff screenshot --baseline before.png --output diff.png --threshold 0.2
+  silver diff url https://staging.example.com https://prod.example.com
+  silver diff url https://v1.example.com https://v2.example.com --screenshot
 "##
         }
 
         "batch" => {
             r##"
-agent-browser batch - Execute multiple commands sequentially
+silver batch - Execute multiple commands sequentially
 
-Usage: agent-browser batch [options] "<cmd1>" "<cmd2>" ...
-       echo '<json>' | agent-browser batch [options]
+Usage: silver batch [options] "<cmd1>" "<cmd2>" ...
+       echo '<json>' | silver batch [options]
 
 Runs multiple commands in sequence. Commands can be passed as quoted
 arguments or piped as JSON via stdin. Results are printed in order,
@@ -3050,7 +3050,7 @@ Options:
 
 Argument Mode:
   Each quoted argument is a full command string:
-  agent-browser batch "open https://example.com" "snapshot -i" "screenshot"
+  silver batch "open https://example.com" "snapshot -i" "screenshot"
 
 Stdin Mode (JSON):
   A JSON array of string arrays. Each inner array is one command:
@@ -3063,18 +3063,18 @@ Stdin Mode (JSON):
   ]
 
 Examples:
-  agent-browser batch "open https://example.com" "screenshot"
-  agent-browser batch --bail "open https://example.com" "click @e1" "screenshot"
-  echo '[["open", "https://example.com"], ["snapshot"]]' | agent-browser batch
-  agent-browser batch --bail < commands.json
+  silver batch "open https://example.com" "screenshot"
+  silver batch --bail "open https://example.com" "click @e1" "screenshot"
+  echo '[["open", "https://example.com"], ["snapshot"]]' | silver batch
+  silver batch --bail < commands.json
 "##
         }
 
         "profiles" => {
             r##"
-agent-browser profiles - List available Chrome profiles
+silver profiles - List available Chrome profiles
 
-Usage: agent-browser profiles
+Usage: silver profiles
 
 Lists all Chrome profiles found in your Chrome user data directory, showing
 the directory name and display name for each profile. Use the directory name
@@ -3084,23 +3084,23 @@ Global Options:
   --json               Output as JSON
 
 Examples:
-  agent-browser profiles
-  agent-browser profiles --json
-  agent-browser --profile Default open https://gmail.com
+  silver profiles
+  silver profiles --json
+  silver --profile Default open https://gmail.com
 "##
         }
 
         "chat" => {
             r##"
-agent-browser chat - Natural language browser control via AI
+silver chat - Natural language browser control via AI
 
 Usage:
-  agent-browser chat <message>         Single-shot: execute instruction and exit
-  agent-browser chat                   Interactive REPL (when stdin is a TTY)
-  echo "instruction" | agent-browser chat   Piped input
+  silver chat <message>         Single-shot: execute instruction and exit
+  silver chat                   Interactive REPL (when stdin is a TTY)
+  echo "instruction" | silver chat   Piped input
 
 Sends natural language instructions to an AI model that translates them
-into agent-browser commands and executes them against the active session.
+into silver commands and executes them against the active session.
 Requires AI_GATEWAY_API_KEY to be set.
 
 In interactive mode, type "quit", "exit", or "q" to leave the REPL.
@@ -3115,20 +3115,20 @@ Global Options:
   --session <name>       Target session for commands
 
 Examples:
-  agent-browser chat "open google.com and search for cats"
-  agent-browser chat "take a screenshot of the current page"
-  agent-browser -q chat "summarize this page"
-  agent-browser -v chat "fill in the login form with test@example.com"
-  agent-browser --model openai/gpt-4o chat "navigate to hacker news"
-  agent-browser chat
+  silver chat "open google.com and search for cats"
+  silver chat "take a screenshot of the current page"
+  silver -q chat "summarize this page"
+  silver -v chat "fill in the login form with test@example.com"
+  silver --model openai/gpt-4o chat "navigate to hacker news"
+  silver chat
 "##
         }
 
         "mcp" => {
             r##"
-agent-browser mcp - Start an MCP stdio server
+silver mcp - Start an MCP stdio server
 
-Usage: agent-browser mcp [--tools <profiles>]
+Usage: silver mcp [--tools <profiles>]
 
 Starts a Model Context Protocol server over stdio. MCP clients launch this
 command as a subprocess and communicate with newline-delimited JSON-RPC.
@@ -3153,26 +3153,26 @@ Tool profiles:
   all        Every MCP tool, including the full typed CLI parity surface
 
 Common tools include:
-  agent_browser_tools_profiles  List MCP startup tool profiles
-  agent_browser_open       Open a URL or launch about:blank
-  agent_browser_snapshot   Get an accessibility snapshot with refs
-  agent_browser_click      Click an element by @ref or selector
-  agent_browser_fill       Fill an input
-  agent_browser_screenshot Take a screenshot
-  agent_browser_get_url    Read the current URL
-  agent_browser_close      Close the browser session
+  silver_tools_profiles  List MCP startup tool profiles
+  silver_open       Open a URL or launch about:blank
+  silver_snapshot   Get an accessibility snapshot with refs
+  silver_click      Click an element by @ref or selector
+  silver_fill       Fill an input
+  silver_screenshot Take a screenshot
+  silver_get_url    Read the current URL
+  silver_close      Close the browser session
 
 Each tool has typed fields such as url, selector, text, key, and session.
 Each tool also accepts extraArgs for advanced CLI flags and exact CLI parity.
 Tool discovery is paginated and includes read-only/open-world annotations so
 modern MCP clients can load the large typed surface incrementally.
-Use agent_browser_snapshot after navigation to get fresh refs before clicking.
+Use silver_snapshot after navigation to get fresh refs before clicking.
 
 MCP client config example:
   {
     "mcpServers": {
-      "agent-browser": {
-        "command": "agent-browser",
+      "silver": {
+        "command": "silver",
         "args": ["mcp"]
       }
     }
@@ -3181,25 +3181,25 @@ MCP client config example:
 Full parity config example:
   {
     "mcpServers": {
-      "agent-browser": {
-        "command": "agent-browser",
+      "silver": {
+        "command": "silver",
         "args": ["mcp", "--tools", "all"]
       }
     }
   }
 
 Environment:
-  AGENT_BROWSER_SESSION          Default browser session
-  AGENT_BROWSER_SOCKET_DIR       Daemon socket directory
-  AGENT_BROWSER_CONFIG           Config file loaded by tool invocations
+  SILVER_SESSION          Default browser session
+  SILVER_SOCKET_DIR       Daemon socket directory
+  SILVER_CONFIG           Config file loaded by tool invocations
 "##
         }
 
         "skills" => {
             r##"
-agent-browser skills - List and retrieve bundled skill content
+silver skills - List and retrieve bundled skill content
 
-Usage: agent-browser skills [subcommand] [options]
+Usage: silver skills [subcommand] [options]
 
 Subcommands:
   list                       List all available skills (default)
@@ -3216,25 +3216,25 @@ installed CLI version. Agents should use this to get current instructions
 rather than relying on cached copies.
 
 Examples:
-  agent-browser skills
-  agent-browser skills list
-  agent-browser skills get core
-  agent-browser skills get core --full
-  agent-browser skills get electron --full
-  agent-browser skills get --all
-  agent-browser skills path core
-  agent-browser skills list --json
+  silver skills
+  silver skills list
+  silver skills get core
+  silver skills get core --full
+  silver skills get electron --full
+  silver skills get --all
+  silver skills path core
+  silver skills list --json
 
 Environment:
-  AGENT_BROWSER_SKILLS_DIR   Override the skills directory path
+  SILVER_SKILLS_DIR   Override the skills directory path
 "##
         }
 
         "plugin" | "plugins" => {
             r##"
-agent-browser plugin - Manage configured plugins
+silver plugin - Manage configured plugins
 
-Usage: agent-browser plugin [subcommand]
+Usage: silver plugin [subcommand]
 
 Subcommands:
   add <ref>                Add a plugin from npm or GitHub
@@ -3242,7 +3242,7 @@ Subcommands:
   show <name>              Show one configured plugin
   run <name> <type>        Run a command.run or custom plugin request
 
-Plugins are configured in agent-browser.json. A plugin entry declares a name,
+Plugins are configured in silver.json. A plugin entry declares a name,
 an executable command, optional args, and capabilities. Plugins run as
 external processes over the agent-browser.plugin.v1 stdio JSON protocol.
 
@@ -3254,7 +3254,7 @@ Add sources:
 Add options:
   --name <name>            Override the configured plugin name
   --capability <name>      Declare a capability if the plugin has no manifest
-  --global                 Write ~/.agent-browser/config.json instead of ./agent-browser.json
+  --global                 Write ~/.silver/config.json instead of ./silver.json
   --no-manifest            Skip plugin.manifest discovery
 
 plugin add asks the package for plugin.manifest to discover name and
@@ -3282,14 +3282,14 @@ Example config:
   }}
 
 Examples:
-  agent-browser plugin add agent-browser-plugin-captcha
-  agent-browser plugin add org/agent-browser-plugin-cloud-browser
-  agent-browser plugin add @company/agent-browser-plugin-vault --name vault
-  agent-browser plugin list
-  agent-browser plugin show vault
-  agent-browser plugin run captcha captcha.solve --payload '{{"siteKey":"...","url":"https://example.com"}}'
-  agent-browser auth login my-app --credential-provider vault --item "My App"
-  agent-browser --provider cloud-browser open https://example.com
+  silver plugin add agent-browser-plugin-captcha
+  silver plugin add org/agent-browser-plugin-cloud-browser
+  silver plugin add @company/agent-browser-plugin-vault --name vault
+  silver plugin list
+  silver plugin show vault
+  silver plugin run captcha captcha.solve --payload '{{"siteKey":"...","url":"https://example.com"}}'
+  silver auth login my-app --credential-provider vault --item "My App"
+  silver --provider cloud-browser open https://example.com
 "##
         }
 
@@ -3302,12 +3302,12 @@ Examples:
 pub fn print_help() {
     println!(
         r#"
-agent-browser - fast browser automation CLI for AI agents
+silver - fast browser automation CLI for AI agents
 
-Usage: agent-browser <command> [args] [options]
+Usage: silver <command> [args] [options]
 
 Start here (for AI agents):
-  agent-browser skills get core --full
+  silver skills get core --full
 
   Skills ship with the CLI (always version-matched) and include workflow
   patterns, ref/selector usage, and copy-paste examples. Prefer this over
@@ -3353,24 +3353,24 @@ Navigation:
   forward                    Go forward
   reload                     Reload page
 
-Get Info:  agent-browser get <what> [selector]
+Get Info:  silver get <what> [selector]
   text, html, value, attr <name>, title, url, count, box, styles, cdp-url
 
-Check State:  agent-browser is <what> <selector>
+Check State:  silver is <what> <selector>
   visible, enabled, checked
 
-Find Elements:  agent-browser find <locator> <value> <action> [text]
+Find Elements:  silver find <locator> <value> <action> [text]
   role, text, label, placeholder, alt, title, testid, first, last, nth
 
-Mouse:  agent-browser mouse <action> [args]
+Mouse:  silver mouse <action> [args]
   move <x> <y>, down [btn], up [btn], wheel <dy> [dx]
 
-Browser Settings:  agent-browser set <setting> [value]
+Browser Settings:  silver set <setting> [value]
   viewport <w> <h>, device <name>, geo <lat> <lng>
   offline [on|off], headers <json>, credentials <user> <pass>
   media [dark|light] [reduced-motion]
 
-Network:  agent-browser network <action>
+Network:  silver network <action>
   route <url> [--abort|--body <json>] [--resource-type <csv>]
   unroute [url]
   requests [--clear] [--filter <pattern>]
@@ -3457,7 +3457,7 @@ Sessions:
   session list               List active sessions
 
 MCP:
-  mcp                        Start an MCP stdio server exposing agent-browser tools
+  mcp                        Start an MCP stdio server exposing silver tools
 
 Chat (AI):
   chat <message>             Send a natural language instruction (single-shot)
@@ -3486,38 +3486,38 @@ Snapshot Options:
 Authentication:
   --profile <name|path>      Chrome profile name (e.g., Default) to reuse login state,
                              or a directory path for a persistent custom profile
-                             (or AGENT_BROWSER_PROFILE env)
+                             (or SILVER_PROFILE env)
   --restore [name]           Auto-save/restore cookies and localStorage.
                              Without a name, uses --session as the restore key
-                             (or AGENT_BROWSER_RESTORE env)
+                             (or SILVER_RESTORE env)
   --restore-save <policy>    Restore auto-save policy: auto, always, never (default: auto)
   --restore-check-url <glob> Validate restored state against current URL pattern
   --restore-check-text <txt> Validate restored state against visible page text
   --restore-check-fn <js>    Validate restored state against a truthy JS expression
   --session-name <name>      Legacy alias for restore persistence key
-                             (or AGENT_BROWSER_SESSION_NAME env)
+                             (or SILVER_SESSION_NAME env)
   --state <path>             Load saved auth state (cookies + storage) from JSON file
-                             (or AGENT_BROWSER_STATE env)
+                             (or SILVER_STATE env)
   --auto-connect             Connect to a running Chrome to reuse its auth state
-                             Tip: agent-browser --auto-connect state save ./auth.json
+                             Tip: silver --auto-connect state save ./auth.json
   --headers <json>           HTTP headers scoped to URL's origin (e.g., Authorization bearer token)
 
 Options:
-  --session <name>           Isolated session (or AGENT_BROWSER_SESSION env)
+  --session <name>           Isolated session (or SILVER_SESSION env)
   --namespace <name>         Isolate daemon sockets and restore-state directories
-                             (or AGENT_BROWSER_NAMESPACE env)
-  --executable-path <path>   Custom browser executable (or AGENT_BROWSER_EXECUTABLE_PATH)
+                             (or SILVER_NAMESPACE env)
+  --executable-path <path>   Custom browser executable (or SILVER_EXECUTABLE_PATH)
   --extension <path>         Load browser extensions (repeatable)
   --init-script <path>       Register a page init script before the first navigation (repeatable)
-                             (or AGENT_BROWSER_INIT_SCRIPTS env, comma-separated)
+                             (or SILVER_INIT_SCRIPTS env, comma-separated)
   --enable <feature>         Built-in init scripts: react-devtools (repeatable or comma-separated)
-                             (or AGENT_BROWSER_ENABLE env)
-  --args <args>              Browser launch args, comma or newline separated (or AGENT_BROWSER_ARGS)
+                             (or SILVER_ENABLE env)
+  --args <args>              Browser launch args, comma or newline separated (or SILVER_ARGS)
                              e.g., --args "--no-sandbox,--disable-blink-features=AutomationControlled"
-  --user-agent <ua>          Custom User-Agent (or AGENT_BROWSER_USER_AGENT)
-  --proxy <server>           Proxy server URL (or AGENT_BROWSER_PROXY, HTTP_PROXY, HTTPS_PROXY, ALL_PROXY)
+  --user-agent <ua>          Custom User-Agent (or SILVER_USER_AGENT)
+  --proxy <server>           Proxy server URL (or SILVER_PROXY, HTTP_PROXY, HTTPS_PROXY, ALL_PROXY)
                              Supports authenticated proxies: --proxy "http://user:pass@127.0.0.1:7890"
-  --proxy-bypass <hosts>     Bypass proxy for these hosts (or AGENT_BROWSER_PROXY_BYPASS, NO_PROXY)
+  --proxy-bypass <hosts>     Bypass proxy for these hosts (or SILVER_PROXY_BYPASS, NO_PROXY)
                              e.g., --proxy-bypass "localhost,*.internal.com"
   --ignore-https-errors      Ignore HTTPS certificate errors
   --allow-file-access        Allow file:// URLs to access local files (Chromium only)
@@ -3527,38 +3527,38 @@ Options:
   --device <name>            iOS device name (e.g., "iPhone 15 Pro")
   --json                     JSON output
   --annotate                 Annotated screenshot with numbered labels and legend
-  --screenshot-dir <path>    Default screenshot output directory (or AGENT_BROWSER_SCREENSHOT_DIR)
-  --screenshot-quality <n>   JPEG quality 0-100; ignored for PNG (or AGENT_BROWSER_SCREENSHOT_QUALITY)
-  --screenshot-format <fmt>  Screenshot format: png, jpeg (or AGENT_BROWSER_SCREENSHOT_FORMAT)
-  --headed                   Show browser window (not headless) (or AGENT_BROWSER_HEADED env)
-  --webgpu                   Enable WebGPU; uses SwiftShader software Vulkan on Linux, no GPU required (or AGENT_BROWSER_WEBGPU env)
+  --screenshot-dir <path>    Default screenshot output directory (or SILVER_SCREENSHOT_DIR)
+  --screenshot-quality <n>   JPEG quality 0-100; ignored for PNG (or SILVER_SCREENSHOT_QUALITY)
+  --screenshot-format <fmt>  Screenshot format: png, jpeg (or SILVER_SCREENSHOT_FORMAT)
+  --headed                   Show browser window (not headless) (or SILVER_HEADED env)
+  --webgpu                   Enable WebGPU; uses SwiftShader software Vulkan on Linux, no GPU required (or SILVER_WEBGPU env)
   --cdp <port>               Connect via CDP (Chrome DevTools Protocol)
-  --color-scheme <scheme>    Color scheme: dark, light, no-preference (or AGENT_BROWSER_COLOR_SCHEME)
-  --download-path <path>     Default download directory (or AGENT_BROWSER_DOWNLOAD_PATH)
-  --content-boundaries       Wrap page output in boundary markers (or AGENT_BROWSER_CONTENT_BOUNDARIES)
-  --max-output <chars>       Truncate page output to N chars (or AGENT_BROWSER_MAX_OUTPUT)
-  --allowed-domains <list>   Restrict navigation domains (or AGENT_BROWSER_ALLOWED_DOMAINS)
-  --action-policy <path>     Action policy JSON file (or AGENT_BROWSER_ACTION_POLICY)
-  --confirm-actions <list>   Categories requiring confirmation (or AGENT_BROWSER_CONFIRM_ACTIONS)
-  --confirm-interactive      Interactive confirmation prompts; auto-denies if stdin is not a TTY (or AGENT_BROWSER_CONFIRM_INTERACTIVE)
-  --engine <name>            Browser engine: chrome (default), lightpanda (or AGENT_BROWSER_ENGINE)
-  --no-auto-dialog           Disable automatic dismissal of alert/beforeunload dialogs (or AGENT_BROWSER_NO_AUTO_DIALOG)
+  --color-scheme <scheme>    Color scheme: dark, light, no-preference (or SILVER_COLOR_SCHEME)
+  --download-path <path>     Default download directory (or SILVER_DOWNLOAD_PATH)
+  --content-boundaries       Wrap page output in boundary markers (or SILVER_CONTENT_BOUNDARIES)
+  --max-output <chars>       Truncate page output to N chars (or SILVER_MAX_OUTPUT)
+  --allowed-domains <list>   Restrict navigation domains (or SILVER_ALLOWED_DOMAINS)
+  --action-policy <path>     Action policy JSON file (or SILVER_ACTION_POLICY)
+  --confirm-actions <list>   Categories requiring confirmation (or SILVER_CONFIRM_ACTIONS)
+  --confirm-interactive      Interactive confirmation prompts; auto-denies if stdin is not a TTY (or SILVER_CONFIRM_INTERACTIVE)
+  --engine <name>            Browser engine: chrome (default), lightpanda (or SILVER_ENGINE)
+  --no-auto-dialog           Disable automatic dismissal of alert/beforeunload dialogs (or SILVER_NO_AUTO_DIALOG)
   --model <name>             AI model for chat (or AI_GATEWAY_MODEL env)
   -v, --verbose              Show tool commands and their raw output
   -q, --quiet                Show only AI text responses (hide tool calls)
-  --config <path>            Use a custom config file (or AGENT_BROWSER_CONFIG env)
+  --config <path>            Use a custom config file (or SILVER_CONFIG env)
   --debug                    Debug output
   --version, -V              Show version
 
 Configuration:
-  agent-browser looks for agent-browser.json in these locations (lowest to highest priority):
-    1. ~/.agent-browser/config.json      User-level defaults
-    2. ./agent-browser.json              Project-level overrides
+  silver looks for silver.json in these locations (lowest to highest priority):
+    1. ~/.silver/config.json      User-level defaults
+    2. ./silver.json              Project-level overrides
     3. Environment variables             Override config file values
     4. CLI flags                         Override everything
 
   Use --config <path> to load a specific config file instead of the defaults.
-  If --config points to a missing or invalid file, agent-browser exits with an error.
+  If --config points to a missing or invalid file, silver exits with an error.
 
   Boolean flags accept an optional true/false value to override config:
     --headed           (same as --headed true)
@@ -3567,113 +3567,113 @@ Configuration:
 
   Extensions from user and project configs are merged (not replaced).
 
-  Example agent-browser.json:
+  Example silver.json:
     {{"headed": true, "hideScrollbars": false, "proxy": "http://localhost:8080"}}
 
   Plugin example:
     {{"plugins":[{{"name":"vault","command":"agent-browser-plugin-vault","capabilities":["credential.read"]}},{{"name":"stealth","command":"agent-browser-plugin-stealth","capabilities":["launch.mutate"]}}]}}
 
 Environment:
-  AGENT_BROWSER_CONFIG           Path to config file (or use --config)
-  AGENT_BROWSER_SESSION          Session name (default: "default")
-  AGENT_BROWSER_NAMESPACE        Namespace for daemon sockets and restore state
-  AGENT_BROWSER_RESTORE          Auto-save/restore persistence key
-  AGENT_BROWSER_RESTORE_SAVE     Restore save policy: auto, always, never
-  AGENT_BROWSER_AUTOSAVE_INTERVAL_MS Min ms between periodic session autosaves (default: 30000, 0 disables)
-  AGENT_BROWSER_RESTORE_CHECK_URL URL pattern restored state must match
-  AGENT_BROWSER_RESTORE_CHECK_TEXT Page text restored state must contain
-  AGENT_BROWSER_RESTORE_CHECK_FN JS expression restored state must satisfy
-  AGENT_BROWSER_SESSION_NAME     Legacy auto-save/restore state persistence name
-  AGENT_BROWSER_ENCRYPTION_KEY   64-char hex key for AES-256-GCM state encryption
-  AGENT_BROWSER_STATE_EXPIRE_DAYS Auto-delete states older than N days (default: 30)
-  AGENT_BROWSER_EXECUTABLE_PATH  Custom browser executable path
-  AGENT_BROWSER_EXTENSIONS       Comma-separated browser extension paths
-  AGENT_BROWSER_INIT_SCRIPTS     Comma-separated paths to page init scripts
-  AGENT_BROWSER_ENABLE           Comma-separated built-in init script features (e.g. react-devtools)
-  AGENT_BROWSER_HEADED           Show browser window (not headless)
-  AGENT_BROWSER_NO_XVFB          Disable automatic Xvfb for headed mode on displayless Linux hosts
-  AGENT_BROWSER_WEBGPU           Enable WebGPU (SwiftShader software Vulkan on Linux)
-  AGENT_BROWSER_JSON             JSON output
-  AGENT_BROWSER_ANNOTATE         Annotated screenshot with numbered labels and legend
-  AGENT_BROWSER_DEBUG            Debug output
-  AGENT_BROWSER_IGNORE_HTTPS_ERRORS Ignore HTTPS certificate errors
-  AGENT_BROWSER_PROVIDER         Browser provider (ios, browserbase, kernel, browseruse, browserless, agentcore, or plugin name)
-  AGENT_BROWSER_AUTO_CONNECT     Auto-discover and connect to running Chrome
-  AGENT_BROWSER_ALLOW_FILE_ACCESS Allow file:// URLs to access local files
-  AGENT_BROWSER_HIDE_SCROLLBARS  Hide scrollbars in headless Chromium screenshots (default: true)
-  AGENT_BROWSER_COLOR_SCHEME     Color scheme preference (dark, light, no-preference)
-  AGENT_BROWSER_DOWNLOAD_PATH    Default download directory for browser downloads
-  AGENT_BROWSER_DEFAULT_TIMEOUT  Default action timeout in ms (default: 25000)
-  AGENT_BROWSER_SESSION_NAME     Legacy auto-save/load state persistence name
-  AGENT_BROWSER_STATE_EXPIRE_DAYS Auto-delete saved states older than N days (default: 30)
-  AGENT_BROWSER_ENCRYPTION_KEY   64-char hex key for AES-256-GCM session encryption
-  AGENT_BROWSER_STREAM_PORT      Override WebSocket streaming port (default: OS-assigned)
-  AGENT_BROWSER_IDLE_TIMEOUT_MS  Auto-shutdown daemon after N ms of inactivity (disabled by default)
-  AGENT_BROWSER_IOS_DEVICE       Default iOS device name
-  AGENT_BROWSER_IOS_UDID         Default iOS device UDID
-  AGENT_BROWSER_CONTENT_BOUNDARIES Wrap page output in boundary markers
-  AGENT_BROWSER_MAX_OUTPUT       Max characters for page output
-  AGENT_BROWSER_ALLOWED_DOMAINS  Comma-separated allowed domain patterns
-  AGENT_BROWSER_ACTION_POLICY    Path to action policy JSON file
-  AGENT_BROWSER_CONFIRM_ACTIONS  Action categories requiring confirmation
-  AGENT_BROWSER_CONFIRM_INTERACTIVE Enable interactive confirmation prompts
-  AGENT_BROWSER_NO_AUTO_DIALOG   Disable automatic dismissal of alert/beforeunload dialogs
-  AGENT_BROWSER_ENGINE           Browser engine: chrome (default), lightpanda
-  AGENT_BROWSER_PLUGINS          JSON plugin registry override
-  HTTP_PROXY / HTTPS_PROXY       Standard proxy env vars (fallback if AGENT_BROWSER_PROXY not set)
+  SILVER_CONFIG           Path to config file (or use --config)
+  SILVER_SESSION          Session name (default: "default")
+  SILVER_NAMESPACE        Namespace for daemon sockets and restore state
+  SILVER_RESTORE          Auto-save/restore persistence key
+  SILVER_RESTORE_SAVE     Restore save policy: auto, always, never
+  SILVER_AUTOSAVE_INTERVAL_MS Min ms between periodic session autosaves (default: 30000, 0 disables)
+  SILVER_RESTORE_CHECK_URL URL pattern restored state must match
+  SILVER_RESTORE_CHECK_TEXT Page text restored state must contain
+  SILVER_RESTORE_CHECK_FN JS expression restored state must satisfy
+  SILVER_SESSION_NAME     Legacy auto-save/restore state persistence name
+  SILVER_ENCRYPTION_KEY   64-char hex key for AES-256-GCM state encryption
+  SILVER_STATE_EXPIRE_DAYS Auto-delete states older than N days (default: 30)
+  SILVER_EXECUTABLE_PATH  Custom browser executable path
+  SILVER_EXTENSIONS       Comma-separated browser extension paths
+  SILVER_INIT_SCRIPTS     Comma-separated paths to page init scripts
+  SILVER_ENABLE           Comma-separated built-in init script features (e.g. react-devtools)
+  SILVER_HEADED           Show browser window (not headless)
+  SILVER_NO_XVFB          Disable automatic Xvfb for headed mode on displayless Linux hosts
+  SILVER_WEBGPU           Enable WebGPU (SwiftShader software Vulkan on Linux)
+  SILVER_JSON             JSON output
+  SILVER_ANNOTATE         Annotated screenshot with numbered labels and legend
+  SILVER_DEBUG            Debug output
+  SILVER_IGNORE_HTTPS_ERRORS Ignore HTTPS certificate errors
+  SILVER_PROVIDER         Browser provider (ios, browserbase, kernel, browseruse, browserless, agentcore, or plugin name)
+  SILVER_AUTO_CONNECT     Auto-discover and connect to running Chrome
+  SILVER_ALLOW_FILE_ACCESS Allow file:// URLs to access local files
+  SILVER_HIDE_SCROLLBARS  Hide scrollbars in headless Chromium screenshots (default: true)
+  SILVER_COLOR_SCHEME     Color scheme preference (dark, light, no-preference)
+  SILVER_DOWNLOAD_PATH    Default download directory for browser downloads
+  SILVER_DEFAULT_TIMEOUT  Default action timeout in ms (default: 25000)
+  SILVER_SESSION_NAME     Legacy auto-save/load state persistence name
+  SILVER_STATE_EXPIRE_DAYS Auto-delete saved states older than N days (default: 30)
+  SILVER_ENCRYPTION_KEY   64-char hex key for AES-256-GCM session encryption
+  SILVER_STREAM_PORT      Override WebSocket streaming port (default: OS-assigned)
+  SILVER_IDLE_TIMEOUT_MS  Auto-shutdown daemon after N ms of inactivity (disabled by default)
+  SILVER_IOS_DEVICE       Default iOS device name
+  SILVER_IOS_UDID         Default iOS device UDID
+  SILVER_CONTENT_BOUNDARIES Wrap page output in boundary markers
+  SILVER_MAX_OUTPUT       Max characters for page output
+  SILVER_ALLOWED_DOMAINS  Comma-separated allowed domain patterns
+  SILVER_ACTION_POLICY    Path to action policy JSON file
+  SILVER_CONFIRM_ACTIONS  Action categories requiring confirmation
+  SILVER_CONFIRM_INTERACTIVE Enable interactive confirmation prompts
+  SILVER_NO_AUTO_DIALOG   Disable automatic dismissal of alert/beforeunload dialogs
+  SILVER_ENGINE           Browser engine: chrome (default), lightpanda
+  SILVER_PLUGINS          JSON plugin registry override
+  HTTP_PROXY / HTTPS_PROXY       Standard proxy env vars (fallback if SILVER_PROXY not set)
   ALL_PROXY                      SOCKS proxy (fallback for proxy)
   NO_PROXY                       Bypass proxy for hosts (fallback for proxy-bypass)
-  AGENT_BROWSER_SCREENSHOT_DIR   Default screenshot output directory
-  AGENT_BROWSER_SCREENSHOT_QUALITY JPEG quality 0-100
-  AGENT_BROWSER_SCREENSHOT_FORMAT Screenshot format: png, jpeg
+  SILVER_SCREENSHOT_DIR   Default screenshot output directory
+  SILVER_SCREENSHOT_QUALITY JPEG quality 0-100
+  SILVER_SCREENSHOT_FORMAT Screenshot format: png, jpeg
   AI_GATEWAY_URL                 Vercel AI Gateway base URL (default: https://ai-gateway.vercel.sh)
   AI_GATEWAY_API_KEY             API key for the AI Gateway (enables chat command and dashboard AI chat)
   AI_GATEWAY_MODEL               Default AI model (default: anthropic/claude-sonnet-4.6, or --model flag)
 
 Install:
-  npm install -g agent-browser           # npm
-  brew install agent-browser             # Homebrew
-  cargo install agent-browser            # Cargo
-  agent-browser install                  # Download Chrome (first time)
+  npm install -g silver           # npm
+  brew install silver             # Homebrew
+  cargo install silver            # Cargo
+  silver install                  # Download Chrome (first time)
 
 Examples:
-  agent-browser open example.com
-  agent-browser snapshot -i              # Interactive elements only
-  agent-browser click @e2                # Click by ref from snapshot
-  agent-browser fill @e3 "test@example.com"
-  agent-browser find role button click --name Submit
-  agent-browser get text @e1
-  agent-browser screenshot --full
-  agent-browser screenshot --annotate    # Labeled screenshot for vision models
-  agent-browser wait 2000               # Wait for slow pages to settle
-  agent-browser --cdp 9222 snapshot      # Connect via CDP port
-  agent-browser --auto-connect snapshot  # Auto-discover running Chrome
-  agent-browser stream enable            # Start runtime streaming on an auto-selected port
-  agent-browser stream status            # Inspect runtime streaming state
-  agent-browser --color-scheme dark open example.com  # Dark mode
-  agent-browser --profile Default open gmail.com        # Reuse Chrome login state
-  agent-browser --profile ~/.myapp open example.com    # Persistent custom profile
-  agent-browser profiles                               # List available Chrome profiles
-  SESSION="$(agent-browser session id --scope worktree --prefix myapp)"
-  agent-browser --session "$SESSION" --restore open example.com  # Auto-save/restore state
-  agent-browser session info --json                    # Inspect daemon and restore status
-  agent-browser chat "open google.com and search for cats"  # AI chat (single-shot)
-  agent-browser chat                                        # AI chat (interactive REPL)
-  agent-browser -q chat "summarize this page"               # Quiet mode (text only)
+  silver open example.com
+  silver snapshot -i              # Interactive elements only
+  silver click @e2                # Click by ref from snapshot
+  silver fill @e3 "test@example.com"
+  silver find role button click --name Submit
+  silver get text @e1
+  silver screenshot --full
+  silver screenshot --annotate    # Labeled screenshot for vision models
+  silver wait 2000               # Wait for slow pages to settle
+  silver --cdp 9222 snapshot      # Connect via CDP port
+  silver --auto-connect snapshot  # Auto-discover running Chrome
+  silver stream enable            # Start runtime streaming on an auto-selected port
+  silver stream status            # Inspect runtime streaming state
+  silver --color-scheme dark open example.com  # Dark mode
+  silver --profile Default open gmail.com        # Reuse Chrome login state
+  silver --profile ~/.myapp open example.com    # Persistent custom profile
+  silver profiles                               # List available Chrome profiles
+  SESSION="$(silver session id --scope worktree --prefix myapp)"
+  silver --session "$SESSION" --restore open example.com  # Auto-save/restore state
+  silver session info --json                    # Inspect daemon and restore status
+  silver chat "open google.com and search for cats"  # AI chat (single-shot)
+  silver chat                                        # AI chat (interactive REPL)
+  silver -q chat "summarize this page"               # Quiet mode (text only)
 
 Command Chaining:
   Chain commands with && in a single shell call (browser persists via daemon):
 
-  agent-browser open example.com && agent-browser snapshot -i
-  agent-browser fill @e1 "user@example.com" && agent-browser fill @e2 "pass" && agent-browser click @e3
-  agent-browser open example.com && agent-browser screenshot
+  silver open example.com && silver snapshot -i
+  silver fill @e1 "user@example.com" && silver fill @e2 "pass" && silver click @e3
+  silver open example.com && silver screenshot
 
 iOS Simulator (requires Xcode and Appium):
-  agent-browser -p ios open example.com                    # Use default iPhone
-  agent-browser -p ios --device "iPhone 15 Pro" open url   # Specific device
-  agent-browser -p ios device list                         # List simulators
-  agent-browser -p ios swipe up                            # Swipe gesture
-  agent-browser -p ios tap @e1                             # Touch element
+  silver -p ios open example.com                    # Use default iPhone
+  silver -p ios --device "iPhone 15 Pro" open url   # Specific device
+  silver -p ios device list                         # List simulators
+  silver -p ios swipe up                            # Swipe gesture
+  silver -p ios tap @e1                             # Touch element
 "#
     );
 }
@@ -3755,7 +3755,7 @@ fn print_screenshot_diff(data: &serde_json::Map<String, serde_json::Value>) {
 }
 
 pub fn print_version() {
-    println!("agent-browser {}", env!("CARGO_PKG_VERSION"));
+    println!("silver {}", env!("CARGO_PKG_VERSION"));
 }
 
 #[cfg(test)]
@@ -3908,10 +3908,10 @@ hydration: -  phases: 0  hydratedComponents: 0"
 
         let rendered = format_with_boundaries("content", Some("https://example.com"), &opts);
 
-        assert!(rendered.contains("AGENT_BROWSER_PAGE_CONTENT"));
+        assert!(rendered.contains("SILVER_PAGE_CONTENT"));
         assert!(rendered.contains("origin=https://example.com"));
         assert!(rendered.contains("\ncontent\n"));
-        assert!(rendered.contains("END_AGENT_BROWSER_PAGE_CONTENT"));
+        assert!(rendered.contains("END_SILVER_PAGE_CONTENT"));
     }
 
     #[test]

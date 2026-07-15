@@ -1,7 +1,7 @@
 //! External plugin protocol support.
 //!
 //! Plugins run out-of-process and communicate over a small stdio JSON protocol.
-//! Core agent-browser keeps ownership of browser automation, policy checks, and
+//! Core silver keeps ownership of browser automation, policy checks, and
 //! redaction-sensitive flows; credential plugins only resolve secrets on demand.
 
 use serde::{Deserialize, Serialize};
@@ -131,7 +131,7 @@ struct PluginManifestResponse {
 }
 
 pub fn plugins_from_env() -> Vec<PluginConfig> {
-    std::env::var("AGENT_BROWSER_PLUGINS")
+    std::env::var("SILVER_PLUGINS")
         .ok()
         .and_then(|raw| serde_json::from_str::<Vec<PluginConfig>>(&raw).ok())
         .unwrap_or_default()
@@ -622,9 +622,9 @@ fn validate_plugin_name(name: &str) -> Result<(), String> {
 
 fn config_path_for_scope(scope: &PluginConfigScope) -> Result<PathBuf, String> {
     match scope {
-        PluginConfigScope::Project => Ok(PathBuf::from("agent-browser.json")),
+        PluginConfigScope::Project => Ok(PathBuf::from("silver.json")),
         PluginConfigScope::Global => dirs::home_dir()
-            .map(|d| d.join(".agent-browser").join("config.json"))
+            .map(|d| d.join(".silver").join("config.json"))
             .ok_or_else(|| "Could not determine home directory".to_string()),
     }
 }
@@ -826,7 +826,7 @@ pub fn run_plugin_command(args: &[String], plugins: &[PluginConfig], json_output
             if is_core_plugin_entrypoint(request_type) {
                 print_plugin_error(
                     &format!(
-                        "plugin run cannot invoke core plugin entrypoint '{}'; use the dedicated agent-browser command path",
+                        "plugin run cannot invoke core plugin entrypoint '{}'; use the dedicated silver command path",
                         request_type
                     ),
                     json_output,
@@ -1105,7 +1105,7 @@ mod tests {
     #[test]
     fn plugin_config_upsert_replaces_existing_plugin() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agent-browser.json");
+        let path = dir.path().join("silver.json");
         fs::write(
             &path,
             r#"{"headed":true,"plugins":[{"name":"captcha","command":"old","capabilities":["command.run"]}]}"#,
@@ -1138,7 +1138,7 @@ mod tests {
         use crate::test_utils::EnvGuard;
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_PLUGINS"]);
+        let _guard = EnvGuard::new(&["SILVER_PLUGINS"]);
         let dir = tempfile::tempdir().unwrap();
         let plugin_path = dir.path().join("mock-credential-plugin");
         std::fs::write(
@@ -1160,7 +1160,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"credential":{
             ..PluginConfig::default()
         }])
         .unwrap();
-        _guard.set("AGENT_BROWSER_PLUGINS", &registry);
+        _guard.set("SILVER_PLUGINS", &registry);
 
         let plugins = plugins_from_env();
         let credential = resolve_credential_with_plugins(

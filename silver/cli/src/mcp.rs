@@ -1,4 +1,4 @@
-//! Stdio MCP server for exposing agent-browser to MCP clients.
+//! Stdio MCP server for exposing silver to MCP clients.
 //!
 //! The server keeps stdout exclusively for newline-delimited JSON-RPC
 //! messages. Tool calls are delegated to the current binary in `--json` mode
@@ -18,157 +18,157 @@ const PROTOCOL_VERSION: &str = "2025-11-25";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const TOOL_LIST_PAGE_SIZE: usize = 64;
-const TOOL_OPEN: &str = "agent_browser_open";
-const TOOL_READ: &str = "agent_browser_read";
-const TOOL_BACK: &str = "agent_browser_back";
-const TOOL_FORWARD: &str = "agent_browser_forward";
-const TOOL_RELOAD: &str = "agent_browser_reload";
-const TOOL_SNAPSHOT: &str = "agent_browser_snapshot";
-const TOOL_CLICK: &str = "agent_browser_click";
-const TOOL_DBLCLICK: &str = "agent_browser_dblclick";
-const TOOL_FILL: &str = "agent_browser_fill";
-const TOOL_TYPE: &str = "agent_browser_type";
-const TOOL_PRESS: &str = "agent_browser_press";
-const TOOL_KEYDOWN: &str = "agent_browser_keydown";
-const TOOL_KEYUP: &str = "agent_browser_keyup";
-const TOOL_KEYBOARD_TYPE: &str = "agent_browser_keyboard_type";
-const TOOL_KEYBOARD_INSERT_TEXT: &str = "agent_browser_keyboard_insert_text";
-const TOOL_HOVER: &str = "agent_browser_hover";
-const TOOL_FOCUS: &str = "agent_browser_focus";
-const TOOL_CHECK: &str = "agent_browser_check";
-const TOOL_UNCHECK: &str = "agent_browser_uncheck";
-const TOOL_SELECT: &str = "agent_browser_select";
-const TOOL_DRAG: &str = "agent_browser_drag";
-const TOOL_UPLOAD: &str = "agent_browser_upload";
-const TOOL_DOWNLOAD: &str = "agent_browser_download";
-const TOOL_SCROLL: &str = "agent_browser_scroll";
-const TOOL_SCROLL_INTO_VIEW: &str = "agent_browser_scroll_into_view";
-const TOOL_WAIT_MS: &str = "agent_browser_wait_ms";
-const TOOL_WAIT_FOR_SELECTOR: &str = "agent_browser_wait_for_selector";
-const TOOL_WAIT_FOR_TEXT: &str = "agent_browser_wait_for_text";
-const TOOL_WAIT_FOR_URL: &str = "agent_browser_wait_for_url";
-const TOOL_WAIT_FOR_LOAD: &str = "agent_browser_wait_for_load";
-const TOOL_WAIT_FOR_FUNCTION: &str = "agent_browser_wait_for_function";
-const TOOL_WAIT_FOR_DOWNLOAD: &str = "agent_browser_wait_for_download";
-const TOOL_SCREENSHOT: &str = "agent_browser_screenshot";
-const TOOL_PDF: &str = "agent_browser_pdf";
-const TOOL_GET_TEXT: &str = "agent_browser_get_text";
-const TOOL_GET_HTML: &str = "agent_browser_get_html";
-const TOOL_GET_VALUE: &str = "agent_browser_get_value";
-const TOOL_GET_ATTR: &str = "agent_browser_get_attr";
-const TOOL_GET_COUNT: &str = "agent_browser_get_count";
-const TOOL_GET_BOX: &str = "agent_browser_get_box";
-const TOOL_GET_STYLES: &str = "agent_browser_get_styles";
-const TOOL_GET_URL: &str = "agent_browser_get_url";
-const TOOL_GET_TITLE: &str = "agent_browser_get_title";
-const TOOL_GET_CDP_URL: &str = "agent_browser_get_cdp_url";
-const TOOL_IS_VISIBLE: &str = "agent_browser_is_visible";
-const TOOL_IS_ENABLED: &str = "agent_browser_is_enabled";
-const TOOL_IS_CHECKED: &str = "agent_browser_is_checked";
-const TOOL_FIND: &str = "agent_browser_find";
-const TOOL_MOUSE_MOVE: &str = "agent_browser_mouse_move";
-const TOOL_MOUSE_DOWN: &str = "agent_browser_mouse_down";
-const TOOL_MOUSE_UP: &str = "agent_browser_mouse_up";
-const TOOL_MOUSE_WHEEL: &str = "agent_browser_mouse_wheel";
-const TOOL_SET_VIEWPORT: &str = "agent_browser_set_viewport";
-const TOOL_SET_DEVICE: &str = "agent_browser_set_device";
-const TOOL_SET_GEO: &str = "agent_browser_set_geo";
-const TOOL_SET_OFFLINE: &str = "agent_browser_set_offline";
-const TOOL_SET_HEADERS: &str = "agent_browser_set_headers";
-const TOOL_SET_CREDENTIALS: &str = "agent_browser_set_credentials";
-const TOOL_SET_MEDIA: &str = "agent_browser_set_media";
-const TOOL_NETWORK_ROUTE: &str = "agent_browser_network_route";
-const TOOL_NETWORK_UNROUTE: &str = "agent_browser_network_unroute";
-const TOOL_NETWORK_REQUESTS: &str = "agent_browser_network_requests";
-const TOOL_NETWORK_REQUEST: &str = "agent_browser_network_request";
-const TOOL_NETWORK_HAR_START: &str = "agent_browser_network_har_start";
-const TOOL_NETWORK_HAR_STOP: &str = "agent_browser_network_har_stop";
-const TOOL_STORAGE_GET: &str = "agent_browser_storage_get";
-const TOOL_STORAGE_SET: &str = "agent_browser_storage_set";
-const TOOL_STORAGE_CLEAR: &str = "agent_browser_storage_clear";
-const TOOL_COOKIES_GET: &str = "agent_browser_cookies_get";
-const TOOL_COOKIES_SET: &str = "agent_browser_cookies_set";
-const TOOL_COOKIES_SET_CURL: &str = "agent_browser_cookies_set_curl";
-const TOOL_COOKIES_CLEAR: &str = "agent_browser_cookies_clear";
-const TOOL_TAB_NEW: &str = "agent_browser_tab_new";
-const TOOL_TAB_LIST: &str = "agent_browser_tab_list";
-const TOOL_TAB_SWITCH: &str = "agent_browser_tab_switch";
-const TOOL_TAB_CLOSE: &str = "agent_browser_tab_close";
-const TOOL_WINDOW_NEW: &str = "agent_browser_window_new";
-const TOOL_FRAME_SWITCH: &str = "agent_browser_frame_switch";
-const TOOL_FRAME_MAIN: &str = "agent_browser_frame_main";
-const TOOL_DIALOG_STATUS: &str = "agent_browser_dialog_status";
-const TOOL_DIALOG_ACCEPT: &str = "agent_browser_dialog_accept";
-const TOOL_DIALOG_DISMISS: &str = "agent_browser_dialog_dismiss";
-const TOOL_TRACE_START: &str = "agent_browser_trace_start";
-const TOOL_TRACE_STOP: &str = "agent_browser_trace_stop";
-const TOOL_PROFILER_START: &str = "agent_browser_profiler_start";
-const TOOL_PROFILER_STOP: &str = "agent_browser_profiler_stop";
-const TOOL_RECORD_START: &str = "agent_browser_record_start";
-const TOOL_RECORD_STOP: &str = "agent_browser_record_stop";
-const TOOL_RECORD_RESTART: &str = "agent_browser_record_restart";
-const TOOL_CONSOLE: &str = "agent_browser_console";
-const TOOL_ERRORS: &str = "agent_browser_errors";
-const TOOL_HIGHLIGHT: &str = "agent_browser_highlight";
-const TOOL_INSPECT: &str = "agent_browser_inspect";
-const TOOL_CLIPBOARD_READ: &str = "agent_browser_clipboard_read";
-const TOOL_CLIPBOARD_WRITE: &str = "agent_browser_clipboard_write";
-const TOOL_CLIPBOARD_COPY: &str = "agent_browser_clipboard_copy";
-const TOOL_CLIPBOARD_PASTE: &str = "agent_browser_clipboard_paste";
-const TOOL_AUTH_SAVE: &str = "agent_browser_auth_save";
-const TOOL_AUTH_LOGIN: &str = "agent_browser_auth_login";
-const TOOL_AUTH_LIST: &str = "agent_browser_auth_list";
-const TOOL_AUTH_SHOW: &str = "agent_browser_auth_show";
-const TOOL_AUTH_DELETE: &str = "agent_browser_auth_delete";
-const TOOL_STATE_SAVE: &str = "agent_browser_state_save";
-const TOOL_STATE_LOAD: &str = "agent_browser_state_load";
-const TOOL_STATE_LIST: &str = "agent_browser_state_list";
-const TOOL_STATE_CLEAR: &str = "agent_browser_state_clear";
-const TOOL_STATE_SHOW: &str = "agent_browser_state_show";
-const TOOL_STATE_CLEAN: &str = "agent_browser_state_clean";
-const TOOL_STATE_RENAME: &str = "agent_browser_state_rename";
-const TOOL_TAP: &str = "agent_browser_tap";
-const TOOL_SWIPE: &str = "agent_browser_swipe";
-const TOOL_DEVICE: &str = "agent_browser_device";
-const TOOL_DIFF_SNAPSHOT: &str = "agent_browser_diff_snapshot";
-const TOOL_DIFF_SCREENSHOT: &str = "agent_browser_diff_screenshot";
-const TOOL_DIFF_URL: &str = "agent_browser_diff_url";
-const TOOL_BATCH: &str = "agent_browser_batch";
-const TOOL_REACT_TREE: &str = "agent_browser_react_tree";
-const TOOL_REACT_INSPECT: &str = "agent_browser_react_inspect";
-const TOOL_REACT_RENDERS_START: &str = "agent_browser_react_renders_start";
-const TOOL_REACT_RENDERS_STOP: &str = "agent_browser_react_renders_stop";
-const TOOL_REACT_SUSPENSE: &str = "agent_browser_react_suspense";
-const TOOL_VITALS: &str = "agent_browser_vitals";
-const TOOL_PUSHSTATE: &str = "agent_browser_pushstate";
-const TOOL_REMOVE_INIT_SCRIPT: &str = "agent_browser_remove_init_script";
-const TOOL_CONFIRM: &str = "agent_browser_confirm";
-const TOOL_DENY: &str = "agent_browser_deny";
-const TOOL_CONNECT: &str = "agent_browser_connect";
-const TOOL_STREAM_ENABLE: &str = "agent_browser_stream_enable";
-const TOOL_STREAM_DISABLE: &str = "agent_browser_stream_disable";
-const TOOL_STREAM_STATUS: &str = "agent_browser_stream_status";
-const TOOL_SESSION: &str = "agent_browser_session";
-const TOOL_SESSION_LIST: &str = "agent_browser_session_list";
-const TOOL_SESSION_ID: &str = "agent_browser_session_id";
-const TOOL_SESSION_INFO: &str = "agent_browser_session_info";
-const TOOL_PROFILES: &str = "agent_browser_profiles";
-const TOOL_SKILLS_LIST: &str = "agent_browser_skills_list";
-const TOOL_SKILLS_GET: &str = "agent_browser_skills_get";
-const TOOL_SKILLS_PATH: &str = "agent_browser_skills_path";
-const TOOL_PLUGIN_ADD: &str = "agent_browser_plugin_add";
-const TOOL_PLUGIN_LIST: &str = "agent_browser_plugin_list";
-const TOOL_PLUGIN_SHOW: &str = "agent_browser_plugin_show";
-const TOOL_PLUGIN_RUN: &str = "agent_browser_plugin_run";
-const TOOL_DOCTOR: &str = "agent_browser_doctor";
-const TOOL_DASHBOARD_START: &str = "agent_browser_dashboard_start";
-const TOOL_DASHBOARD_STOP: &str = "agent_browser_dashboard_stop";
-const TOOL_INSTALL: &str = "agent_browser_install";
-const TOOL_UPGRADE: &str = "agent_browser_upgrade";
-const TOOL_CHAT: &str = "agent_browser_chat";
-const TOOL_EVAL: &str = "agent_browser_eval";
-const TOOL_CLOSE: &str = "agent_browser_close";
-const TOOL_TOOLS_PROFILES: &str = "agent_browser_tools_profiles";
+const TOOL_OPEN: &str = "silver_open";
+const TOOL_READ: &str = "silver_read";
+const TOOL_BACK: &str = "silver_back";
+const TOOL_FORWARD: &str = "silver_forward";
+const TOOL_RELOAD: &str = "silver_reload";
+const TOOL_SNAPSHOT: &str = "silver_snapshot";
+const TOOL_CLICK: &str = "silver_click";
+const TOOL_DBLCLICK: &str = "silver_dblclick";
+const TOOL_FILL: &str = "silver_fill";
+const TOOL_TYPE: &str = "silver_type";
+const TOOL_PRESS: &str = "silver_press";
+const TOOL_KEYDOWN: &str = "silver_keydown";
+const TOOL_KEYUP: &str = "silver_keyup";
+const TOOL_KEYBOARD_TYPE: &str = "silver_keyboard_type";
+const TOOL_KEYBOARD_INSERT_TEXT: &str = "silver_keyboard_insert_text";
+const TOOL_HOVER: &str = "silver_hover";
+const TOOL_FOCUS: &str = "silver_focus";
+const TOOL_CHECK: &str = "silver_check";
+const TOOL_UNCHECK: &str = "silver_uncheck";
+const TOOL_SELECT: &str = "silver_select";
+const TOOL_DRAG: &str = "silver_drag";
+const TOOL_UPLOAD: &str = "silver_upload";
+const TOOL_DOWNLOAD: &str = "silver_download";
+const TOOL_SCROLL: &str = "silver_scroll";
+const TOOL_SCROLL_INTO_VIEW: &str = "silver_scroll_into_view";
+const TOOL_WAIT_MS: &str = "silver_wait_ms";
+const TOOL_WAIT_FOR_SELECTOR: &str = "silver_wait_for_selector";
+const TOOL_WAIT_FOR_TEXT: &str = "silver_wait_for_text";
+const TOOL_WAIT_FOR_URL: &str = "silver_wait_for_url";
+const TOOL_WAIT_FOR_LOAD: &str = "silver_wait_for_load";
+const TOOL_WAIT_FOR_FUNCTION: &str = "silver_wait_for_function";
+const TOOL_WAIT_FOR_DOWNLOAD: &str = "silver_wait_for_download";
+const TOOL_SCREENSHOT: &str = "silver_screenshot";
+const TOOL_PDF: &str = "silver_pdf";
+const TOOL_GET_TEXT: &str = "silver_get_text";
+const TOOL_GET_HTML: &str = "silver_get_html";
+const TOOL_GET_VALUE: &str = "silver_get_value";
+const TOOL_GET_ATTR: &str = "silver_get_attr";
+const TOOL_GET_COUNT: &str = "silver_get_count";
+const TOOL_GET_BOX: &str = "silver_get_box";
+const TOOL_GET_STYLES: &str = "silver_get_styles";
+const TOOL_GET_URL: &str = "silver_get_url";
+const TOOL_GET_TITLE: &str = "silver_get_title";
+const TOOL_GET_CDP_URL: &str = "silver_get_cdp_url";
+const TOOL_IS_VISIBLE: &str = "silver_is_visible";
+const TOOL_IS_ENABLED: &str = "silver_is_enabled";
+const TOOL_IS_CHECKED: &str = "silver_is_checked";
+const TOOL_FIND: &str = "silver_find";
+const TOOL_MOUSE_MOVE: &str = "silver_mouse_move";
+const TOOL_MOUSE_DOWN: &str = "silver_mouse_down";
+const TOOL_MOUSE_UP: &str = "silver_mouse_up";
+const TOOL_MOUSE_WHEEL: &str = "silver_mouse_wheel";
+const TOOL_SET_VIEWPORT: &str = "silver_set_viewport";
+const TOOL_SET_DEVICE: &str = "silver_set_device";
+const TOOL_SET_GEO: &str = "silver_set_geo";
+const TOOL_SET_OFFLINE: &str = "silver_set_offline";
+const TOOL_SET_HEADERS: &str = "silver_set_headers";
+const TOOL_SET_CREDENTIALS: &str = "silver_set_credentials";
+const TOOL_SET_MEDIA: &str = "silver_set_media";
+const TOOL_NETWORK_ROUTE: &str = "silver_network_route";
+const TOOL_NETWORK_UNROUTE: &str = "silver_network_unroute";
+const TOOL_NETWORK_REQUESTS: &str = "silver_network_requests";
+const TOOL_NETWORK_REQUEST: &str = "silver_network_request";
+const TOOL_NETWORK_HAR_START: &str = "silver_network_har_start";
+const TOOL_NETWORK_HAR_STOP: &str = "silver_network_har_stop";
+const TOOL_STORAGE_GET: &str = "silver_storage_get";
+const TOOL_STORAGE_SET: &str = "silver_storage_set";
+const TOOL_STORAGE_CLEAR: &str = "silver_storage_clear";
+const TOOL_COOKIES_GET: &str = "silver_cookies_get";
+const TOOL_COOKIES_SET: &str = "silver_cookies_set";
+const TOOL_COOKIES_SET_CURL: &str = "silver_cookies_set_curl";
+const TOOL_COOKIES_CLEAR: &str = "silver_cookies_clear";
+const TOOL_TAB_NEW: &str = "silver_tab_new";
+const TOOL_TAB_LIST: &str = "silver_tab_list";
+const TOOL_TAB_SWITCH: &str = "silver_tab_switch";
+const TOOL_TAB_CLOSE: &str = "silver_tab_close";
+const TOOL_WINDOW_NEW: &str = "silver_window_new";
+const TOOL_FRAME_SWITCH: &str = "silver_frame_switch";
+const TOOL_FRAME_MAIN: &str = "silver_frame_main";
+const TOOL_DIALOG_STATUS: &str = "silver_dialog_status";
+const TOOL_DIALOG_ACCEPT: &str = "silver_dialog_accept";
+const TOOL_DIALOG_DISMISS: &str = "silver_dialog_dismiss";
+const TOOL_TRACE_START: &str = "silver_trace_start";
+const TOOL_TRACE_STOP: &str = "silver_trace_stop";
+const TOOL_PROFILER_START: &str = "silver_profiler_start";
+const TOOL_PROFILER_STOP: &str = "silver_profiler_stop";
+const TOOL_RECORD_START: &str = "silver_record_start";
+const TOOL_RECORD_STOP: &str = "silver_record_stop";
+const TOOL_RECORD_RESTART: &str = "silver_record_restart";
+const TOOL_CONSOLE: &str = "silver_console";
+const TOOL_ERRORS: &str = "silver_errors";
+const TOOL_HIGHLIGHT: &str = "silver_highlight";
+const TOOL_INSPECT: &str = "silver_inspect";
+const TOOL_CLIPBOARD_READ: &str = "silver_clipboard_read";
+const TOOL_CLIPBOARD_WRITE: &str = "silver_clipboard_write";
+const TOOL_CLIPBOARD_COPY: &str = "silver_clipboard_copy";
+const TOOL_CLIPBOARD_PASTE: &str = "silver_clipboard_paste";
+const TOOL_AUTH_SAVE: &str = "silver_auth_save";
+const TOOL_AUTH_LOGIN: &str = "silver_auth_login";
+const TOOL_AUTH_LIST: &str = "silver_auth_list";
+const TOOL_AUTH_SHOW: &str = "silver_auth_show";
+const TOOL_AUTH_DELETE: &str = "silver_auth_delete";
+const TOOL_STATE_SAVE: &str = "silver_state_save";
+const TOOL_STATE_LOAD: &str = "silver_state_load";
+const TOOL_STATE_LIST: &str = "silver_state_list";
+const TOOL_STATE_CLEAR: &str = "silver_state_clear";
+const TOOL_STATE_SHOW: &str = "silver_state_show";
+const TOOL_STATE_CLEAN: &str = "silver_state_clean";
+const TOOL_STATE_RENAME: &str = "silver_state_rename";
+const TOOL_TAP: &str = "silver_tap";
+const TOOL_SWIPE: &str = "silver_swipe";
+const TOOL_DEVICE: &str = "silver_device";
+const TOOL_DIFF_SNAPSHOT: &str = "silver_diff_snapshot";
+const TOOL_DIFF_SCREENSHOT: &str = "silver_diff_screenshot";
+const TOOL_DIFF_URL: &str = "silver_diff_url";
+const TOOL_BATCH: &str = "silver_batch";
+const TOOL_REACT_TREE: &str = "silver_react_tree";
+const TOOL_REACT_INSPECT: &str = "silver_react_inspect";
+const TOOL_REACT_RENDERS_START: &str = "silver_react_renders_start";
+const TOOL_REACT_RENDERS_STOP: &str = "silver_react_renders_stop";
+const TOOL_REACT_SUSPENSE: &str = "silver_react_suspense";
+const TOOL_VITALS: &str = "silver_vitals";
+const TOOL_PUSHSTATE: &str = "silver_pushstate";
+const TOOL_REMOVE_INIT_SCRIPT: &str = "silver_remove_init_script";
+const TOOL_CONFIRM: &str = "silver_confirm";
+const TOOL_DENY: &str = "silver_deny";
+const TOOL_CONNECT: &str = "silver_connect";
+const TOOL_STREAM_ENABLE: &str = "silver_stream_enable";
+const TOOL_STREAM_DISABLE: &str = "silver_stream_disable";
+const TOOL_STREAM_STATUS: &str = "silver_stream_status";
+const TOOL_SESSION: &str = "silver_session";
+const TOOL_SESSION_LIST: &str = "silver_session_list";
+const TOOL_SESSION_ID: &str = "silver_session_id";
+const TOOL_SESSION_INFO: &str = "silver_session_info";
+const TOOL_PROFILES: &str = "silver_profiles";
+const TOOL_SKILLS_LIST: &str = "silver_skills_list";
+const TOOL_SKILLS_GET: &str = "silver_skills_get";
+const TOOL_SKILLS_PATH: &str = "silver_skills_path";
+const TOOL_PLUGIN_ADD: &str = "silver_plugin_add";
+const TOOL_PLUGIN_LIST: &str = "silver_plugin_list";
+const TOOL_PLUGIN_SHOW: &str = "silver_plugin_show";
+const TOOL_PLUGIN_RUN: &str = "silver_plugin_run";
+const TOOL_DOCTOR: &str = "silver_doctor";
+const TOOL_DASHBOARD_START: &str = "silver_dashboard_start";
+const TOOL_DASHBOARD_STOP: &str = "silver_dashboard_stop";
+const TOOL_INSTALL: &str = "silver_install";
+const TOOL_UPGRADE: &str = "silver_upgrade";
+const TOOL_CHAT: &str = "silver_chat";
+const TOOL_EVAL: &str = "silver_eval";
+const TOOL_CLOSE: &str = "silver_close";
+const TOOL_TOOLS_PROFILES: &str = "silver_tools_profiles";
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 const RAW_JSON_ARG: &str = "--raw-json";
@@ -532,7 +532,7 @@ fn parse_mcp_config(args: &[String]) -> Result<McpConfig, String> {
             i += 1;
         } else {
             return Err(format!(
-                "Unknown mcp option: {}\nUsage: agent-browser mcp [--tools <profiles>]",
+                "Unknown mcp option: {}\nUsage: silver mcp [--tools <profiles>]",
                 arg
             ));
         }
@@ -668,12 +668,12 @@ fn initialize_result(params: Option<&Value>, config: &McpConfig) -> Value {
             "tools": {}
         },
         "serverInfo": {
-            "name": "agent-browser",
-            "title": "agent-browser",
+            "name": "silver",
+            "title": "silver",
             "version": env!("CARGO_PKG_VERSION")
         },
         "instructions": format!(
-            "Use the typed agent_browser_* tools to control a browser. Active MCP tools profile(s): {}. Prefer agent_browser_snapshot after navigation to obtain stable element refs before clicking or typing. Use agent_browser_tools_profiles to see available startup profiles.",
+            "Use the typed silver_* tools to control a browser. Active MCP tools profile(s): {}. Prefer silver_snapshot after navigation to obtain stable element refs before clicking or typing. Use silver_tools_profiles to see available startup profiles.",
             config.profile_names().join(", ")
         )
     })
@@ -728,7 +728,7 @@ fn tool_profile_summaries() -> Vec<Value> {
             "name": profile.name(),
             "description": profile.description(),
             "toolCount": tool_count,
-            "usage": format!("agent-browser mcp --tools {}", profile.name()),
+            "usage": format!("silver mcp --tools {}", profile.name()),
         })
     })
     .collect()
@@ -749,8 +749,8 @@ fn tools() -> Vec<Value> {
             "Launch the browser and optionally navigate to a URL.",
             json!({
                 "url": { "type": "string", "description": "URL to open. Omit to launch about:blank." },
-                "headed": { "type": "boolean", "description": "Show the browser window. Explicit true/false overrides AGENT_BROWSER_HEADED and config; omit to use those defaults." },
-                "webgpu": { "type": "boolean", "description": "Enable WebGPU (SwiftShader software Vulkan on Linux; no GPU required). Explicit true/false overrides AGENT_BROWSER_WEBGPU and config; omit to use those defaults." }
+                "headed": { "type": "boolean", "description": "Show the browser window. Explicit true/false overrides SILVER_HEADED and config; omit to use those defaults." },
+                "webgpu": { "type": "boolean", "description": "Enable WebGPU (SwiftShader software Vulkan on Linux; no GPU required). Explicit true/false overrides SILVER_WEBGPU and config; omit to use those defaults." }
             }),
             &[],
         ),
@@ -1681,12 +1681,12 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_PLUGIN_ADD,
             "Plugin add",
-            "Add a plugin from npm or GitHub to agent-browser config.",
+            "Add a plugin from npm or GitHub to silver config.",
             json!({
                 "reference": { "type": "string", "description": "npm package, scoped package, or owner/repo GitHub reference." },
                 "name": { "type": "string", "description": "Override the configured plugin name." },
                 "capabilities": string_array_schema("Capabilities to declare when manifest discovery is skipped or unavailable."),
-                "global": { "type": "boolean", "default": false, "description": "Write ~/.agent-browser/config.json instead of ./agent-browser.json." },
+                "global": { "type": "boolean", "default": false, "description": "Write ~/.silver/config.json instead of ./silver.json." },
                 "noManifest": { "type": "boolean", "default": false, "description": "Skip plugin.manifest discovery." }
             }),
             &["reference"],
@@ -1720,7 +1720,7 @@ fn parity_tools() -> Vec<Value> {
             TOOL_DOCTOR,
             "Doctor",
             "Diagnose the installation.",
-            json!({ "offline": { "type": "boolean" }, "quick": { "type": "boolean" }, "fix": { "type": "boolean" }, "webgpu": { "type": "boolean", "description": "Also run a live WebGPU render probe (launches a second Chrome)." }, "headed": { "type": "boolean", "description": "Run the WebGPU probe headed to validate the capture path (auto-Xvfb on displayless Linux). Explicit true/false overrides AGENT_BROWSER_HEADED/config." }, "debug": { "type": "boolean", "description": "Verbose diagnostics from the probes' scratch daemons." } }),
+            json!({ "offline": { "type": "boolean" }, "quick": { "type": "boolean" }, "fix": { "type": "boolean" }, "webgpu": { "type": "boolean", "description": "Also run a live WebGPU render probe (launches a second Chrome)." }, "headed": { "type": "boolean", "description": "Run the WebGPU probe headed to validate the capture path (auto-Xvfb on displayless Linux). Explicit true/false overrides SILVER_HEADED/config." }, "debug": { "type": "boolean", "description": "Verbose diagnostics from the probes' scratch daemons." } }),
             &[],
         ),
         tool(
@@ -1747,7 +1747,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_UPGRADE,
             "Upgrade",
-            "Upgrade agent-browser.",
+            "Upgrade silver.",
             json!({}),
             &[],
         ),
@@ -2034,7 +2034,7 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
 
     if !config.allows(name) {
         return Err(ProtocolError::invalid_params(format!(
-            "Tool {} is not enabled by the active MCP tools profile(s): {}. Restart with `agent-browser mcp --tools all` or add a profile that includes it.",
+            "Tool {} is not enabled by the active MCP tools profile(s): {}. Restart with `silver mcp --tools all` or add a profile that includes it.",
             name,
             config.profile_names().join(", ")
         )));
@@ -2207,7 +2207,7 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
 fn call_tools_profiles(config: &McpConfig) -> Result<Value, ProtocolError> {
     let profiles = tool_profile_summaries();
     let text = format!(
-        "Active MCP tools profile(s): {}\n\nAvailable profiles:\n{}\n\nRestart the MCP server with `agent-browser mcp --tools <profile>` or combine profiles with commas, for example `agent-browser mcp --tools core,network,react`. Use `agent-browser mcp --tools all` for the full typed CLI parity surface.",
+        "Active MCP tools profile(s): {}\n\nAvailable profiles:\n{}\n\nRestart the MCP server with `silver mcp --tools <profile>` or combine profiles with commas, for example `silver mcp --tools core,network,react`. Use `silver mcp --tools all` for the full typed CLI parity surface.",
         config.profile_names().join(", "),
         profiles
             .iter()
@@ -2232,9 +2232,9 @@ fn call_tools_profiles(config: &McpConfig) -> Result<Value, ProtocolError> {
             "activeProfiles": config.profile_names(),
             "profiles": profiles,
             "usage": {
-                "default": "agent-browser mcp",
-                "compose": "agent-browser mcp --tools core,network,react",
-                "all": "agent-browser mcp --tools all",
+                "default": "silver mcp",
+                "compose": "silver mcp --tools core,network,react",
+                "all": "silver mcp --tools all",
             }
         },
         "isError": false,
@@ -2257,7 +2257,7 @@ fn call_cli_tool(
     cli_args.extend(extra_args);
 
     let run = run_cli(&cli_args, stdin_body, timeout_ms).map_err(|e| {
-        ProtocolError::invalid_params(format!("Failed to run agent-browser: {}", e))
+        ProtocolError::invalid_params(format!("Failed to run silver: {}", e))
     })?;
     Ok(tool_result_from_run(run))
 }
@@ -2309,7 +2309,7 @@ fn call_keyboard(arguments: &Value, subcommand: &str) -> Result<Value, ProtocolE
 
 /// Build the CLI args for the open tool. Explicit booleans are forwarded as
 /// `--flag true|false` so an MCP caller can override env/config defaults
-/// (e.g. webgpu: false with AGENT_BROWSER_WEBGPU=1 set); an absent field
+/// (e.g. webgpu: false with SILVER_WEBGPU=1 set); an absent field
 /// sends nothing and leaves the env/config resolution to the CLI.
 fn open_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
     let mut args = Vec::new();
@@ -3216,7 +3216,7 @@ fn plugin_run_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
 /// Build the CLI args for the doctor tool. offline/quick/fix are parsed by
 /// doctor as bare presence flags, so they are only sent when true; the
 /// value-taking booleans are forwarded explicitly so callers can override
-/// env/config defaults (e.g. headed: false with AGENT_BROWSER_HEADED=1).
+/// env/config defaults (e.g. headed: false with SILVER_HEADED=1).
 fn doctor_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
     let mut args = vec!["doctor".to_string()];
     for (key, flag) in [
@@ -3582,7 +3582,7 @@ fn join_output(handle: thread::JoinHandle<io::Result<Vec<u8>>>) -> Result<String
 }
 
 fn append_timeout_message(stderr: String, timeout_ms: u64) -> String {
-    let msg = format!("agent-browser command timed out after {}ms", timeout_ms);
+    let msg = format!("silver command timed out after {}ms", timeout_ms);
     if stderr.trim().is_empty() {
         msg
     } else {
@@ -3740,7 +3740,7 @@ mod tests {
         assert!(names.contains(&TOOL_PLUGIN_RUN));
         assert!(names.contains(&TOOL_SESSION_ID));
         assert!(names.contains(&TOOL_SESSION_INFO));
-        assert!(!names.contains(&"agent_browser_frame_list"));
+        assert!(!names.contains(&"silver_frame_list"));
     }
 
     #[test]
@@ -3761,7 +3761,7 @@ mod tests {
         assert_eq!(open_args(&json!({})).unwrap(), vec!["open"]);
 
         // Explicit true and false are both forwarded, so MCP callers can
-        // override AGENT_BROWSER_WEBGPU/config just like `--webgpu false`.
+        // override SILVER_WEBGPU/config just like `--webgpu false`.
         assert_eq!(
             open_args(&json!({ "webgpu": false, "url": "https://example.com" })).unwrap(),
             vec!["--webgpu", "false", "open", "https://example.com"]
@@ -3938,7 +3938,7 @@ mod tests {
         assert!(result["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("agent-browser mcp --tools all"));
+            .contains("silver mcp --tools all"));
     }
 
     #[test]
