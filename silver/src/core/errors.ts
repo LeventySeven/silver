@@ -74,6 +74,15 @@ export const ERRORS = {
     message:
       'output exceeded the size cap; narrow the scope with -d (max depth), -s (selector scope), or a ref to snapshot a subtree instead of the whole page',
   },
+  // The per-session advisory lock could not be acquired: another command is
+  // holding this session's lock and did not release it in time. Retryable —
+  // commands against ONE session serialize, so retry once the other finishes.
+  // Static reason only (no session name / path leak).
+  session_busy: {
+    retryableByHost: true,
+    message:
+      'another command is currently using this session; commands against one session run one at a time — retry shortly, or use a different --session',
+  },
 } as const
 
 export type ErrorCode = keyof typeof ERRORS

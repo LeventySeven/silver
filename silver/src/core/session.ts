@@ -24,6 +24,13 @@ export type SessionInfo = {
   pid: number
   wsEndpoint: string
   createdAt: string
+  /**
+   * True when this session was attached to an ALREADY-RUNNING browser via
+   * `connect <endpoint>` rather than spawned by us. We do not own its process,
+   * so: pid-liveness is not checked before connecting, a failed connect is NOT
+   * auto-respawned into a fresh owned browser, and `session gc` never reaps it.
+   */
+  external?: boolean
 }
 
 export type OpenOptions = {
@@ -56,14 +63,54 @@ const VIEWPORT = { width: 1280, height: 900 } as const
 
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
-/** True while `pid` is a live process (EPERM = alive-but-not-ours; ESRCH = gone). */
-function isPidAlive(pid: number): boolean {
+/**
+ * True while `pid` is a live process (EPERM = alive-but-not-ours; ESRCH = gone).
+ *
+ * pid <= 0 is treated as dead: `process.kill(0, 0)` targets the whole process
+ * GROUP (a footgun), and pid 0 is what external/connected sessions record for a
+ * browser whose real pid we do not know.
+ */
+export function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false
   try {
     process.kill(pid, 0)
     return true
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === 'EPERM'
   }
+}
+
+// ---------------------------------------------------------------------------
+// Namespace: a sidecar-dir prefix isolating independent agent-GROUPS. Set once
+// per CLI invocation from `--namespace` (see cli.ts) — the whole process runs in
+// ONE namespace, so a module-level value avoids threading it through 40+ path
+// call sites (this mirrors the Rust fork's SILVER_NAMESPACE env approach).
+// ---------------------------------------------------------------------------
+
+let activeNamespace = sanitizeNamespace(process.env.SILVER_NAMESPACE ?? '')
+
+/** Sanitize a namespace into a safe single path segment (or '' for none). */
+export function sanitizeNamespace(ns: string | undefined): string {
+  if (!ns) return ''
+  const cleaned = ns
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  return cleaned
+}
+
+/**
+ * Set the active namespace for this process. A falsy/empty flag falls back to
+ * the SILVER_NAMESPACE env, then to the un-namespaced default.
+ */
+export function setNamespace(ns: string | undefined): void {
+  const fromFlag = sanitizeNamespace(ns)
+  activeNamespace = fromFlag || sanitizeNamespace(process.env.SILVER_NAMESPACE ?? '')
+}
+
+/** The active namespace segment ('' when un-namespaced). */
+export function currentNamespace(): string {
+  return activeNamespace
 }
 
 /**
@@ -82,9 +129,16 @@ async function atomicWrite(filePath: string, data: string): Promise<void> {
   }
 }
 
-/** Root dir for all sessions: `~/.silver/sessions`. */
+/**
+ * Root dir for all sessions. Un-namespaced: `~/.silver/sessions`. Under a
+ * namespace `ns`: `~/.silver/<ns>/sessions` — so independent agent-groups do not
+ * collide even when they both use `--session default`.
+ */
 export function sessionsRoot(): string {
-  return path.join(os.homedir(), '.silver', 'sessions')
+  const base = path.join(os.homedir(), '.silver')
+  return activeNamespace
+    ? path.join(base, activeNamespace, 'sessions')
+    : path.join(base, 'sessions')
 }
 
 /** Per-session dir: `~/.silver/sessions/<name>`. */
@@ -243,8 +297,10 @@ export async function connect(name: string): Promise<Connection> {
   const info = await readSidecar(name)
   // PID-liveness (P1-S1): a stale sidecar whose browser died would otherwise
   // hang on a dead CDP endpoint. Treat a dead pid as "no live session" so the
-  // caller (ensureConnected) re-spawns instead.
-  if (!isPidAlive(info.pid)) {
+  // caller (ensureConnected) re-spawns instead. Skipped for EXTERNAL sessions:
+  // we do not own the process (pid is unknown/0) — liveness is the CDP connect
+  // succeeding, and a failure must NOT trigger an owned-browser respawn.
+  if (!info.external && !isPidAlive(info.pid)) {
     throw new Error('the previous browser process is gone (reopen the session)')
   }
   const browser = await chromium.connectOverCDP(info.wsEndpoint)
@@ -257,6 +313,67 @@ export async function connect(name: string): Promise<Connection> {
   // Deterministic viewport (P0-8); best-effort over a CDP-connected page.
   await page.setViewportSize({ width: VIEWPORT.width, height: VIEWPORT.height }).catch(() => {})
   return { browser, context, page }
+}
+
+/**
+ * Attach the session `name` to an ALREADY-RUNNING browser's CDP endpoint (the
+ * "share one browser someone else launched" branch). `endpoint` may be:
+ *   - a websocket url         (`ws://…` / `wss://…`) — used directly
+ *   - an http devtools url    (`http://127.0.0.1:9222`) — resolved via /json/version
+ *   - a bare port             (`9222`) — treated as http://127.0.0.1:<port>
+ *
+ * We verify the endpoint is reachable, then persist an `external: true` sidecar.
+ * We do NOT own the process, so no pid is recorded (0) and gc/respawn skip it.
+ */
+export async function connectExternalSession(name: string, endpoint: string): Promise<SessionInfo> {
+  const resolved = await resolveCdpEndpoint(endpoint)
+  // Verify connectability up front so `connect` fails loudly rather than
+  // leaving a dangling sidecar that every later command trips over.
+  const probe = await chromium.connectOverCDP(resolved.wsEndpoint, { timeout: 5_000 })
+  try {
+    if (!probe.contexts()[0]) throw new Error('the target browser exposes no context')
+  } finally {
+    await probe.close().catch(() => {})
+  }
+  const info: SessionInfo = {
+    port: resolved.port ?? 0,
+    pid: 0,
+    wsEndpoint: resolved.wsEndpoint,
+    createdAt: new Date().toISOString(),
+    external: true,
+  }
+  await fs.mkdir(sessionDir(name), { recursive: true })
+  await atomicWrite(sidecarPath(name), JSON.stringify(info, null, 2))
+  return info
+}
+
+/** Resolve any accepted CDP endpoint form to a concrete websocket url. */
+async function resolveCdpEndpoint(endpoint: string): Promise<{ wsEndpoint: string; port?: number }> {
+  let ep = endpoint.trim()
+  if (ep.length === 0) throw new Error('a CDP endpoint is required')
+  if (/^\d+$/.test(ep)) ep = `http://127.0.0.1:${ep}`
+
+  if (ep.startsWith('ws://') || ep.startsWith('wss://')) {
+    return { wsEndpoint: ep }
+  }
+  if (ep.startsWith('http://') || ep.startsWith('https://')) {
+    const base = ep.replace(/\/+$/, '')
+    const res = await fetch(`${base}/json/version`)
+    if (!res.ok) throw new Error('the CDP endpoint did not respond')
+    const body = (await res.json()) as { webSocketDebuggerUrl?: unknown }
+    if (typeof body.webSocketDebuggerUrl !== 'string' || body.webSocketDebuggerUrl.length === 0) {
+      throw new Error('the CDP endpoint did not expose a websocket url')
+    }
+    let port: number | undefined
+    try {
+      const p = Number(new URL(ep).port)
+      if (Number.isInteger(p) && p > 0) port = p
+    } catch {
+      /* no explicit port */
+    }
+    return { wsEndpoint: body.webSocketDebuggerUrl, port }
+  }
+  throw new Error('unsupported CDP endpoint (use ws://, http://127.0.0.1:PORT, or a bare port)')
 }
 
 /** Persist the RefMap sidecar for cross-command grounding. */
@@ -307,12 +424,19 @@ export async function closeSession(name: string): Promise<void> {
     } catch {
       /* browser may already be gone */
     }
-    try {
-      process.kill(info.pid, 'SIGTERM')
-    } catch {
-      /* already dead */
+    // NEVER signal an EXTERNAL (connect'd) browser — we do not own it, and its
+    // recorded pid is 0. `process.kill(0, …)` would signal our ENTIRE process
+    // group (a footgun that would take down the caller). Only terminate a real,
+    // positive pid of a browser WE spawned. Dropping the CDP transport above is
+    // the whole teardown for an external session.
+    if (!info.external && info.pid > 0) {
+      try {
+        process.kill(info.pid, 'SIGTERM')
+      } catch {
+        /* already dead */
+      }
+      await waitForExit(info.pid, 4_000)
     }
-    await waitForExit(info.pid, 4_000)
   }
 
   await fs.rm(dir, { recursive: true, force: true })

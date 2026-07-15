@@ -26,6 +26,7 @@ import { ERRORS } from './core/errors.js'
 import { parseFlags, type ParsedFlags } from './core/flags.js'
 import { buildRegistry } from './security/registry.js'
 import { handle } from './core/handlers.js'
+import { setNamespace } from './core/session.js'
 import { OutputOverflowError } from './perception/serialize.js'
 import { ResolveError } from './actuation/resolve.js'
 import { WaitError } from './actuation/wait.js'
@@ -48,6 +49,12 @@ export type RunResult = { env: Envelope<unknown>; code: number; json: boolean }
 export async function run(argv: string[]): Promise<RunResult> {
   const flags = parseFlags(argv)
   const json = flags.json
+
+  // Namespace is a per-invocation, process-wide setting that scopes ALL session
+  // paths (`~/.silver/<ns>/sessions/…`). Apply it before any path is computed —
+  // before the registry gate, before dispatch — so `session list/gc`, the lock,
+  // and every sidecar resolve within this namespace. (No --namespace → default.)
+  setNamespace(flags.namespace)
 
   if (flags.verb === '' || flags.verb === 'help' || flags.verb === '--help') {
     return { env: usage(), code: 0, json }
@@ -125,8 +132,17 @@ function usage(): Envelope<unknown> {
         ],
         query: ['get', 'is', 'wait'],
         extract: ['extract', 'extract resolve'],
-        auth: ['state', 'cookies', 'session'],
+        tabs: ['tab', 'tab new [url] [--label L]', 'tab list', 'tab <tN|label>', 'tab close [tN]'],
+        multi_browser: ['connect <ws|http://127.0.0.1:PORT|port>'],
+        auth: ['state', 'cookies'],
+        session: ['session list', 'session gc', 'session id'],
         meta: ['version', 'doctor', 'skill'],
+      },
+      parallel: {
+        session: '--session <name> — one detached browser per name (own-context-per-agent, the safe default for parallel agents)',
+        namespace: '--namespace <ns> — isolate independent agent-GROUPS under ~/.silver/<ns>/sessions so they never collide',
+        shared_browser: '`connect <endpoint>` then `tab new` — many agents share ONE browser, each on its own tab',
+        locking: 'commands against ONE session serialize via a per-session advisory lock; different sessions never block',
       },
       note: 'read-only by default; actor verbs require --enable-actions',
     },

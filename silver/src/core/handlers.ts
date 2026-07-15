@@ -29,15 +29,31 @@ import type { ParsedFlags } from './flags.js'
 import {
   openSession,
   connect,
+  connectExternalSession,
   closeSession,
   saveRefMap,
   loadRefMap,
   readSidecar,
   sessionDir,
   sessionsRoot,
+  isPidAlive,
+  currentNamespace,
   type Connection,
   type OpenOptions,
 } from './session.js'
+import { withSessionLock } from './lock.js'
+import {
+  loadTabRegistry,
+  saveTabRegistry,
+  emptyRegistry,
+  syncRegistry,
+  findTab,
+  isValidLabel,
+  pageTargetId,
+  resolveActivePage,
+  type TabRecord,
+  type TabRegistry,
+} from './tabs.js'
 import { groundRef, newGeneration, type RefMap, type RefEntry } from '../perception/refmap.js'
 import { snapshotNodes, type SnapNode } from '../perception/walk.js'
 import { render } from '../perception/serialize.js'
@@ -132,31 +148,45 @@ function openOpts(flags: ParsedFlags): OpenOptions {
   return { headed: flags.headed }
 }
 
-/** Connect to the session, auto-spawning the detached browser if none is live. */
+/** Connect to the session, auto-spawning the detached browser if none is live.
+ * EXTERNAL (connect'd) sessions are never auto-respawned into an owned browser —
+ * a failed connect there is surfaced, since we do not own that process. */
 async function ensureConnected(name: string, opts: OpenOptions): Promise<Connection> {
   try {
     return await connect(name)
-  } catch {
+  } catch (err) {
+    const info = await readSidecar(name).catch(() => null)
+    if (info?.external) throw err
     await openSession(name, opts)
     return await connect(name)
   }
 }
 
-/** Run `fn` with a fresh connection, always dropping the CDP transport after. */
+/**
+ * Run `fn` with a fresh connection to the session's ACTIVE tab, holding the
+ * per-session advisory lock for the whole critical section (connect → act →
+ * disconnect). The lock serializes commands against ONE session so they stop
+ * racing `pages()[0]` and the sidecars; different sessions never block. The CDP
+ * transport is always dropped after.
+ */
 async function withConnection<T>(
   flags: ParsedFlags,
   fn: (conn: Connection) => Promise<T>,
 ): Promise<T> {
-  const conn = await ensureConnected(flags.session, openOpts(flags))
-  // Register the dialog handler on THIS connection's page (fix P0-7): with no
-  // listener, Playwright silently CANCELS every alert/confirm/prompt, so a
-  // `confirm("delete?")` guard is auto-dismissed while the host still gets ok().
-  attachDialogHandler(conn.page, flags.session)
-  try {
-    return await fn(conn)
-  } finally {
-    await conn.browser.close().catch(() => {})
-  }
+  return withSessionLock(flags.session, async () => {
+    const conn = await ensureConnected(flags.session, openOpts(flags))
+    // Every verb operates on the ACTIVE tab, not blindly on pages()[0].
+    const page = await resolveActivePage(conn.context, flags.session)
+    // Register the dialog handler on the active page (fix P0-7): with no
+    // listener, Playwright silently CANCELS every alert/confirm/prompt, so a
+    // `confirm("delete?")` guard is auto-dismissed while the host still gets ok().
+    attachDialogHandler(page, flags.session)
+    try {
+      return await fn({ ...conn, page })
+    } finally {
+      await conn.browser.close().catch(() => {})
+    }
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +294,12 @@ export async function handle(flags: ParsedFlags): Promise<Envelope<unknown>> {
     // extract
     case 'extract':
       return handleExtract(flags)
+    // tabs (multi-tab: enables shared-browser parallel — each subagent a tab)
+    case 'tab':
+      return handleTab(flags)
+    // connect an already-running CDP browser to this session (share-one-browser)
+    case 'connect':
+      return handleConnect(flags)
     // auth / session
     case 'state':
       return handleStateVerb(flags)
@@ -281,7 +317,6 @@ export async function handle(flags: ParsedFlags): Promise<Envelope<unknown>> {
     case 'dialog':
       return handleDialog(flags)
     // nice-to-have — honestly unimplemented (never faked).
-    case 'tab':
     case 'frame':
     case 'network':
     case 'pdf':
@@ -335,11 +370,16 @@ async function handleClose(flags: ParsedFlags): Promise<Envelope<unknown>> {
   if (flags.all) {
     const names = await listSessionNames()
     for (const name of names) {
-      await closeSession(name).catch(() => {})
+      // Serialize each teardown behind its own session lock so a close never
+      // races an in-flight command on that session.
+      await withSessionLock(name, () => closeSession(name)).catch(() => {})
     }
     return ok({ closed: names.length })
   }
-  await closeSession(flags.session)
+  // Hold the session lock across teardown so a concurrent command on this
+  // session finishes first (and vice-versa). closeSession removes the dir
+  // (incl. the .lock); release then no-ops on the already-gone file.
+  await withSessionLock(flags.session, () => closeSession(flags.session))
   return ok({ closed: 1, session: flags.session })
 }
 
@@ -366,6 +406,212 @@ function gotoOpts(flags: ParsedFlags): { waitUntil: 'domcontentloaded'; timeout?
   const o: { waitUntil: 'domcontentloaded'; timeout?: number } = { waitUntil: 'domcontentloaded' }
   if (flags.timeout !== undefined) o.timeout = flags.timeout
   return o
+}
+
+/**
+ * A new tab / a tab switch lands on a DIFFERENT DOM than the last snapshot's, so
+ * prior `@eN` refs no longer ground. Bump the generation, write an EMPTY refmap
+ * at it (a stale ref → element_not_found), reset the diff baseline, and
+ * re-fingerprint — mirroring handleOpen/handleHistory. Keeps grounding loud.
+ */
+async function invalidateRefs(session: string, page: Page): Promise<void> {
+  const prev = await loadState(session)
+  const gen = newGeneration(prev?.generation ?? 0)
+  await saveRefMap(session, { generation: gen, entries: {} })
+  const fp = await settleAndFingerprint(page, prev?.fingerprint, gen)
+  await saveState(session, { generation: gen, prevTree: null, fingerprint: fp.fingerprint })
+}
+
+// ---------------------------------------------------------------------------
+// tabs — multi-tab on real Playwright pages (build order step 1). Ids `t1,t2,…`
+// are stable across the stateless per-command reconnects (keyed by CDP
+// targetId, persisted in the tabs.json sidecar). Every OTHER verb operates on
+// the active tab (resolveActivePage in withConnection). Subcommands:
+//   tab | tab list          -> ids + labels + urls + titles (+ which is active)
+//   tab new [url] [--label L]-> open a page, make it active, return its id
+//   tab <tN|label>          -> switch the active tab
+//   tab close [tN|label]    -> close a tab (default: the active one)
+// ---------------------------------------------------------------------------
+
+async function handleTab(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const sub = flags.args[0]
+  if (sub === undefined || sub === 'list') return handleTabList(flags)
+  if (sub === 'new') return handleTabNew(flags)
+  if (sub === 'close') return handleTabClose(flags)
+  // Anything else is a switch target: `tab t2` / `tab <label>`.
+  return handleTabSwitch(flags, sub)
+}
+
+async function handleTabList(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  return withConnection(flags, async ({ context }) => {
+    const reg = (await loadTabRegistry(flags.session)) ?? emptyRegistry()
+    const synced = await syncRegistry(context, reg)
+    await saveTabRegistry(flags.session, synced.reg)
+    const tabs = await Promise.all(
+      synced.live.map(async (t) => ({
+        tabId: t.id,
+        label: t.label ?? null,
+        url: t.page.url(),
+        title: await t.page.title().catch(() => ''),
+        active: t.targetId === synced.reg.activeTargetId,
+      })),
+    )
+    const active = synced.live.find((t) => t.targetId === synced.reg.activeTargetId)?.id ?? null
+    return ok({ tabs, active })
+  })
+}
+
+async function handleTabNew(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const url = flags.args[1]
+  const label = flags.label
+  if (label !== undefined && !isValidLabel(label)) {
+    return badRequest(
+      'invalid tab label; labels must start with a letter and use only letters, digits, - and _ (and not look like t<N>)',
+    )
+  }
+  // Egress guard BEFORE opening/navigating (same first-layer check as `open`).
+  if (url !== undefined) {
+    const nav = await assertNavigableResolved(url, {
+      allowFile: flags.allowFileAccess,
+      allowedDomains: flags.allowedDomains,
+    })
+    if (!nav.ok) return fail('navigation_blocked')
+  }
+
+  return withConnection(flags, async ({ context }) => {
+    const reg = (await loadTabRegistry(flags.session)) ?? emptyRegistry()
+    const synced = await syncRegistry(context, reg)
+    if (label !== undefined && synced.reg.tabs.some((t) => t.label === label)) {
+      return badRequest('that tab label is already used in this session; labels must be unique')
+    }
+
+    const page = await context.newPage()
+    // Deterministic viewport (P0-8) for the new tab too.
+    await page.setViewportSize({ width: 1280, height: 900 }).catch(() => {})
+    if (url !== undefined) await page.goto(url, gotoOpts(flags))
+
+    const targetId = await pageTargetId(page)
+    const id = `t${synced.reg.nextId}`
+    const record: TabRecord = label !== undefined ? { id, label, targetId } : { id, targetId }
+    const nextReg: TabRegistry = {
+      nextId: synced.reg.nextId + 1,
+      activeTargetId: targetId, // the new tab becomes active
+      tabs: [...synced.reg.tabs, record],
+    }
+    await saveTabRegistry(flags.session, nextReg)
+    await invalidateRefs(flags.session, page)
+
+    return ok({
+      tabId: id,
+      label: label ?? null,
+      url: page.url(),
+      title: await page.title().catch(() => ''),
+      total: nextReg.tabs.length,
+    })
+  })
+}
+
+async function handleTabSwitch(flags: ParsedFlags, ref: string): Promise<Envelope<unknown>> {
+  return withConnection(flags, async ({ context }) => {
+    const reg = (await loadTabRegistry(flags.session)) ?? emptyRegistry()
+    const synced = await syncRegistry(context, reg)
+    const rec = findTab(synced.reg.tabs, ref)
+    const page = rec ? synced.byId.get(rec.id) : undefined
+    if (!rec || !page) return badRequest('no such tab; run `tab list` to see open tabs')
+
+    await page.bringToFront().catch(() => {})
+    await saveTabRegistry(flags.session, { ...synced.reg, activeTargetId: rec.targetId })
+    await invalidateRefs(flags.session, page)
+
+    return ok({
+      tabId: rec.id,
+      label: rec.label ?? null,
+      url: page.url(),
+      title: await page.title().catch(() => ''),
+    })
+  })
+}
+
+async function handleTabClose(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const ref = flags.args[1] // optional; default = the active tab
+  return withConnection(flags, async ({ context }) => {
+    const reg = (await loadTabRegistry(flags.session)) ?? emptyRegistry()
+    const synced = await syncRegistry(context, reg)
+    if (synced.live.length <= 1) {
+      return badRequest('cannot close the last tab; use `close` to end the session')
+    }
+
+    const target =
+      ref !== undefined
+        ? findTab(synced.reg.tabs, ref)
+        : synced.reg.tabs.find((t) => t.targetId === synced.reg.activeTargetId)
+    const page = target ? synced.byId.get(target.id) : undefined
+    if (!target || !page) return badRequest('no such tab; run `tab list` to see open tabs')
+
+    const wasActive = target.targetId === synced.reg.activeTargetId
+    await page.close().catch(() => {})
+
+    const remaining = synced.reg.tabs.filter((t) => t.targetId !== target.targetId)
+    let active = synced.reg.activeTargetId
+    if (wasActive) active = remaining[remaining.length - 1]?.targetId ?? null
+    await saveTabRegistry(flags.session, { nextId: synced.reg.nextId, activeTargetId: active, tabs: remaining })
+
+    // Closing the active tab promotes a new active tab with a different DOM.
+    if (wasActive && active) {
+      const newRec = remaining.find((t) => t.targetId === active)
+      const newPage = newRec ? synced.byId.get(newRec.id) : undefined
+      if (newPage) await invalidateRefs(flags.session, newPage)
+    }
+
+    const activeId = remaining.find((t) => t.targetId === active)?.id ?? null
+    return ok({ closed: target.id, active: activeId, total: remaining.length })
+  })
+}
+
+// ---------------------------------------------------------------------------
+// connect — attach this --session to an ALREADY-RUNNING CDP browser someone
+// else launched (the "share one browser" branch). Each agent then makes its own
+// tab. Accepts ws://…, http://127.0.0.1:PORT, or a bare port.
+// ---------------------------------------------------------------------------
+
+async function handleConnect(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const endpoint = flags.args[0]
+  if (!endpoint) {
+    return badRequest('usage: silver connect <ws-url | http://127.0.0.1:PORT | port>')
+  }
+  return withSessionLock(flags.session, async () => {
+    // Free a prior OWNED browser on this session name so we don't orphan it.
+    const prior = await readSidecar(flags.session).catch(() => null)
+    if (prior && !prior.external) await closeSession(flags.session).catch(() => {})
+
+    let info
+    try {
+      info = await connectExternalSession(flags.session, endpoint)
+    } catch {
+      // Generic, no-leak: endpoint unreachable or not a CDP endpoint.
+      return badRequest(
+        'could not attach to that CDP endpoint; is a browser running there with --remote-debugging-port?',
+      )
+    }
+
+    // Reset grounding state + seed the tab registry from the attached browser.
+    await saveRefMap(flags.session, { generation: 1, entries: {} })
+    await saveState(flags.session, { generation: 1, prevTree: null, fingerprint: null })
+    const conn = await connect(flags.session)
+    try {
+      const synced = await syncRegistry(conn.context, emptyRegistry())
+      await saveTabRegistry(flags.session, synced.reg)
+      return ok({
+        connected: true,
+        session: flags.session,
+        external: true,
+        tabs: synced.live.length,
+        ...(info.port ? { port: info.port } : {}),
+      })
+    } finally {
+      await conn.browser.close().catch(() => {})
+    }
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,20 +1262,69 @@ async function handleSession(flags: ParsedFlags): Promise<Envelope<unknown>> {
     // Deliberately omit `base` (a path) from the envelope — no-leak invariant.
     return ok({ id, scope: flags.scope ?? 'cwd' })
   }
-  if (sub === 'list') {
-    const names = await listSessionNames()
-    const sessions: Array<{ name: string; pid?: number; createdAt?: string }> = []
-    for (const name of names) {
-      try {
-        const info = await readSidecar(name)
-        sessions.push({ name, pid: info.pid, createdAt: info.createdAt })
-      } catch {
-        sessions.push({ name })
-      }
-    }
-    return ok({ sessions })
+  if (sub === 'list') return sessionList()
+  if (sub === 'gc') return sessionGc()
+  return badRequest('usage: silver session id|list|gc')
+}
+
+/**
+ * `session list` — enumerate this namespace's sessions with liveness (is the pid
+ * alive?), active tab count, and age. Cheap: reads the sidecars only (no CDP
+ * connect, no browser spawn). External (connect'd) sessions report `alive:null`
+ * since we don't own the process to signal it.
+ */
+async function sessionList(): Promise<Envelope<unknown>> {
+  const names = await listSessionNames()
+  const sessions = []
+  for (const name of names) {
+    const info = await readSidecar(name).catch(() => null)
+    const reg = await loadTabRegistry(name).catch(() => null)
+    const alive: boolean | null = info ? (info.external ? null : isPidAlive(info.pid)) : false
+    const tabs = reg ? reg.tabs.length : alive === false ? 0 : 1
+    sessions.push({
+      name,
+      alive,
+      external: info?.external ?? false,
+      ...(info && !info.external ? { pid: info.pid } : {}),
+      tabs,
+      ...(info?.createdAt ? { ageMs: Date.now() - Date.parse(info.createdAt) } : {}),
+    })
   }
-  return badRequest('usage: silver session id|list')
+  return ok({ namespace: currentNamespace() || null, sessions })
+}
+
+/**
+ * `session gc` — reap dead sessions: remove the dirs of sessions whose owned
+ * browser process is gone, plus orphaned dirs missing/with a corrupt sidecar
+ * (port of the Rust fork's walk_daemons/cleanup_stale_files). Never touches an
+ * external (connect'd) session or a session with a live pid.
+ */
+async function sessionGc(): Promise<Envelope<unknown>> {
+  let entries
+  try {
+    entries = await fs.readdir(sessionsRoot(), { withFileTypes: true })
+  } catch {
+    return ok({ removed: [], kept: [] })
+  }
+  const removed: string[] = []
+  const kept: string[] = []
+  for (const e of entries) {
+    if (!e.isDirectory()) continue
+    const name = e.name
+    const hasSidecar = existsSync(path.join(sessionsRoot(), name, 'session.json'))
+    const info = hasSidecar ? await readSidecar(name).catch(() => null) : null
+    if (info?.external) {
+      kept.push(name)
+      continue
+    }
+    if (!info || !isPidAlive(info.pid)) {
+      await fs.rm(sessionDir(name), { recursive: true, force: true }).catch(() => {})
+      removed.push(name)
+    } else {
+      kept.push(name)
+    }
+  }
+  return ok({ removed, kept })
 }
 
 function worktreeRoot(start: string): string {

@@ -36,8 +36,16 @@ const READ_ONLY_VERBS: readonly string[] = [
   'back',
   'forward',
   'reload',
+  // `tab` is lifecycle, not page-state mutation: its subcommands (new/list/
+  // switch/close) mirror open/navigate/close — all read-only-dispatchable, all
+  // still bounded by the egress guard on any navigation. `tab list` in
+  // particular must never require --enable-actions.
   'tab',
   'frame',
+  // `connect` attaches the session to an already-running CDP browser instead of
+  // spawning one. It is session setup (like `open`), operator-supplied argv (not
+  // page-injected), and touches no page state — so it lives in the read-only set.
+  'connect',
   'state',
   'cookies',
   'skill',

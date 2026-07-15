@@ -23,6 +23,12 @@
 export type ParsedFlags = {
   // ---- global ----
   session: string
+  /**
+   * Sidecar-dir prefix isolating independent agent-GROUPS: sessions live under
+   * `~/.silver/<namespace>/sessions/…` instead of `~/.silver/sessions/…`. Two
+   * groups using the same `--session default` never collide across namespaces.
+   */
+  namespace?: string
   json: boolean
   headed: boolean
   allowedDomains: string[]
@@ -61,6 +67,8 @@ export type ParsedFlags = {
   fn?: string
   name?: string
   index?: number
+  /** `tab new --label <L>`: durable human-facing name for a tab. */
+  label?: string
   // ---- positionals ----
   verb: string
   args: string[]
@@ -69,6 +77,7 @@ export type ParsedFlags = {
 /** Value flags: always consume the next token (or `=value`). */
 const VALUE_FLAGS: Record<string, keyof ParsedFlags> = {
   session: 'session',
+  namespace: 'namespace',
   'max-output': 'maxOutput',
   timeout: 'timeout',
   state: 'state',
@@ -83,6 +92,7 @@ const VALUE_FLAGS: Record<string, keyof ParsedFlags> = {
   fn: 'fn',
   name: 'name',
   index: 'index',
+  label: 'label',
   depth: 'depth',
   selector: 'selector',
 }
