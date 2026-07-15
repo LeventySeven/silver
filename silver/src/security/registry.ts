@@ -51,6 +51,11 @@ const READ_ONLY_VERBS: readonly string[] = [
   'skill',
   'doctor',
   'version',
+  // `mcp` starts silver's stdio MCP server (the second host interface). It is a
+  // read-only META verb: it touches no page state to START, and every MCP tool
+  // call it later routes goes back through run()'s own registry gate. Dispatched
+  // in cli.ts before handlers.ts is reached.
+  'mcp',
   // Long-task artifact / grep-first memory / subagent orchestration layers.
   // Read-only-dispatchable at the VERB level so `task list|status|resume`,
   // `memory add|search|list`, and `subagent wait|list|status` never require an

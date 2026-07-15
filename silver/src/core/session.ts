@@ -18,6 +18,7 @@ import * as path from 'node:path'
 import { chromium } from 'playwright'
 import type { Browser, BrowserContext, Page } from 'playwright'
 import type { RefMap } from '../perception/refmap.js'
+import { decodeStateBuffer, encryptJson, isStateEncryptionEnabled } from './state-crypto.js'
 
 export type SessionInfo = {
   port: number
@@ -118,15 +119,38 @@ export function currentNamespace(): string {
  * into place. `rename(2)` is atomic within a directory, so a concurrent reader
  * never observes a half-written (torn) JSON grounding file.
  */
-async function atomicWrite(filePath: string, data: string): Promise<void> {
+async function atomicWrite(filePath: string, data: string | Buffer): Promise<void> {
   const tmp = `${filePath}.tmp.${process.pid}.${Date.now()}`
-  await fs.writeFile(tmp, data, 'utf8')
+  await fs.writeFile(tmp, data)
   try {
     await fs.rename(tmp, filePath)
   } catch (err) {
     await fs.rm(tmp, { force: true }).catch(() => {})
     throw err
   }
+}
+
+/**
+ * Serialize + atomically write a session sidecar, ENCRYPTED at rest by default
+ * (AES-256-GCM) so cookie/storage-adjacent session state is never plaintext on
+ * disk. `--no-encrypt-state` / `SILVER_NO_ENCRYPT_STATE=1` writes plaintext JSON
+ * instead. Reads (`readSidecarObject`) transparently accept either form.
+ */
+async function writeSidecar(filePath: string, obj: unknown): Promise<void> {
+  const data: string | Buffer = isStateEncryptionEnabled()
+    ? encryptJson(obj)
+    : JSON.stringify(obj, null, 2)
+  await atomicWrite(filePath, data)
+}
+
+/**
+ * Read a session sidecar and decode it transparently: an encrypted blob is
+ * decrypted, a legacy plaintext-JSON sidecar is parsed as-is (migration). The
+ * caller owns error mapping (missing vs. corrupt).
+ */
+async function readSidecarObject<T>(filePath: string): Promise<T> {
+  const buf = await fs.readFile(filePath)
+  return decodeStateBuffer(buf) as T
 }
 
 /**
@@ -224,7 +248,7 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
       createdAt: new Date().toISOString(),
     }
     await fs.mkdir(dir, { recursive: true })
-    await atomicWrite(sidecarPath(name), JSON.stringify(info, null, 2))
+    await writeSidecar(sidecarPath(name), info)
     return info
   } catch (err) {
     // Readiness failed — do not leave a zombie browser behind.
@@ -274,14 +298,14 @@ async function waitForWsEndpoint(port: number, deadline: number): Promise<string
 
 /** Read the sidecar for a session. Throws generically if absent/corrupt. */
 export async function readSidecar(name: string): Promise<SessionInfo> {
-  let raw: string
+  const p = sidecarPath(name)
   try {
-    raw = await fs.readFile(sidecarPath(name), 'utf8')
+    await fs.access(p)
   } catch {
     throw new Error('no such session (open one first)')
   }
   try {
-    return JSON.parse(raw) as SessionInfo
+    return await readSidecarObject<SessionInfo>(p)
   } catch {
     throw new Error('the session sidecar is corrupt')
   }
@@ -343,7 +367,7 @@ export async function connectExternalSession(name: string, endpoint: string): Pr
     external: true,
   }
   await fs.mkdir(sessionDir(name), { recursive: true })
-  await atomicWrite(sidecarPath(name), JSON.stringify(info, null, 2))
+  await writeSidecar(sidecarPath(name), info)
   return info
 }
 
@@ -376,22 +400,16 @@ async function resolveCdpEndpoint(endpoint: string): Promise<{ wsEndpoint: strin
   throw new Error('unsupported CDP endpoint (use ws://, http://127.0.0.1:PORT, or a bare port)')
 }
 
-/** Persist the RefMap sidecar for cross-command grounding. */
+/** Persist the RefMap sidecar for cross-command grounding (encrypted at rest). */
 export async function saveRefMap(name: string, map: RefMap): Promise<void> {
   await fs.mkdir(sessionDir(name), { recursive: true })
-  await atomicWrite(refmapPath(name), JSON.stringify(map))
+  await writeSidecar(refmapPath(name), map)
 }
 
 /** Load the RefMap sidecar, or null if none has been saved yet. */
 export async function loadRefMap(name: string): Promise<RefMap | null> {
-  let raw: string
   try {
-    raw = await fs.readFile(refmapPath(name), 'utf8')
-  } catch {
-    return null
-  }
-  try {
-    return JSON.parse(raw) as RefMap
+    return await readSidecarObject<RefMap>(refmapPath(name))
   } catch {
     return null
   }

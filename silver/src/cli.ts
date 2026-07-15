@@ -27,6 +27,7 @@ import { parseFlags, type ParsedFlags } from './core/flags.js'
 import { buildRegistry } from './security/registry.js'
 import { handle } from './core/handlers.js'
 import { setNamespace } from './core/session.js'
+import { setStateEncryption } from './core/state-crypto.js'
 // Task-artifact / memory / subagent layers — dispatched here (NOT in
 // handlers.ts) so their modules stay decoupled from the browser-verb handlers.
 import { handleTask } from './task/index.js'
@@ -42,7 +43,7 @@ import { WaitError } from './actuation/wait.js'
  * modify), so it is dispatched here directly; the others are read-only-safe and
  * bypass the gate for clarity. None can mutate page state.
  */
-const META_VERBS = new Set(['version', 'doctor', 'skill', 'session', 'batch'])
+const META_VERBS = new Set(['version', 'doctor', 'skill', 'session', 'batch', 'mcp'])
 
 /**
  * Verbs owned by the task-artifact / memory / subagent layers. Registered
@@ -83,6 +84,11 @@ export async function run(argv: string[]): Promise<RunResult> {
   // and every sidecar resolve within this namespace. (No --namespace → default.)
   setNamespace(flags.namespace)
 
+  // Encryption-at-rest for session sidecars is ON by default; `--no-encrypt-state`
+  // opts out (plaintext JSON) for debugging. Reads accept both forms, so this is
+  // safe to toggle per-invocation. `SILVER_NO_ENCRYPT_STATE=1` is the env opt-out.
+  if (flags.noEncryptState) setStateEncryption(false)
+
   if (flags.verb === '' || flags.verb === 'help' || flags.verb === '--help') {
     return { env: usage(), code: 0, json }
   }
@@ -98,6 +104,16 @@ export async function run(argv: string[]): Promise<RunResult> {
   }
 
   try {
+    // `mcp` is a META verb: it starts silver's stdio MCP server (the second host
+    // interface) rather than driving a browser. Dispatched HERE (not in
+    // handlers.ts, which a sibling owns) via a dynamic import that keeps the
+    // module graph acyclic. The server routes each MCP tool call back through
+    // this same run() path, so every security gate still applies. KEYLESS.
+    if (flags.verb === 'mcp') {
+      const { runMcp } = await import('./mcp/index.js')
+      const env = await runMcp(flags)
+      return { env, code: env.success ? 0 : 1, json }
+    }
     const env = LAYER_VERBS.has(flags.verb) ? await dispatchLayer(flags) : await handle(flags)
     return { env, code: env.success ? 0 : 1, json }
   } catch (err) {

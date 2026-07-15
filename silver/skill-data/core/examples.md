@@ -1,120 +1,211 @@
-# silver — worked examples
+# silver — worked transcripts
 
-Every transcript below is copied verbatim from real `silver` (`node dist/cli.js`) output.
-Envelopes are shown in the readable form; add `--json` for the one-line
-`{ success, data, error, warning? }`. The interaction verbs below are shown with an
-explicit `--enable-actions` (read-only verbs need no flag).
+Every block below is copied **verbatim** from real `silver` (`node dist/cli.js`) output, run
+against a tiny local demo shop (`http://localhost:8199/` — an index page with two links and a
+"Load more" button, a `/login.html` form, and a `/products.html` page with product links and a
+"Buy now" button). Human-readable output is shown; append `--json` for the raw one-line
+envelope. Session/namespace names are chosen per example.
 
-## 1. The lean loop: open → snapshot → act → re-observe
+---
+
+## 1. The lean loop: open → snapshot → act → re-snapshot
 
 ```
-$ silver open <url>
+$ silver open http://localhost:8199/ --session demo
 {
-  "url": "http://…/buttons.html",
-  "title": "Buttons Fixture",
+  "url": "http://localhost:8199/",
+  "title": "Silver Demo Shop",
   "page_changed": false
 }
 
-$ silver snapshot -i
+$ silver snapshot -i --session demo
 ⟦page-content untrusted⟧
-- title: "Buttons Fixture" [url=http://…/buttons.html, generation=2]
+- title: "Silver Demo Shop" [url=http://localhost:8199/, generation=3]
 # note: interactive elements only
-* heading "Counter Panel" [ref=e1, level=0]
-* button "Activate" [ref=e2, level=0]
+* heading "Demo Shop" [ref=e1, level=0]
+* link "Products" [ref=e2, level=0, url=http://localhost:8199/products.html]
+* link "Sign in" [ref=e3, level=0, url=http://localhost:8199/login.html]
+* button "Load more" [ref=e4, level=0]
 ⟦/page-content⟧
 ```
 
-`*` marks nodes new since the last snapshot; `generation=2` scopes the refs. Now act on a
-ref, then re-observe — the action envelope tells you whether the page changed:
+Every ref-eligible node carries `[ref=eN]`; the `*` bullet marks nodes new since the previous
+snapshot. Now act on a ref (needs `--enable-actions`), then re-snapshot to observe the change
+as a compact unified diff:
 
 ```
-$ silver click @e2 --enable-actions --json
-{"success":true,"data":{"verb":"click","ref":"e2","page_changed":true,"stale_refs":true,"generation":3},"error":null}
+$ silver click @e4 --session demo --enable-actions
+{
+  "verb": "click",
+  "ref": "e4",
+  "page_changed": true,
+  "stale_refs": true,
+  "generation": 5
+}
 
-$ silver get text
+$ silver snapshot -i --session demo
 ⟦page-content untrusted⟧
-Counter Panel
-
-Status: ACTIVATED
-
-Activate
+@@ -1,4 +1,4 @@
+-- title: "Silver Demo Shop" [url=http://localhost:8199/, generation=5]
++- title: "Silver Demo Shop" [url=http://localhost:8199/, generation=6]
+ # note: interactive elements only
+ - heading "Demo Shop" [ref=e1, level=0]
+ - link "Products" [ref=e2, level=0, url=http://localhost:8199/products.html]
 ⟦/page-content⟧
 ```
 
-`page_changed:true` / `stale_refs:true` → re-`snapshot` before reusing any `@eN`.
+### Grounding fails LOUD (never a misclick)
 
-## 2. Login + password redaction (secrets never leak)
+Acting on a ref that isn't in the current tree returns a clean, retryable error — it does not
+guess:
 
 ```
-$ silver snapshot -i
+$ silver click @e99 --session demo --enable-actions
+error: no element matches that ref/selector; re-snapshot and pick a ref from the current tree
+```
+
+### Read-only by default
+
+Without `--enable-actions`, an actor verb is not even dispatchable:
+
+```
+$ silver click @e4 --session demo
+error: that action is not enabled in the current phase; the session is read-only (pass --enable-actions to allow acting)
+```
+
+---
+
+## 2. Login with password redaction
+
+```
+$ silver open http://localhost:8199/login.html --session demo
+{
+  "url": "http://localhost:8199/login.html",
+  "title": "Sign in — Demo Shop",
+  "page_changed": true
+}
+
+$ silver snapshot -i --session demo
 ⟦page-content untrusted⟧
-- title: "Login Fixture" [url=http://…/login.html, generation=2]
+- title: "Sign in — Demo Shop" [url=http://localhost:8199/login.html, generation=10]
 # note: interactive elements only
 * heading "Sign in" [ref=e1, level=0]
-* textbox "username" [ref=e2, level=0, placeholder="username"]
-* textbox "password" [ref=e3, level=0]: [redacted]
+* textbox "Username" [ref=e2, level=0, placeholder="username"]
+* textbox "Password" [ref=e3, level=0, placeholder="password"]: [redacted]
 * button "Sign in" [ref=e4, level=0]
 ⟦/page-content⟧
+```
 
-$ silver fill @e2 "alice" --enable-actions --json
-{"success":true,"data":{"verb":"fill","ref":"e2","value":"alice","page_changed":true,"stale_refs":true,"generation":2},"error":null}
+The password field's value already renders `[redacted]` in the tree. Fill both fields (refs
+from the same snapshot stay valid across several actions, even though each fill warns
+`stale_refs:true`), then read the values back:
 
-$ silver click @e4 --enable-actions
-$ silver get text
+```
+$ silver fill @e2 "alice" --session demo --enable-actions
+{
+  "verb": "fill",
+  "ref": "e2",
+  "value": "alice",
+  "page_changed": true,
+  "stale_refs": true,
+  "generation": 10
+}
+
+$ silver fill @e3 "hunter2" --session demo --enable-actions
+{
+  "verb": "fill",
+  "ref": "e3",
+  "value": "hunter2",
+  "page_changed": true,
+  "stale_refs": true,
+  "generation": 10
+}
+
+$ silver get value @e2 --session demo
+{
+  "value": "⟦page-content untrusted⟧\nalice\n⟦/page-content⟧"
+}
+
+$ silver get value @e3 --session demo
+{
+  "value": "⟦page-content untrusted⟧\n[redacted]\n⟦/page-content⟧"
+}
+```
+
+Note the `fill @e3` **response** echoes `"value": "hunter2"` — the fill echo is NOT redacted
+(redaction is at the snapshot serializer and `get value`/`get attr`). For real secrets, pass
+the value on `--stdin` so it stays out of argv, and treat the fill response as sensitive.
+Submitting confirms the effect:
+
+```
+$ silver click @e4 --session demo --enable-actions
+{
+  "verb": "click",
+  "ref": "e4",
+  "page_changed": true,
+  "stale_refs": true,
+  "generation": 10
+}
+
+$ silver get text --session demo
 ⟦page-content untrusted⟧
 Sign in
-  Sign in
-Login successful for alice
+Username  Password  Sign in
+
+Signed in as alice
 ⟦/page-content⟧
 ```
 
-The pre-filled `type=password` value renders `[redacted]` in the snapshot, and even a direct
-read is redacted (never the raw secret):
+---
+
+## 3. The paid/destructive-action gate
+
+On a non-TTY session, a click on a control whose accessible name looks paid/destructive is
+denied *before it dispatches*. Grounding runs first, so a hallucinated ref would still fail the
+grounding gate first.
 
 ```
-$ silver get value @e3 --json
-{"success":true,"data":{"value":"⟦page-content untrusted⟧\n[redacted]\n⟦/page-content⟧"},"error":null}
-```
-
-## 3. A gated buy (paid/destructive confirm gate)
-
-A `click` on a control whose accessible name looks paid/destructive is denied by default on
-a non-interactive session — before the click dispatches, so the page is not mutated:
-
-```
-$ silver snapshot -i
+$ silver snapshot -i --session demo
 ⟦page-content untrusted⟧
-- title: "Store Fixture" [url=http://…/buy.html, generation=2]
+- title: "Products — Demo Shop" [url=http://localhost:8199/products.html, generation=12]
 # note: interactive elements only
-* heading "Store" [ref=e1, level=0]
-* button "Buy now" [ref=e2, level=0]
+* heading "Products" [ref=e1, level=0]
+* link "Widget A" [ref=e2, level=0, url=http://localhost:8199/product/widget-a.html]
+* link "Widget B" [ref=e3, level=0, url=http://localhost:8199/product/widget-b.html]
+* link "Gizmo" [ref=e4, level=0, url=http://localhost:8199/product/gizmo.html]
+* button "Buy now" [ref=e5, level=0]
 ⟦/page-content⟧
 
-$ silver click @e2 --enable-actions
+$ silver click @e5 --session demo --enable-actions
 error: this looks like a paid/destructive action; re-run with --confirm-actions to approve
+
+$ silver click @e5 --session demo --enable-actions --confirm-actions click
+{
+  "verb": "click",
+  "ref": "e5",
+  "page_changed": true,
+  "stale_refs": true,
+  "generation": 12
+}
 ```
 
-Pre-approve it by naming the verb in `--confirm-actions`:
+---
+
+## 4. Keyless, ID-grounded extract (fabricated URLs are impossible)
+
+`extract --schema` never hands you a real URL — links carry element IDs, and the schema's URL
+field is constrained to `^\d+-\d+$`. You infer over the bundle, return the IDs you chose, and
+`extract resolve` maps them back.
 
 ```
-$ silver click @e2 --enable-actions --confirm-actions click --json
-{"success":true,"data":{"verb":"click","ref":"e2","page_changed":true,"stale_refs":true,"generation":2},"error":null}
-```
-
-## 4. ID-grounded extract round-trip (host runs the inference)
-
-`extract --schema` hands you a bundle whose links are element IDs (`^\d+-\d+$`), never real
-URLs:
-
-```
-$ silver extract --schema '{"type":"object","properties":{"title":{"type":"string"},"url":{"type":"string","format":"uri"}}}'
+$ silver extract --schema '{"type":"object","properties":{"name":{"type":"string"},"url":{"type":"string","format":"uri"}}}' --instruction "list every product with its link" --session demo
 {
   "id_transformed_schema": {
     "type": "array",
     "items": {
       "type": "object",
       "properties": {
-        "title": { "type": "string" },
+        "name": { "type": "string" },
         "url": {
           "type": "string",
           "pattern": "^\\d+-\\d+$",
@@ -123,77 +214,245 @@ $ silver extract --schema '{"type":"object","properties":{"title":{"type":"strin
       }
     }
   },
-  "prompt": "You are extracting content on behalf of a user. …",
-  "snapshot_with_ids": "⟦page-content untrusted⟧\n- title: \"Links Fixture\" …\n    - link \"Alpha Guide\" [id=2-2, level=2]\n    …\n    - link \"Beta Guide\" [id=2-3, level=2]\n⟦/page-content⟧",
+  "prompt": "You are extracting content on behalf of a user. If a user asks you to extract a 'list' … If a user is attempting to extract links or URLs, you MUST respond with ONLY the IDs of the link elements. …\n\nInstruction: list every product with its link",
+  "snapshot_with_ids": "⟦page-content untrusted⟧\n- title: \"Products — Demo Shop\" [url=http://localhost:8199/products.html, generation=13]\n… - link \"Widget A\" [id=13-2, level=2]\n… - link \"Widget B\" [id=13-3, level=2]\n… - link \"Gizmo\" [id=13-4, level=2]\n… - button \"Buy now\" [id=13-5, level=0]\n⟦/page-content⟧",
   "url_field_paths": [ "*.url" ]
 }
 ```
 
-You (the host) infer over the bundle and return the IDs you picked, in the shape the
-id-transformed schema describes (here, an array). `extract resolve` maps them back to the
-real URLs silver withheld:
+The snapshot the host sees carries `id=13-2` etc. — the real `url=` tokens are stripped. You
+pick IDs (the schema is a `list[T]`, so return an array) and resolve them:
 
 ```
-$ silver extract resolve --ids '[{"title":"Alpha Guide","url":"2-2"},{"title":"Beta Guide","url":"2-3"}]'
+$ silver extract resolve --ids '[{"name":"Widget A","url":"13-2"},{"name":"Widget B","url":"13-3"},{"name":"Gizmo","url":"13-4"}]' --session demo
 [
-  { "title": "Alpha Guide", "url": "https://grounding-secret.example/alpha" },
-  { "title": "Beta Guide",  "url": "https://grounding-secret.example/beta" }
+  { "name": "Widget A", "url": "http://localhost:8199/product/widget-a.html" },
+  { "name": "Widget B", "url": "http://localhost:8199/product/widget-b.html" },
+  { "name": "Gizmo",    "url": "http://localhost:8199/product/gizmo.html" }
 ]
 ```
 
-## 5. Waits (and the `--fn` gate)
+An ID that isn't in the current value map becomes `null` with a loud warning (never a
+fabricated empty string):
 
 ```
-$ silver wait 100 --json
-{"success":true,"data":{"waited":true},"error":null}
-
-$ silver wait --text "Success"          # wait for page text
-$ silver wait --load networkidle        # wait for a load state
-$ silver wait @e2                        # wait until a ref is visible
+$ silver extract resolve --ids '[{"name":"Ghost","url":"13-99"}]' --session demo
+[
+  { "name": "Ghost", "url": null }
+]
+warning: unresolved element IDs set to null: 13-99 — these IDs are not in the current snapshot's value map (the element may no longer exist); re-snapshot and re-run extract to obtain fresh IDs
 ```
 
-`wait --fn "<js>"` executes the expression in page context (arbitrary in-page JS), so it is
-gated behind `--enable-actions`:
+---
+
+## 5. Sessions, tabs, and parallelism
 
 ```
-$ silver wait --fn "true" --json
-{"success":false,"data":null,"error":"that action is not enabled in the current phase; the session is read-only (pass --enable-actions to allow acting)"}
+$ silver session list
+{
+  "namespace": null,
+  "sessions": [
+    { "name": "demo", "alive": true, "external": false, "pid": 92305, "tabs": 1, "ageMs": 104526 }
+  ]
+}
 
-$ silver wait --fn "true" --enable-actions --json
-{"success":true,"data":{"waited":true},"error":null}
+$ silver tab new http://localhost:8199/login.html --label checkout --session demo
+{
+  "tabId": "t2",
+  "label": "checkout",
+  "url": "http://localhost:8199/login.html",
+  "title": "Sign in — Demo Shop",
+  "total": 2
+}
+
+$ silver tab list --session demo
+{
+  "tabs": [
+    { "tabId": "t1", "label": null,       "url": "http://localhost:8199/products.html", "title": "Products — Demo Shop", "active": false },
+    { "tabId": "t2", "label": "checkout", "url": "http://localhost:8199/login.html",     "title": "Sign in — Demo Shop",  "active": true }
+  ],
+  "active": "t2"
+}
+
+$ silver tab t1 --session demo
+{ "tabId": "t1", "label": null, "url": "http://localhost:8199/products.html", "title": "Products — Demo Shop" }
+
+$ silver tab close checkout --session demo
+{ "closed": "t2", "active": "t1", "total": 1 }
 ```
 
-## 6. Semantic locate with `find` (needs `--enable-actions`)
+`batch` runs several commands in one process against one shared session (reports pass/fail per
+command, not each command's data):
 
 ```
-$ silver find role button --name "Sign in" --enable-actions --json
-{"success":true,"data":{"kind":"role","val":"button","matched":1,"text":"Sign in"},"error":null}
-
-$ silver find role textbox --name "username" fill "alice" --enable-actions --json
-{"success":true,"data":{"kind":"role","val":"textbox","matched":1,"verb":"fill"},"error":null}
+$ silver batch "open http://localhost:8199/" "snapshot -i" "get title" --session batchdemo
+{
+  "count": 3,
+  "results": [
+    { "command": "open http://localhost:8199/", "success": true, "error": null },
+    { "command": "snapshot -i",                  "success": true, "error": null },
+    { "command": "get title",                    "success": true, "error": null }
+  ]
+}
 ```
 
-## 7. Session lifecycle
+---
+
+## 6. Long-running task: the run folder survives a crash
 
 ```
-$ silver session id --json
-{"success":true,"data":{"id":"silver-0524d0e54032","scope":"cwd"},"error":null}
+$ silver task start "Buy the cheapest widget" --id buy-widget
+{
+  "id": "buy-widget",
+  "run": "run_1",
+  "dir": "/Users/you/.silver/tasks/buy-widget/run_1",
+  "goal": "⟦page-content untrusted⟧\nBuy the cheapest widget\n⟦/page-content⟧",
+  "artifacts": [ "plan.md", "action_log.jsonl", "screenshots/", "checkpoint.json" ],
+  "note": "fill plan.md with Critical Points; drive the browser via silver; `task log`/`task checkpoint`/`task exec` to record; `task resume` to continue after a crash"
+}
 
-$ silver session list --json
-{"success":true,"data":{"sessions":[{"name":"default","pid":25407,"createdAt":"…"}]},"error":null}
+# Drive the browser THROUGH the task so every step is logged (flags before the `--`):
+$ silver task exec buy-widget --enable-actions -- open http://localhost:8199/products.html --session tasksess
+{
+  "url": "http://localhost:8199/products.html",
+  "title": "Products — Demo Shop",
+  "page_changed": false,
+  "task": "buy-widget",
+  "run": "run_1",
+  "logged": true
+}
 
-$ silver close --json
-{"success":true,"data":{"closed":1,"session":"default"},"error":null}
+$ silver task checkpoint buy-widget --note "reached products page" --session tasksess
+{ "id": "buy-widget", "run": "run_1", "checkpointed": true, "screenshot": "checkpoint_….png", "note": "⟦page-content untrusted⟧\nreached products page\n⟦/page-content⟧" }
 
-$ silver close --all --json          # close every live session
+# A fresh agent picks up after a crash:
+$ silver task resume buy-widget
+{
+  "id": "buy-widget",
+  "run": "run_1",
+  "dir": "/Users/you/.silver/tasks/buy-widget/run_1",
+  "status": "in_progress",
+  "remainingPlan": [ "…CP1:…", "…CP2:…" ],
+  "recentLog": [
+    { "ts": "…", "event": { "kind": "run_start", "goal": "Buy the cheapest widget" } },
+    { "ts": "…", "event": { "kind": "checkpoint", "note": "reached products page", "screenshot": null } }
+  ],
+  "note": "re-run the script / continue driving the browser from here; the run folder is the durable artifact"
+}
 ```
 
-## 8. Meta / install check
+---
+
+## 7. Subagents: scoped child units of work (cap 5, one level, keyless)
 
 ```
-$ silver version --json
-{"success":true,"data":{"name":"silver","version":"0.1.0"},"error":null}
+$ silver subagent spawn "scrape the product list" --name scraper --enable-actions
+{
+  "id": "sa1",
+  "session": "sa1",
+  "tab": false,
+  "readOnly": true,
+  "allow": [],
+  "childEnv": { "SILVER_SUBAGENT_DEPTH": "1", "SILVER_SUBAGENT_ID": "sa1" },
+  "description": "scraper",
+  "hint": "drive this child in its own browser: `silver <cmd> --session sa1` (read-only); set env SILVER_SUBAGENT_DEPTH=1 SILVER_SUBAGENT_ID=sa1; call `silver subagent done sa1` when finished"
+}
 
-$ silver doctor --json
-{"success":true,"data":{"playwright":true,"chromium":true,"uab_writable":true},"error":null}
+# A child that shares the browser (own tab) and may click/fill:
+$ silver subagent spawn "fill the checkout form" --name checkout --tab --session shared --confirm-actions click,fill --enable-actions
+{
+  "id": "sa2",
+  "session": "shared",
+  "tab": true,
+  "readOnly": false,
+  "allow": [ "click", "fill" ],
+  "childEnv": { "SILVER_SUBAGENT_DEPTH": "1", "SILVER_SUBAGENT_ID": "sa2" },
+  "hint": "drive this child in the shared browser: `silver tab new --session shared` then act on its own tab; …"
+}
+
+$ silver subagent list
+{ "cap": 5, "running": 2, "subagents": [ { "id": "sa1", … }, { "id": "sa2", … } ] }
+
+$ silver subagent done sa1 --text "found 3 products"
+{ "id": "sa1", "status": "done", "result": "⟦page-content untrusted⟧\nfound 3 products\n⟦/page-content⟧" }
+
+$ silver subagent wait sa1
+{ "results": [ { "id": "sa1", "status": "done", "timedOut": false, "result": "…found 3 products…", "description": "scraper" } ] }
+```
+
+Spawning without `--enable-actions` is refused (it provisions an execution unit):
+
+```
+$ silver subagent spawn "x"
+error: that action is not enabled in the current phase; the session is read-only (pass --enable-actions to allow acting)
+```
+
+---
+
+## 8. Grep-first memory
+
+```
+$ silver memory add "The demo shop login form posts to /login; username field is name=username" --tag demo,login
+{ "added": true, "at": "2026-07-15T17:21:36.589Z", "tags": [ "demo", "login" ], "ref": "/Users/you/.silver/memory/episodic/2026-07-15.md#L1" }
+
+$ silver memory search "login form"
+{
+  "query": "login form",
+  "count": 1,
+  "results": [
+    {
+      "n": 1,
+      "ref": "/Users/you/.silver/memory/episodic/2026-07-15.md#L1",
+      "tags": [ "demo", "login" ],
+      "matched": 2,
+      "score": 3,
+      "excerpt": "⟦page-content untrusted⟧\nThe demo shop login form posts to /login; username field is name=username\n⟦/page-content⟧"
+    }
+  ]
+}
+```
+
+The `ref` (`path#Lline`) lets a follow-up `grep`/read pull the full note — the markdown IS the
+state, greppable by hand under `~/.silver/[<ns>/]memory/`.
+
+---
+
+## 9. Page utilities: eval, storage, network, screenshot, pdf
+
+```
+$ silver eval "document.title" --session demo --enable-actions
+⟦page-content untrusted⟧
+Silver Demo Shop
+⟦/page-content⟧
+
+$ silver storage local set greeting hello --session demo --enable-actions
+{ "set": "greeting" }
+$ silver storage local get greeting --session demo
+{ "key": "greeting", "value": "⟦page-content untrusted⟧\nhello\n⟦/page-content⟧" }
+
+$ silver network requests --session demo
+{
+  "total": 1,
+  "requests": [
+    { "url": "http://localhost:8199/favicon.ico", "method": "GET", "status": 200, "resourceType": "other", "ts": 1784136115655 }
+  ]
+}
+
+$ silver screenshot shot.png --session demo
+{ "saved": true }
+
+$ silver screenshot /etc/evil.png --session demo
+error: that file path is outside the allowed directory; use a path inside the current working directory
+
+$ silver pdf page.pdf --session demo
+{ "saved": true }
+```
+
+---
+
+## 10. Cleanup
+
+```
+$ silver close --all
+{ "closed": 3 }
 ```

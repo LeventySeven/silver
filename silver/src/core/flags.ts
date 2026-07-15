@@ -44,6 +44,12 @@ export type ParsedFlags = {
   state?: string
   incognito: boolean
   passwordStdin: boolean
+  /**
+   * Disable AES-256-GCM encryption-at-rest for session sidecars (write
+   * plaintext JSON). For debugging / plaintext inspection; reads still accept
+   * both forms. Also settable via `SILVER_NO_ENCRYPT_STATE=1`.
+   */
+  noEncryptState: boolean
   // ---- perception ----
   compact: boolean
   interactive: boolean
@@ -153,6 +159,7 @@ const BOOL_FLAGS: Record<string, keyof ParsedFlags> = {
   'enable-actions': 'enableActions',
   incognito: 'incognito',
   'password-stdin': 'passwordStdin',
+  'no-encrypt-state': 'noEncryptState',
   compact: 'compact',
   interactive: 'interactive',
   urls: 'urls',
@@ -198,6 +205,7 @@ function defaults(): ParsedFlags {
     confirmActionsProvided: false,
     incognito: false,
     passwordStdin: false,
+    noEncryptState: false,
     compact: false,
     interactive: false,
     urls: false,
