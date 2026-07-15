@@ -109,8 +109,10 @@ describe('vercel-parity verbs (real Chromium via the run() entry)', () => {
     expect(getOne.env.success).toBe(true)
     expect((getOne.env.data as { value: string }).value).toContain('v1')
 
+    // The whole-store dump now routes each value through the neutralizer too
+    // (fix F7), so the value is boundary-fenced like the single-key get above.
     const getAll = await run(['storage', 'local', 'get', '--session', NAME])
-    expect((getAll.env.data as { storage: Record<string, string> }).storage.k1).toBe('v1')
+    expect((getAll.env.data as { storage: Record<string, string> }).storage.k1).toContain('v1')
 
     const cleared = await run(['storage', 'local', 'clear', '--enable-actions', '--session', NAME])
     expect(cleared.env.success).toBe(true)

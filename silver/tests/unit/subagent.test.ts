@@ -66,6 +66,46 @@ describe('silver subagent — keyless scoped-child orchestration', () => {
     await nuke(ns)
   })
 
+  it('CAP + id/session invariants hold under interleaved concurrent spawns (namespace lock)', async () => {
+    const ns = `${NS}-race`
+    // Fire CAP+4 spawns CONCURRENTLY. Without the namespace-scoped lock the
+    // unlocked read-check-write would let >CAP through, collide on sa<N> ids, or
+    // duplicate the auto-assigned session. Each uses the default session so the
+    // child session is its own id — collisions would be observable as dup sessions.
+    const N = CONCURRENCY_CAP + 4
+    const settled = await Promise.all(
+      Array.from({ length: N }, (_, i) =>
+        run(['subagent', 'spawn', `racer ${i}`, '--enable-actions', '--namespace', ns]),
+      ),
+    )
+
+    const succeeded = settled.filter((r) => r.env.success)
+    const failed = settled.filter((r) => !r.env.success)
+
+    // Exactly CAP win; the rest are refused for cap (never a crash / other error).
+    expect(succeeded.length).toBe(CONCURRENCY_CAP)
+    expect(failed.length).toBe(N - CONCURRENCY_CAP)
+    for (const f of failed) expect(f.env.error).toContain('too many active subagents')
+
+    // Ids are unique and are exactly sa1..sa<CAP> (no silent clobber, no dup id).
+    const ids = succeeded.map((r) => data<{ id: string }>(r).id)
+    expect(new Set(ids).size).toBe(CONCURRENCY_CAP)
+    expect([...ids].sort()).toEqual(
+      Array.from({ length: CONCURRENCY_CAP }, (_, i) => `sa${i + 1}`).sort(),
+    )
+
+    // Each isolated child got its own session (own-context invariant held).
+    const sessions = succeeded.map((r) => data<{ session: string }>(r).session)
+    expect(new Set(sessions).size).toBe(CONCURRENCY_CAP)
+
+    // The registry agrees: exactly CAP running records persisted, ids all distinct.
+    const listed = await run(['subagent', 'list', '--namespace', ns])
+    const l = data<{ running: number; subagents: Array<{ id: string }> }>(listed)
+    expect(l.running).toBe(CONCURRENCY_CAP)
+    expect(new Set(l.subagents.map((s) => s.id)).size).toBe(CONCURRENCY_CAP)
+    await nuke(ns)
+  })
+
   it('enforces ONE-LEVEL nesting: a child (SILVER_SUBAGENT_DEPTH=1) cannot spawn', async () => {
     const ns = `${NS}-nest`
     process.env.SILVER_SUBAGENT_DEPTH = '1'

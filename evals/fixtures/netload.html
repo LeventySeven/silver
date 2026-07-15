@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Net Load Fixture</title>
+  </head>
+  <body>
+    <h1 id="h">net-load-fixture</h1>
+    <p>Issues a same-origin fetch on load so the network capture buffer is non-empty.</p>
+    <script>
+      // Wrapped by the capture instrumentation (installed at document-start),
+      // so the request is recorded synchronously into window.__silverCap.net
+      // the moment fetch() is called — before this page finishes loading.
+      try { fetch('links.html').catch(function () {}); } catch (e) {}
+    </script>
+  </body>
+</html>

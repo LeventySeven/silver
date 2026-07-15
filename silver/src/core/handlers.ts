@@ -34,6 +34,8 @@ import {
   saveRefMap,
   loadRefMap,
   readSidecar,
+  writeSidecar,
+  readSidecarObject,
   sessionDir,
   sessionsRoot,
   isPidAlive,
@@ -131,10 +133,13 @@ function statePath(name: string): string {
   return path.join(sessionDir(name), 'silver-state.json')
 }
 
+// silver-state.json holds prevTree (full page-tree text) AND extract.valueMap
+// (the REAL urls the extract moat hides from the host) — so it is routed through
+// the SAME AES-256-GCM encryption-at-rest + plaintext-legacy migration as
+// session.json / refmap.json (fix F4/F8), never raw fs+JSON.
 async function loadState(name: string): Promise<UabState | null> {
   try {
-    const raw = await fs.readFile(statePath(name), 'utf8')
-    return JSON.parse(raw) as UabState
+    return await readSidecarObject<UabState>(statePath(name))
   } catch {
     return null
   }
@@ -142,7 +147,7 @@ async function loadState(name: string): Promise<UabState | null> {
 
 async function saveState(name: string, state: UabState): Promise<void> {
   await fs.mkdir(sessionDir(name), { recursive: true })
-  await fs.writeFile(statePath(name), JSON.stringify(state), 'utf8')
+  await writeSidecar(statePath(name), state)
 }
 
 async function patchState(name: string, patch: Partial<UabState>): Promise<UabState> {
@@ -224,10 +229,12 @@ function dialogPath(name: string): string {
   return path.join(sessionDir(name), 'dialog.json')
 }
 
+// dialog.json can carry a page-authored dialog message/defaultValue — encrypted
+// at rest through the shared sidecar crypto (fix F4/F8), not raw fs+JSON.
 async function writeDialogSidecar(name: string, d: LastDialog): Promise<void> {
   try {
     await fs.mkdir(sessionDir(name), { recursive: true })
-    await fs.writeFile(dialogPath(name), JSON.stringify(d), 'utf8')
+    await writeSidecar(dialogPath(name), d)
   } catch {
     /* best-effort — the dialog handler must never throw into Playwright */
   }
@@ -235,7 +242,7 @@ async function writeDialogSidecar(name: string, d: LastDialog): Promise<void> {
 
 async function loadDialogSidecar(name: string): Promise<LastDialog | null> {
   try {
-    return JSON.parse(await fs.readFile(dialogPath(name), 'utf8')) as LastDialog
+    return await readSidecarObject<LastDialog>(dialogPath(name))
   } catch {
     return null
   }
@@ -263,6 +270,57 @@ function attachDialogHandler(page: Page, session: string): void {
 function presentPageText(text: string, flags: ParsedFlags): string {
   const capped = capOutput(text, flags.maxOutput)
   return flags.contentBoundaries ? neutralize(capped) : capped
+}
+
+// ---------------------------------------------------------------------------
+// Narrowed paid/destructive activation gate (fix P0-4 / F3). Shared by
+// handleAct, handleMouse (raw-coordinate click), and handleKeyboard (submit-like
+// press): on a NON-TTY session that did not pre-approve the verb via
+// --confirm-actions, a click/press-like ACTIVATION of a control whose accessible
+// name looks paid/destructive (Buy/Pay/Delete/…) is refused (confirm_required).
+// A TTY session (interactive human) is allowed through to a prompt.
+// ---------------------------------------------------------------------------
+
+function destructivePaidBlocks(name: string, flags: ParsedFlags, verb: string): boolean {
+  return (
+    isDestructivePaidName(name) && !process.stdout.isTTY && !flags.confirmActions.includes(verb)
+  )
+}
+
+/** Keys that ACTIVATE the focused control (submit-like), for the F3 keyboard gate. */
+const SUBMIT_LIKE_KEYS: ReadonlySet<string> = new Set(['enter', 'numpadenter', 'space', ' '])
+function isSubmitLikeKey(key: string): boolean {
+  return SUBMIT_LIKE_KEYS.has(key.toLowerCase())
+}
+
+// Accessible-name extraction snippet (string JS — tsconfig `lib` has no DOM).
+// Prefers aria-label / title, then textContent, then a form control's value.
+const NAME_EXTRACT_JS =
+  "var n=el.getAttribute('aria-label')||el.getAttribute('title')||el.textContent||el.value||'';return String(n).trim();"
+
+/**
+ * Best-effort accessible name of the element at viewport point (x,y) — the
+ * hit-test the F3 mouse-click gate runs so a raw-coordinate click can't bypass
+ * the paid/destructive gate a grounded `click @eN` enforces. x/y are validated
+ * finite numbers, so interpolating them into the script is injection-safe.
+ */
+async function elementNameAtPoint(page: Page, x: number, y: number): Promise<string> {
+  const js = `(function(){var el=document.elementFromPoint(${x},${y});if(!el)return '';${NAME_EXTRACT_JS}})()`
+  try {
+    return ((await page.evaluate(js)) as string) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+/** Best-effort accessible name of the currently focused element (F3 keyboard gate). */
+async function focusedElementName(page: Page): Promise<string> {
+  const js = `(function(){var el=document.activeElement;if(!el)return '';${NAME_EXTRACT_JS}})()`
+  try {
+    return ((await page.evaluate(js)) as string) ?? ''
+  } catch {
+    return ''
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -825,13 +883,7 @@ async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
   if (CONFIRM_GATED_VERBS.has(verb)) {
     const g = groundRef(refmap, ref)
     if (!g.ok) return fail(g.code)
-    if (
-      isDestructivePaidName(g.entry.name) &&
-      !process.stdout.isTTY &&
-      !flags.confirmActions.includes(verb)
-    ) {
-      return fail('confirm_required')
-    }
+    if (destructivePaidBlocks(g.entry.name, flags, verb)) return fail('confirm_required')
   }
 
   // Value: positional arg, or stdin for large/unsafe payloads.
@@ -1538,13 +1590,20 @@ async function handleNetworkRequests(flags: ParsedFlags): Promise<Envelope<unkno
     if (flags.type !== undefined) {
       list = list.filter((r) => String(r.resourceType ?? '') === flags.type)
     }
+    // --method/--status only match AUTHORITATIVE (source:'fetch') entries. Observer
+    // (PerformanceObserver) entries carry an ASSUMED method 'GET' / status 200
+    // (capture.ts), so matching them by those fields would present best-effort data
+    // as authoritative — the contract at capture.ts:44-50. Scope the filters to fetch.
     if (flags.method !== undefined) {
       const m = flags.method.toUpperCase()
-      list = list.filter((r) => String(r.method ?? '').toUpperCase() === m)
+      list = list.filter(
+        (r) => String(r.source ?? '') === 'fetch' && String(r.method ?? '').toUpperCase() === m,
+      )
     }
     if (flags.status !== undefined) {
       const s = flags.status
       list = list.filter((r) => {
+        if (String(r.source ?? '') !== 'fetch') return false
         const st = String(r.status ?? '')
         return st === s || st.startsWith(s)
       })
@@ -1552,7 +1611,20 @@ async function handleNetworkRequests(flags: ParsedFlags): Promise<Envelope<unkno
     const total = list.length
     // Bound the returned array (the page-side ring buffer is already capped).
     const CAP = 200
-    const requests = list.slice(-CAP)
+    // The request url is attacker-controlled free text (a page can seed a captured
+    // url with forged transcript tags), so route it through presentPageText
+    // (fix F6): neutralize + cap like console/errors before it reaches the host.
+    // Filtering/slicing runs on the RAW url first, so --filter still matches
+    // unwrapped. The HTTP method is NOT free text — it is a bounded token, so
+    // fencing it in content-boundary markers would corrupt a structured field.
+    // Sanitize it to a safe uppercase-letter token instead: this strips any
+    // injected tag characters entirely (strictly safer than fencing, which leaves
+    // attacker text present) while keeping real methods like GET/POST intact.
+    const requests = list.slice(-CAP).map((r) => ({
+      ...r,
+      url: presentPageText(String(r.url ?? ''), flags),
+      method: String(r.method ?? '').toUpperCase().replace(/[^A-Z-]/g, '').slice(0, 16),
+    }))
     if (flags.clear) await clearCapture(page, 'net')
     return ok({ total, requests })
   })
@@ -1753,7 +1825,13 @@ async function handleStorage(flags: ParsedFlags): Promise<Envelope<unknown>> {
     const all = (await page.evaluate(
       `(function(){var s=window.${store};var o={};for(var i=0;i<s.length;i++){var k=s.key(i);if(k!==null)o[k]=s.getItem(k);}return o;})()`,
     )) as Record<string, string>
-    return ok({ type: kind, storage: all })
+    // Route EVERY value through presentPageText (fix F7): the whole-store dump
+    // otherwise returned each value raw + uncapped, so a page could stash forged
+    // transcript tags in localStorage and have them replayed verbatim. Mirrors
+    // the single-key `get` path above.
+    const storage: Record<string, string> = {}
+    for (const [k, v] of Object.entries(all)) storage[k] = presentPageText(String(v), flags)
+    return ok({ type: kind, storage })
   })
 }
 
@@ -1860,6 +1938,11 @@ async function handleMouse(flags: ParsedFlags): Promise<Envelope<unknown>> {
           return ok({ moved: { x, y } })
         }
         const button = mouseButton(flags.args[3])
+        // F3: hit-test the element under the click point and run the SAME
+        // paid/destructive gate a grounded `click @eN` runs — a raw-coordinate
+        // click on a "Buy now" control otherwise bypasses the confirm gate.
+        const hitName = await elementNameAtPoint(page, x, y)
+        if (destructivePaidBlocks(hitName, flags, 'click')) return fail('confirm_required')
         await page.mouse.click(x, y, { button })
         return ok({ clicked: { x, y, button } })
       }
@@ -1905,8 +1988,16 @@ async function handleKeyboard(flags: ParsedFlags): Promise<Envelope<unknown>> {
       case 'up': {
         const key = flags.args[1]
         if (!key) return badRequest(`usage: silver keyboard ${sub} <key>`)
-        if (sub === 'press') await page.keyboard.press(key)
-        else if (sub === 'down') await page.keyboard.down(key)
+        if (sub === 'press') {
+          // F3: a submit-like press (Enter/Space) ACTIVATES the focused control,
+          // so gate it exactly like a `press @eN` on a paid/destructive name —
+          // otherwise Enter on a focused "Pay" button bypasses the confirm gate.
+          if (isSubmitLikeKey(key)) {
+            const focusName = await focusedElementName(page)
+            if (destructivePaidBlocks(focusName, flags, 'press')) return fail('confirm_required')
+          }
+          await page.keyboard.press(key)
+        } else if (sub === 'down') await page.keyboard.down(key)
         else await page.keyboard.up(key)
         return ok({ [sub]: key })
       }

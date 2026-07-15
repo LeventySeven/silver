@@ -1,0 +1,17 @@
+{
+  "id": "tab-lifecycle",
+  "task": "Open a page, open a SECOND tab on a different fixture, then `tab list`. Exercises the multi-tab layer: the two tabs must carry stable ids (t1 for the original page, t2 for the new one) and the newly-opened tab must be the active one.",
+  "start_url": "{BASE}/buttons.html",
+  "script": [
+    ["tab", "new", "{BASE}/links.html"],
+    ["tab", "list"]
+  ],
+  "expectedPatterns": [
+    "\"tabId\": \"t1\"",
+    "\"tabId\": \"t2\"",
+    "\"active\": \"t2\""
+  ],
+  "forbiddenPatterns": [
+    "navigation_blocked"
+  ]
+}

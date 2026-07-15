@@ -1,0 +1,17 @@
+{
+  "id": "memory-note",
+  "task": "Add a dated markdown memory note carrying a unique marker, then grep-search for that marker. Exercises the keyless grep-first memory layer: the added note must be found and its body echoed back (through the injection scrub).",
+  "start_url": "{BASE}/buttons.html",
+  "script": [
+    ["memory", "add", "silver-eval-marker-zulu-quebec deterministic smoke note", "--namespace", "silver-eval-smoke"],
+    ["memory", "search", "zulu-quebec", "--namespace", "silver-eval-smoke"]
+  ],
+  "expectedPatterns": [
+    "\"added\": true",
+    "silver-eval-marker-zulu-quebec",
+    "\"matched\":"
+  ],
+  "forbiddenPatterns": [
+    "no matching memories found"
+  ]
+}

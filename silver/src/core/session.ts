@@ -135,8 +135,13 @@ async function atomicWrite(filePath: string, data: string | Buffer): Promise<voi
  * (AES-256-GCM) so cookie/storage-adjacent session state is never plaintext on
  * disk. `--no-encrypt-state` / `SILVER_NO_ENCRYPT_STATE=1` writes plaintext JSON
  * instead. Reads (`readSidecarObject`) transparently accept either form.
+ *
+ * Exported so ALL per-session sidecars share ONE crypto path — not just
+ * session.json / refmap.json here, but also handlers' silver-state.json (holds
+ * the previous page-tree text + the extract value-map of real URLs) and
+ * dialog.json, which must never be plaintext on disk (fix F4/F8).
  */
-async function writeSidecar(filePath: string, obj: unknown): Promise<void> {
+export async function writeSidecar(filePath: string, obj: unknown): Promise<void> {
   const data: string | Buffer = isStateEncryptionEnabled()
     ? encryptJson(obj)
     : JSON.stringify(obj, null, 2)
@@ -147,8 +152,11 @@ async function writeSidecar(filePath: string, obj: unknown): Promise<void> {
  * Read a session sidecar and decode it transparently: an encrypted blob is
  * decrypted, a legacy plaintext-JSON sidecar is parsed as-is (migration). The
  * caller owns error mapping (missing vs. corrupt).
+ *
+ * Exported for handlers' silver-state.json / dialog.json (fix F4/F8) so those
+ * sidecars migrate legacy plaintext + round-trip through the SAME crypto.
  */
-async function readSidecarObject<T>(filePath: string): Promise<T> {
+export async function readSidecarObject<T>(filePath: string): Promise<T> {
   const buf = await fs.readFile(filePath)
   return decodeStateBuffer(buf) as T
 }

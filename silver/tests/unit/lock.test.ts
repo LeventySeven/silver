@@ -88,6 +88,59 @@ describe('per-session advisory lock', () => {
     await expect(fs.readFile(lockFile, 'utf8')).rejects.toBeTruthy()
   })
 
+  it('F1: does NOT steal a LIVE-pid lock even when it is far older than the hard staleness bound', async () => {
+    // Regression for F1: a legitimate long command (e.g. `wait --timeout 200000`)
+    // holds the lock for well over 120s. A concurrent same-session command must
+    // NOT steal it just because the record's `at` is old — stealing a live
+    // holder makes both drive the same browser and race sidecars.
+    const name = uniq('oldlive')
+    await fs.mkdir(sessionDir(name), { recursive: true })
+    const lockFile = path.join(sessionDir(name), '.lock')
+    // Our own (definitely-live) pid, but timestamped ~5 minutes ago — older than
+    // the old HARD_STALE_MS (120s) that used to trigger a takeover.
+    await fs.writeFile(
+      lockFile,
+      JSON.stringify({ pid: process.pid, token: 'longheld', at: Date.now() - 300_000 }),
+      'utf8',
+    )
+    let caught: unknown
+    try {
+      await withSessionLock(name, async () => 'never', 200)
+    } catch (err) {
+      caught = err
+    }
+    // Must fail busy, NOT steal the live holder's lock.
+    expect(caught).toBeInstanceOf(LockError)
+    expect((caught as LockError).code).toBe('session_busy')
+    // The live holder's record is untouched (never stolen, never rewritten).
+    const still = JSON.parse(await fs.readFile(lockFile, 'utf8')) as {
+      token: string
+      pid: number
+    }
+    expect(still.token).toBe('longheld')
+    expect(still.pid).toBe(process.pid)
+  })
+
+  it('F1: DOES steal a DEAD-pid lock that is also old (dead pid is always takeable)', async () => {
+    const name = uniq('oldstale')
+    await fs.mkdir(sessionDir(name), { recursive: true })
+    const lockFile = path.join(sessionDir(name), '.lock')
+    // A dead pid whose record is old — takeover must be immediate.
+    await fs.writeFile(
+      lockFile,
+      JSON.stringify({ pid: 2147483646, token: 'ghost', at: Date.now() - 300_000 }),
+      'utf8',
+    )
+    let ran = false
+    const start = Date.now()
+    await withSessionLock(name, async () => {
+      ran = true
+    })
+    expect(ran).toBe(true)
+    expect(Date.now() - start).toBeLessThan(2_000)
+    await expect(fs.readFile(lockFile, 'utf8')).rejects.toBeTruthy()
+  })
+
   it('fails with LockError(session_busy) when a LIVE holder never releases', async () => {
     const name = uniq('busy')
     await fs.mkdir(sessionDir(name), { recursive: true })

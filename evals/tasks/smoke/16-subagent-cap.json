@@ -1,0 +1,16 @@
+{
+  "id": "subagent-cap",
+  "task": "List subagents. Exercises the keyless subagent orchestration layer: `subagent list` must always report the hard concurrency cap of 5 (Aside pattern 12) regardless of how many children exist.",
+  "start_url": "{BASE}/buttons.html",
+  "script": [
+    ["subagent", "list", "--namespace", "silver-eval-smoke"]
+  ],
+  "expectedPatterns": [
+    "\"cap\": 5",
+    "\"running\":",
+    "\"subagents\":"
+  ],
+  "forbiddenPatterns": [
+    "not_permitted"
+  ]
+}

@@ -11,9 +11,14 @@
  *
  * Mechanism: an atomic exclusive-create lockfile (`<sessionDir>/.lock`).
  *   - acquire: `fs.open(path, 'wx')` (atomic create-if-absent). On EEXIST, read
- *     the holder record; take it over immediately if the holder pid is dead
- *     (PID-liveness) or the lock is older than a hard staleness bound (defends
- *     pid reuse); otherwise back off with jitter and retry until the budget.
+ *     the holder record; take it over immediately ONLY if the holder pid is dead
+ *     (PID-liveness). A LIVE holder is never stolen no matter how long it has
+ *     held the lock — a legitimate long command (e.g. `wait --timeout 200000`)
+ *     must keep its lock. A heartbeat rewrites the record's `at` while `fn()`
+ *     runs, so the only lock that can age past the absolute last-resort bound is
+ *     one whose holder died and whose pid was reused by an unrelated live process
+ *     (the sole case PID-liveness cannot detect). Otherwise back off with jitter
+ *     and retry until the budget.
  *   - release: remove the lockfile ONLY if it still carries OUR random token, so
  *     a process that took over a stale lock is never un-locked by the slow
  *     original holder (a token mismatch means someone else legitimately owns it).
@@ -27,10 +32,18 @@ import { randomUUID } from 'node:crypto'
 import * as path from 'node:path'
 import { sessionDir, isPidAlive } from './session.js'
 
-/** How long a live-pid holder may keep the lock before we force takeover. This
- * only bites a process that was SIGKILLed AND whose pid got reused by an
- * unrelated live process — PID-liveness handles the ordinary crash instantly. */
-const HARD_STALE_MS = 120_000
+/** Absolute last-resort staleness bound. A LIVE-pid holder is normally NEVER
+ * stolen (see isStale) — this bound only bites a holder that was SIGKILLed AND
+ * whose pid got reused by an unrelated live process, so PID-liveness reports
+ * "alive" but the heartbeat has stopped and `at` freezes. Deliberately far above
+ * any legitimate single-command hold (and above HEARTBEAT_MS) so a live command
+ * that genuinely holds the lock for minutes is safe. PID-liveness handles the
+ * ordinary crash instantly; this is only the deadlock breaker of last resort. */
+const ABSOLUTE_STALE_MS = 30 * 60_000
+/** Cadence at which a live holder rewrites its record's `at` while `fn()` runs,
+ * keeping the lock from ever aging toward ABSOLUTE_STALE_MS. Must be well under
+ * that bound. */
+const HEARTBEAT_MS = 30_000
 /** Max time to wait for a busy same-session lock before failing session_busy.
  * Generous: a legitimately-serialized command (incl. an ~8s browser spawn or a
  * long `wait`) must not spuriously lose the lock. */
@@ -66,12 +79,36 @@ async function readLock(file: string): Promise<LockRecord | null> {
   }
 }
 
-/** A holder is stale (safe to steal) if its process is gone or the lock is
- * older than the hard bound. A missing/corrupt record counts as stale. */
+/** A holder is stale (safe to steal) if its process is gone. A LIVE holder is
+ * NOT stealable on age alone — a long-running command legitimately holds the
+ * lock for as long as it runs, and the heartbeat keeps its `at` fresh — so age
+ * is used only as an absolute deadlock breaker for a dead-but-pid-reused holder
+ * (a holder whose pid is now alive but whose heartbeat froze). A missing/corrupt
+ * record counts as stale. */
 function isStale(rec: LockRecord | null): boolean {
   if (!rec) return true
+  // Ordinary crash: pid is gone → steal immediately (the common case).
   if (!isPidAlive(rec.pid)) return true
-  return Date.now() - rec.at > HARD_STALE_MS
+  // Live pid: never steal on the ordinary bound; only the absolute last-resort
+  // bound (pid-reuse deadlock) can force a takeover of a live-pid record.
+  return Date.now() - rec.at > ABSOLUTE_STALE_MS
+}
+
+/** Rewrite the holder record's `at` iff we still own the lock (token match),
+ * atomically (temp + rename) so a concurrent waiter never reads a partial file
+ * and mistakes it for a corrupt/stale record. Best-effort: a dropped heartbeat
+ * just means the next one retries. */
+async function refreshLock(file: string, token: string): Promise<void> {
+  const holder = await readLock(file)
+  if (!holder || holder.token !== token) return
+  const rec: LockRecord = { pid: holder.pid, token, at: Date.now() }
+  const tmp = `${file}.${token}.tmp`
+  try {
+    await fs.writeFile(tmp, JSON.stringify(rec), 'utf8')
+    await fs.rename(tmp, file)
+  } catch {
+    await fs.rm(tmp, { force: true }).catch(() => {})
+  }
 }
 
 /** Acquire the lock, returning the token needed to release it. */
@@ -130,9 +167,18 @@ export async function withSessionLock<T>(
   budgetMs: number = DEFAULT_BUDGET_MS,
 ): Promise<T> {
   const token = await acquire(name, budgetMs)
+  const file = lockPath(name)
+  // Keep the record's `at` fresh so a live holder is never mistaken for stale,
+  // even across a multi-minute command. unref() so the timer never keeps the
+  // process alive on its own.
+  const heartbeat = setInterval(() => {
+    void refreshLock(file, token)
+  }, HEARTBEAT_MS)
+  if (typeof heartbeat.unref === 'function') heartbeat.unref()
   try {
     return await fn()
   } finally {
+    clearInterval(heartbeat)
     await release(name, token)
   }
 }

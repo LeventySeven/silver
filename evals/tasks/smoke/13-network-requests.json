@@ -1,0 +1,16 @@
+{
+  "id": "network-requests",
+  "task": "Open a fixture that issues a same-origin fetch on load, then `network requests`. Exercises the network-capture layer: the request the page made during load must be surfaced from the page-side capture buffer after the navigation.",
+  "start_url": "{BASE}/netload.html",
+  "script": [
+    ["network", "requests"]
+  ],
+  "expectedPatterns": [
+    "\"resourceType\": \"fetch\"",
+    "links\\.html",
+    "\"method\": \"GET\""
+  ],
+  "forbiddenPatterns": [
+    "\"total\": 0"
+  ]
+}

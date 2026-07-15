@@ -11,11 +11,11 @@
  *   - Value flags consume the FOLLOWING argv token (or a `--flag=value` form).
  *   - `--content-boundaries` is ON by default; `--no-content-boundaries` turns it
  *     off (the only tri-state flag).
- *   - Short flags: `-i` interactive, `-c` compact, `-u` urls (bool); `-d`/`-s`
- *     depth/selector (value); a `-dN` / `-d N` form is accepted.
- *   - Large / unsafe payloads arrive on stdin: `--stdin` (fill/eval body) and
- *     `--password-stdin`. This module only records the flags; the CLI reads
- *     stdin (so parsing stays synchronous + testable).
+ *   - Short flags: `-i` interactive, `-c` compact; `-d`/`-s` depth/selector
+ *     (value); a `-dN` / `-d N` form is accepted.
+ *   - Large / unsafe payloads arrive on stdin: `--stdin` (fill/eval body). This
+ *     module only records the flag; the CLI reads stdin (so parsing stays
+ *     synchronous + testable).
  *
  * KEYLESS: pure string parsing, no I/O, no model.
  */
@@ -43,7 +43,6 @@ export type ParsedFlags = {
   timeout?: number
   state?: string
   incognito: boolean
-  passwordStdin: boolean
   /**
    * Disable AES-256-GCM encryption-at-rest for session sidecars (write
    * plaintext JSON). For debugging / plaintext inspection; reads still accept
@@ -55,7 +54,6 @@ export type ParsedFlags = {
   interactive: boolean
   depth?: number
   selector?: string
-  urls: boolean
   full: boolean
   // ---- misc per-verb ----
   all: boolean
@@ -158,11 +156,9 @@ const BOOL_FLAGS: Record<string, keyof ParsedFlags> = {
   'allow-file-access': 'allowFileAccess',
   'enable-actions': 'enableActions',
   incognito: 'incognito',
-  'password-stdin': 'passwordStdin',
   'no-encrypt-state': 'noEncryptState',
   compact: 'compact',
   interactive: 'interactive',
-  urls: 'urls',
   full: 'full',
   all: 'all',
   stdin: 'stdin',
@@ -182,7 +178,6 @@ const OPTIONAL_VALUE_FLAGS = new Set(['load'])
 const SHORT_BOOL: Record<string, keyof ParsedFlags> = {
   i: 'interactive',
   c: 'compact',
-  u: 'urls',
   f: 'full',
 }
 const SHORT_VALUE: Record<string, 'depth' | 'selector'> = {
@@ -204,11 +199,9 @@ function defaults(): ParsedFlags {
     confirmActions: [],
     confirmActionsProvided: false,
     incognito: false,
-    passwordStdin: false,
     noEncryptState: false,
     compact: false,
     interactive: false,
-    urls: false,
     full: false,
     all: false,
     stdin: false,

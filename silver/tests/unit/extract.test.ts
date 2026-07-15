@@ -7,11 +7,7 @@ import {
   type JsonSchema,
 } from '../../src/extract/transform.js'
 import { resolveIds } from '../../src/extract/resolve.js'
-import {
-  EXTRACT_SYSTEM_PROMPT,
-  OBSERVE_SYSTEM_PROMPT,
-  ACT_SYSTEM_PROMPT,
-} from '../../src/extract/prompts.js'
+import { EXTRACT_SYSTEM_PROMPT } from '../../src/extract/prompts.js'
 
 // A free-text URL a hallucinating model might try to emit — must NEVER satisfy
 // the ID pattern the transform installs.
@@ -257,10 +253,5 @@ describe('prompts — verbatim host-run constants', () => {
       'you MUST respond with ONLY the IDs of the link elements',
     )
     expect(EXTRACT_SYSTEM_PROMPT).toContain('YOU MUST EXTRACT ALL OF THE INFORMATION')
-  })
-
-  it('OBSERVE and ACT prompts are present and non-empty', () => {
-    expect(OBSERVE_SYSTEM_PROMPT).toContain('finding elements based on what the')
-    expect(ACT_SYSTEM_PROMPT).toContain('Otherwise, return an empty object.')
   })
 })

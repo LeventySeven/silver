@@ -33,7 +33,7 @@ import { startServer, runUab, execCommand } from './server.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(HERE, '..', '..')
-const UAB = path.join(REPO_ROOT, 'skill', 'agent-browser', 'dist', 'cli.js')
+const UAB = path.join(REPO_ROOT, 'silver', 'dist', 'cli.js')
 const VERCEL_BIN = 'agent-browser'
 const TIMEOUT = 30000
 

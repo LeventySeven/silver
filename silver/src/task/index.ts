@@ -25,6 +25,7 @@ import { sanitizeSegment } from '../core/nsdirs.js'
 import { neutralize, capOutput } from '../security/injection.js'
 import { withSessionLock } from '../core/lock.js'
 import { connect } from '../core/session.js'
+import { resolveActivePage } from '../core/tabs.js'
 import {
   startRun,
   appendLog,
@@ -317,7 +318,7 @@ async function captureScreenshot(session: string, id: string, n: number): Promis
   return withSessionLock(session, async () => {
     const conn = await connect(session)
     try {
-      const page = conn.context.pages()[0] ?? (await conn.context.newPage())
+      const page = await resolveActivePage(conn.context, session)
       const file = `checkpoint_${Date.now()}.png`
       const out = path.join(runDirPath(id, n), 'screenshots', file)
       await fs.mkdir(path.dirname(out), { recursive: true })

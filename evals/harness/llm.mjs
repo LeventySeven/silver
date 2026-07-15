@@ -22,7 +22,7 @@ import { startServer, execCommand, runUab } from './server.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(HERE, '..', '..')
-const UAB = path.join(REPO_ROOT, 'skill', 'agent-browser', 'dist', 'cli.js')
+const UAB = path.join(REPO_ROOT, 'silver', 'dist', 'cli.js')
 
 /** Default: two cheap read-only tasks that don't need --enable-actions. */
 const DEFAULT_TASKS = ['example-domain', 'button-ref']

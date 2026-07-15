@@ -24,6 +24,7 @@ import type { RefMap } from '../perception/refmap.js'
 import { groundRef } from '../perception/refmap.js'
 import { ok, fail, type Envelope } from '../core/envelope.js'
 import type { ErrorCode } from '../core/errors.js'
+import { redactValue } from '../security/redact.js'
 import { toLocator, ResolveError, REF_ATTR } from './resolve.js'
 
 /** Ref-based actuation verbs. */
@@ -146,6 +147,15 @@ export async function act(
   // 3. Dispatch to Playwright; cleanup the stamped attribute regardless.
   try {
     const result = await dispatch(page, cdp, locator, verb, grounded.ref, value, refmap, opts)
+    // Redact the `fill` read-back through the SAME choke point `get value` uses
+    // (fix F5): a raw read-back would otherwise ECHO a just-typed password/card
+    // un-redacted back to the host. isPassword comes from the live DOM `type`;
+    // role/name come from the grounded ref for the password-hint check.
+    if (result.value !== undefined) {
+      const type = ((await locator.getAttribute('type').catch(() => null)) ?? '').toLowerCase()
+      const isPassword = type === 'password'
+      result.value = redactValue(grounded.entry.role, grounded.entry.name, result.value, isPassword)
+    }
     return ok(result)
   } catch (err) {
     return actFail<ActResult>(mapActionError(err))

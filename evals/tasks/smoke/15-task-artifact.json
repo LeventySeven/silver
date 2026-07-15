@@ -1,0 +1,17 @@
+{
+  "id": "task-artifact",
+  "task": "Start a long-running task artifact with a deterministic id, then read its status. Exercises the task-artifact layer: `task start` must scaffold a run folder and `task status` must report the run and an in_progress status.",
+  "start_url": "{BASE}/buttons.html",
+  "script": [
+    ["task", "start", "eval smoke task goal", "--id", "eval-smoke-task", "--namespace", "silver-eval-smoke"],
+    ["task", "status", "--id", "eval-smoke-task", "--namespace", "silver-eval-smoke"]
+  ],
+  "expectedPatterns": [
+    "\"id\": \"eval-smoke-task\"",
+    "\"latestRun\": \"run_\\d+\"",
+    "\"status\": \"in_progress\""
+  ],
+  "forbiddenPatterns": [
+    "no such task"
+  ]
+}

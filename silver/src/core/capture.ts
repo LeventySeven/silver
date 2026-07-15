@@ -39,6 +39,15 @@ const MAX = 500
  *   errors   — window 'error' + 'unhandledrejection'
  *   net      — fetch + XMLHttpRequest (real method/status) + PerformanceObserver
  *              resource entries (other sub-resources; status is best-effort 200).
+ *
+ * Every `net` record carries a `source` field distinguishing AUTHORITATIVE
+ * entries (`source:'fetch'` — real fetch/XHR interception with a true method and
+ * a real observed status) from BEST-EFFORT ones (`source:'observer'` —
+ * PerformanceObserver resource timings, where method is assumed GET and status
+ * is a placeholder 200, NOT a real response code). Consumers must scope
+ * status/method-fidelity operations (the `--status`/`--method` filters, HAR
+ * response headers) to `source:'fetch'` so best-effort data is never presented
+ * as authoritative — see `isAuthoritativeNetEntry`.
  */
 export const INSTALLER = `(function(){
   if (window.__silverCap) return;
@@ -73,14 +82,14 @@ export const INSTALLER = `(function(){
       var url = '', method = 'GET';
       try { url = (typeof input === 'string') ? input : (input && input.url) || ''; } catch(e){}
       try { method = (init && init.method) || (input && input.method) || 'GET'; } catch(e){}
-      var rec = { url: String(url), method: String(method).toUpperCase(), status: 0, resourceType: 'fetch', ts: Date.now() };
+      var rec = { url: String(url), method: String(method).toUpperCase(), status: 0, resourceType: 'fetch', source: 'fetch', ts: Date.now() };
       cap(C.net, rec);
       return of.apply(this, arguments).then(function(res){ try { rec.status = res.status; } catch(e){} return res; }, function(err){ rec.status = -1; throw err; });
     };
   }
   try {
     var oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function(m, u){ try { this.__silver = { url: String(u), method: String(m||'GET').toUpperCase(), status: 0, resourceType: 'xhr', ts: Date.now() }; } catch(e){} return oo.apply(this, arguments); };
+    XMLHttpRequest.prototype.open = function(m, u){ try { this.__silver = { url: String(u), method: String(m||'GET').toUpperCase(), status: 0, resourceType: 'xhr', source: 'fetch', ts: Date.now() }; } catch(e){} return oo.apply(this, arguments); };
     XMLHttpRequest.prototype.send = function(){ var self=this, rec=this.__silver; if (rec){ cap(C.net, rec); try { this.addEventListener('loadend', function(){ try { rec.status = self.status; } catch(e){} }); } catch(e){} } return os.apply(this, arguments); };
   } catch(e){}
   try {
@@ -88,7 +97,7 @@ export const INSTALLER = `(function(){
       list.getEntries().forEach(function(e){
         var it = e.initiatorType || 'other';
         if (it === 'fetch' || it === 'xmlhttprequest') return;
-        cap(C.net, { url: e.name, method: 'GET', status: 200, resourceType: it, ts: Date.now() });
+        cap(C.net, { url: e.name, method: 'GET', status: 200, resourceType: it, source: 'observer', ts: Date.now() });
       });
     });
     po.observe({ type: 'resource', buffered: true });
@@ -96,6 +105,21 @@ export const INSTALLER = `(function(){
 })()`
 
 export type CaptureChannel = 'console' | 'errors' | 'net'
+
+/**
+ * A `net` entry is AUTHORITATIVE iff it came from real fetch/XHR interception
+ * (`source:'fetch'`), which observes a true request method and a real response
+ * status. PerformanceObserver entries (`source:'observer'`) are best-effort:
+ * their method is assumed `GET` and their status is a placeholder `200`, so
+ * status/method-fidelity operations (`--status`/`--method` filters, HAR response
+ * headers) must exclude them rather than present that data as real.
+ *
+ * Legacy entries captured before the `source` field existed have no `source`;
+ * they are treated as authoritative (they predate the observer channel merge).
+ */
+export function isAuthoritativeNetEntry(e: Record<string, unknown>): boolean {
+  return e.source !== 'observer'
+}
 
 export type CaptureMeta = {
   /** True between `network har start` and `network har stop`. */
@@ -280,7 +304,20 @@ export async function stopHar(session: string): Promise<void> {
   await saveCaptureMeta(session, next)
 }
 
-/** Build a minimal, valid HAR 1.2 log from captured network records. */
+/**
+ * Build a minimal, valid HAR 1.2 log from captured network records.
+ *
+ * AUTHORITATIVE entries (real fetch/XHR) carry their observed method and status.
+ * BEST-EFFORT entries (`source:'observer'`, from PerformanceObserver) do NOT
+ * carry a real response status — their placeholder `200` is not a real code — so
+ * their HAR response status is emitted as `0` (unknown) and both the entry and
+ * its response are tagged with a `comment` marking them best-effort. This keeps
+ * the HAR honest: a consumer never reads an observer entry's status/headers as
+ * an authoritative response.
+ */
+const OBSERVER_HAR_COMMENT =
+  'best-effort: PerformanceObserver resource timing; method assumed GET, response status/headers not observed'
+
 export function buildHar(entries: Array<Record<string, unknown>>): unknown {
   return {
     log: {
@@ -288,7 +325,9 @@ export function buildHar(entries: Array<Record<string, unknown>>): unknown {
       creator: { name: 'silver', version: '0.1.0' },
       entries: entries.map((e) => {
         const ts = typeof e.ts === 'number' ? e.ts : Date.now()
-        return {
+        const authoritative = isAuthoritativeNetEntry(e)
+        const responseStatus = authoritative ? (typeof e.status === 'number' ? e.status : 0) : 0
+        const entry: Record<string, unknown> = {
           startedDateTime: new Date(ts).toISOString(),
           time: 0,
           request: {
@@ -302,7 +341,7 @@ export function buildHar(entries: Array<Record<string, unknown>>): unknown {
             bodySize: -1,
           },
           response: {
-            status: typeof e.status === 'number' ? e.status : 0,
+            status: responseStatus,
             statusText: '',
             httpVersion: 'HTTP/1.1',
             headers: [],
@@ -311,11 +350,15 @@ export function buildHar(entries: Array<Record<string, unknown>>): unknown {
             redirectURL: '',
             headersSize: -1,
             bodySize: -1,
+            ...(authoritative ? {} : { comment: OBSERVER_HAR_COMMENT }),
           },
           _resourceType: String(e.resourceType ?? 'other'),
+          _source: authoritative ? 'fetch' : 'observer',
           cache: {},
           timings: { send: 0, wait: 0, receive: 0 },
         }
+        if (!authoritative) entry.comment = OBSERVER_HAR_COMMENT
+        return entry
       }),
     },
   }

@@ -34,10 +34,22 @@ import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
 import { ok, fail, type Envelope } from '../core/envelope.js'
 import type { ParsedFlags } from '../core/flags.js'
+import { withSessionLock } from '../core/lock.js'
 import { nsRoot, sanitizeSegment } from '../core/nsdirs.js'
 import { neutralize, capOutput } from '../security/injection.js'
 
 export const SUBAGENTS_SUB = 'subagents'
+
+/**
+ * Reserved session name whose advisory lock (core/lock.ts `withSessionLock`)
+ * serializes the spawn read-check-write PER NAMESPACE. The lock file lives under
+ * that namespace's own `sessions/.subagents-lock/` dir, so spawns in different
+ * namespaces never block each other while same-namespace spawns run one-at-a-
+ * time — the only way the CAP + id-mint + session-clash checks can be atomic.
+ * The leading dot keeps it out of `session list` (no `session.json` sidecar) and
+ * away from any real user-chosen `--session` name.
+ */
+const SPAWN_LOCK_NAME = '.subagents-lock'
 
 /** Aside's default: at most 5 concurrent children under one parent/namespace. */
 export const CONCURRENCY_CAP = 5
@@ -110,14 +122,15 @@ async function allRecords(): Promise<SubRecord[]> {
   return out
 }
 
-/** Next free `sa<N>` id (scans existing records so ids never collide). */
-function nextId(records: SubRecord[]): string {
+/** Highest `sa<N>` in use + 1 (scans existing records so ids never collide). The
+ * numeric form lets the atomic-mint loop bump past an id already on disk. */
+function nextIdNum(records: SubRecord[]): number {
   let max = 0
   for (const r of records) {
     const m = /^sa(\d+)$/.exec(r.id)
     if (m) max = Math.max(max, Number.parseInt(m[1], 10))
   }
-  return `sa${max + 1}`
+  return max + 1
 }
 
 export async function handleSubagent(flags: ParsedFlags): Promise<Envelope<unknown>> {
@@ -154,74 +167,103 @@ async function subagentSpawn(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const prompt = capOutput(flags.args.slice(1).join(' ').trim(), MAX_PROMPT)
   if (!prompt) return badRequest('usage: silver subagent spawn <prompt> [--session c] [--tab] [--background]')
 
-  const records = await allRecords()
-
-  // CONCURRENCY CAP: count RUNNING children; refuse the 6th.
-  const running = records.filter((r) => r.status === 'running')
-  if (running.length >= CONCURRENCY_CAP) {
-    return badRequest(`too many active subagents (limit ${CONCURRENCY_CAP}); wait for one to finish`)
-  }
-
-  const id = nextId(records)
   const tab = flags.tab === true
-
   // Child session name: explicit --session (non-default) wins; else the child id.
   const explicit = flags.session && flags.session !== 'default' ? flags.session : null
-  const childSession = tab ? flags.session : (explicit ?? id)
-  const validSession = sanitizeSegment(childSession)
-  if (!validSession) return badRequest('invalid --session name for the child')
-
-  // OWN CONTEXT PER AGENT: an isolated (non-tab) child must not share a session
-  // with another RUNNING child — that would share live page/form state.
-  if (!tab) {
-    const clash = running.some((r) => !r.tab && r.session === validSession)
-    if (clash) {
-      return badRequest('that session is already owned by a running subagent; each isolated child needs its own browser')
-    }
-  }
-
   // Grant model: children default READ-ONLY; --confirm-actions <verbs> is the
   // tool-gated allowlist of actor verbs the child may use.
   const allow = flags.confirmActionsProvided ? [...flags.confirmActions] : []
   const readOnly = allow.length === 0
 
-  const now = new Date().toISOString()
-  const rec: SubRecord = {
-    id,
-    description: flags.name ?? null,
-    prompt,
-    session: validSession,
-    tab,
-    status: 'running',
-    readOnly,
-    allow,
-    background: flags.background === true,
-    depth: 1,
-    createdAt: now,
-    updatedAt: now,
-    result: null,
-  }
-  await writeRecord(rec)
+  // SERIALIZED read-check-write: hold a namespace-scoped advisory lock across the
+  // whole cap-count → id-mint → session-clash → write so concurrent same-namespace
+  // spawns cannot bypass the CAP, collide on `sa<N>` ids, or duplicate an
+  // auto-assigned session. Same-namespace spawns run one-at-a-time; different
+  // namespaces never block each other (the lock file lives in the namespace dir).
+  return withSessionLock(SPAWN_LOCK_NAME, async () => {
+    const records = await allRecords()
 
-  // The environment the HOST must set when driving this child, so the child's
-  // own `subagent spawn` is refused (one-level enforcement bites downstream).
-  const childEnv: Record<string, string> = {
-    SILVER_SUBAGENT_DEPTH: '1',
-    SILVER_SUBAGENT_ID: id,
-  }
+    // CONCURRENCY CAP: count RUNNING children; refuse the 6th.
+    const running = records.filter((r) => r.status === 'running')
+    if (running.length >= CONCURRENCY_CAP) {
+      return badRequest(`too many active subagents (limit ${CONCURRENCY_CAP}); wait for one to finish`)
+    }
 
-  return ok({
-    id,
-    session: validSession,
-    tab,
-    background: rec.background,
-    readOnly,
-    allow,
-    childEnv,
-    description: rec.description,
-    hint: tab
-      ? `drive this child in the shared browser: \`silver tab new --session ${validSession}\` then act on its own tab; set env ${envHint(childEnv)}; call \`silver subagent done ${id}\` when finished`
-      : `drive this child in its own browser: \`silver <cmd> --session ${validSession}\`${readOnly ? ' (read-only)' : ` (may act: ${allow.join(',')})`}; set env ${envHint(childEnv)}; call \`silver subagent done ${id}\` when finished`,
+    await fs.mkdir(subagentsRoot(), { recursive: true })
+
+    // Mint the id ATOMICALLY: `fs.open(…, 'wx')` create-if-absent claims the
+    // record file; on the (lock-guarded, so near-impossible) EEXIST we bump to
+    // the next `sa<N>` and retry. Belt-and-suspenders even if the lock is stolen.
+    let n = nextIdNum(records)
+    for (;;) {
+      const id = `sa${n}`
+
+      const childSession = tab ? flags.session : (explicit ?? id)
+      const validSession = sanitizeSegment(childSession)
+      if (!validSession) return badRequest('invalid --session name for the child')
+
+      // OWN CONTEXT PER AGENT: an isolated (non-tab) child must not share a
+      // session with another RUNNING child — that would share live page/form state.
+      if (!tab) {
+        const clash = running.some((r) => !r.tab && r.session === validSession)
+        if (clash) {
+          return badRequest('that session is already owned by a running subagent; each isolated child needs its own browser')
+        }
+      }
+
+      const now = new Date().toISOString()
+      const rec: SubRecord = {
+        id,
+        description: flags.name ?? null,
+        prompt,
+        session: validSession,
+        tab,
+        status: 'running',
+        readOnly,
+        allow,
+        background: flags.background === true,
+        depth: 1,
+        createdAt: now,
+        updatedAt: now,
+        result: null,
+      }
+
+      try {
+        const fh = await fs.open(recordPath(id), 'wx')
+        try {
+          await fh.writeFile(JSON.stringify(rec, null, 2), 'utf8')
+        } finally {
+          await fh.close()
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+          n++
+          continue
+        }
+        throw err
+      }
+
+      // The environment the HOST must set when driving this child, so the child's
+      // own `subagent spawn` is refused (one-level enforcement bites downstream).
+      const childEnv: Record<string, string> = {
+        SILVER_SUBAGENT_DEPTH: '1',
+        SILVER_SUBAGENT_ID: id,
+      }
+
+      return ok({
+        id,
+        session: validSession,
+        tab,
+        background: rec.background,
+        readOnly,
+        allow,
+        childEnv,
+        description: rec.description,
+        hint: tab
+          ? `drive this child in the shared browser: \`silver tab new --session ${validSession}\` then act on its own tab; set env ${envHint(childEnv)}; call \`silver subagent done ${id}\` when finished`
+          : `drive this child in its own browser: \`silver <cmd> --session ${validSession}\`${readOnly ? ' (read-only)' : ` (may act: ${allow.join(',')})`}; set env ${envHint(childEnv)}; call \`silver subagent done ${id}\` when finished`,
+      })
+    }
   })
 }
 
