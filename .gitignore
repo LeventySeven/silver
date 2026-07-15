@@ -11,3 +11,5 @@ profiles/
 test-results/
 playwright-report/
 .browser-cache/
+
+reference/
