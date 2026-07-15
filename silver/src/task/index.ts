@@ -40,7 +40,14 @@ import {
   taskExists,
   runDirPath,
   bound,
+  refreshManifest,
+  saveReplayCache,
+  loadReplayCache,
+  decideReplay,
+  REPLAY_CACHE_FILE,
   type Checkpoint,
+  type ReplayStep,
+  type ReplayCache,
 } from './store.js'
 
 /** A clean, non-leaking bad-request envelope (static message only). */
@@ -78,8 +85,12 @@ export async function handleTask(flags: ParsedFlags): Promise<Envelope<unknown>>
       return taskExec(flags)
     case 'compile':
       return taskCompile(flags)
+    case 'replay':
+      return taskReplay(flags)
     default:
-      return badRequest('usage: silver task start|log|checkpoint|status|list|resume|exec|compile')
+      return badRequest(
+        'usage: silver task start|log|checkpoint|status|list|resume|exec|compile|replay',
+      )
   }
 }
 
@@ -114,6 +125,7 @@ async function taskLog(flags: ParsedFlags): Promise<Envelope<unknown>> {
   if (!rawEvent) return badRequest('usage: silver task log <id> <event-json>')
   const event = safeJson(rawEvent) ?? { text: bound(rawEvent) }
   await appendLog(id, n, event)
+  await refreshManifest(id, n)
   const count = (await readLog(id, n)).length
   return ok({ id, run: `run_${n}`, logged: true, entries: count })
 }
@@ -152,6 +164,7 @@ async function taskCheckpoint(flags: ParsedFlags): Promise<Envelope<unknown>> {
     note: flags.note ?? null,
     screenshot: screenshot ?? null,
   })
+  await refreshManifest(id, n)
 
   return ok({
     id,
@@ -170,6 +183,9 @@ async function taskStatus(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const cp = n > 0 ? await loadCheckpoint(id, n) : null
   const plan = n > 0 ? parsePlan(await readPlan(id, n)) : { total: 0, checked: 0, open: [] }
   const log = n > 0 ? await readLog(id, n) : []
+  // The T2 manifest is the machine-readable index; surface it (and refresh it so
+  // `status` never reports a stale count) for list/status/resume + tooling.
+  const manifest = n > 0 ? await refreshManifest(id, n) : null
   return ok({
     id,
     runs: (await listRuns(id)).map((r) => `run_${r}`),
@@ -177,6 +193,8 @@ async function taskStatus(flags: ParsedFlags): Promise<Envelope<unknown>> {
     status: cp?.status ?? 'unknown',
     plan: { total: plan.total, checked: plan.checked, remaining: plan.total - plan.checked },
     logEntries: log.length,
+    verbCount: manifest?.verbCount ?? 0,
+    manifest,
     updatedAt: cp?.updatedAt ?? null,
   })
 }
@@ -249,12 +267,23 @@ async function taskExec(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const { run } = await import('../cli.js')
   const res = await run(argv)
 
+  // Capture the resolved ref + DOM fingerprint the inner verb reported (when
+  // present) so `task compile` can auto-name variables (T1) and the replay cache
+  // (T3) can key each step by its DOM-hash — all from data Silver already holds,
+  // no extra work, no model.
+  const innerData =
+    res.env.success && res.env.data !== null && typeof res.env.data === 'object'
+      ? (res.env.data as Record<string, unknown>)
+      : {}
+  const hint = execHint(innerData)
   await appendLog(id, n, {
     kind: 'exec',
     command: inner,
     success: res.env.success,
+    ...hint,
     ...(res.env.success ? {} : { error: res.env.error }),
   })
+  await refreshManifest(id, n)
 
   // Return the inner envelope verbatim so the host sees exactly what the command
   // produced, plus a marker that it was recorded to the task artifact.
@@ -288,57 +317,216 @@ async function taskCompile(flags: ParsedFlags): Promise<Envelope<unknown>> {
   if (n === 0) return badRequest('this task has no run yet; run `task start` first')
 
   const log = await readLog(id, n)
-  const commands = extractCommands(log)
-  const { script, parameters } = renderScript(id, n, commands)
+  const events = collectVerbEvents(log)
+  const { script, parameters } = renderScript(id, n, events)
 
   const scriptName = 'compiled.sh'
   const out = path.join(runDirPath(id, n), scriptName)
   await fs.mkdir(path.dirname(out), { recursive: true })
   await fs.writeFile(out, script, { encoding: 'utf8', mode: 0o755 })
 
-  await appendLog(id, n, { kind: 'compile', script: scriptName, commands: commands.length })
+  // Build + persist the T3 verb-sequence DOM-hash replay cache alongside the
+  // script so a later `task replay` can reuse known-good refs deterministically.
+  const cache = buildReplayCache(id, n, events)
+  await saveReplayCache(id, n, cache)
+  const cachePath = path.join(runDirPath(id, n), REPLAY_CACHE_FILE)
+
+  await appendLog(id, n, { kind: 'compile', script: scriptName, commands: events.length })
+  // Record the compiled-script + replay-cache paths in the run manifest (T2).
+  await refreshManifest(id, n, { compiledScript: out, replayCache: cachePath })
 
   return ok({
     id,
     run: `run_${n}`,
     script: out,
     scriptName,
-    commands: commands.length,
+    replayCache: cachePath,
+    commands: events.length,
     parameters,
-    note: 're-run this script to reproduce the task verbatim; override any parameter (env var) to vary it — no LLM needed',
+    variables: parameters.filter((p) => p.detected).map((p) => ({ name: p.name, type: p.detected })),
+    note: 're-run this script to reproduce the task verbatim; override any parameter (env var) to vary it — detected variables (urls/search/email/…) are named by kind, secrets are never baked in — no LLM needed',
   })
 }
 
-/** Pull the recorded silver command invocations (exec entries) from a log. */
-function extractCommands(log: unknown[]): string[][] {
-  const out: string[][] = []
+// ---------------------------------------------------------------------------
+// T1 — variable auto-detection. A recorded verb whose value varies run-to-run
+// (a filled search term, email, url, credential) is promoted to a semantically
+// NAMED override parameter instead of an opaque positional slot. Detection is
+// keyless: (1) an explicit `var` annotation on the log event, (2) the DOM hint
+// (role/name/type/placeholder) the actuation verb reported, (3) value-shape
+// regex. Everything undetected keeps the stable positional name (back-compat).
+// ---------------------------------------------------------------------------
+
+/** A DOM hint the actuation verb reported about the element it acted on. */
+type DomHint = {
+  role?: string
+  name?: string
+  inputType?: string
+  placeholder?: string
+  id?: string
+  ariaLabel?: string
+}
+
+/** One recorded verb invocation + the metadata used to name its variables. */
+type VerbEvent = {
+  argv: string[]
+  domHash: string | null
+  ref: string | null
+  meta?: DomHint
+  /** Explicit host annotation of THE value: `{ name?, type?, secret? }`. */
+  var?: { name?: string; type?: string; secret?: boolean }
+}
+
+/** A detected variable: its semantic kind + whether it is a credential. */
+type Detection = { type: string; secret: boolean } | null
+
+/** Input verbs whose LAST non-flag positional is a run-to-run "filled value". */
+const INPUT_VERBS = new Set(['fill', 'type', 'select', 'search'])
+
+/** Pull the recorded silver verb invocations (+ hints) from a log. */
+function collectVerbEvents(log: unknown[]): VerbEvent[] {
+  const out: VerbEvent[] = []
   for (const rec of log) {
-    // appendLog wraps every event as { ts, event }. An exec event carries the
+    // appendLog wraps every event as { ts, event }. A verb event carries the
     // verbatim command token array under `command`.
-    const event = (rec as { event?: unknown })?.event
-    const cmd = (event as { command?: unknown })?.command
-    if (Array.isArray(cmd) && cmd.length > 0 && cmd.every((t) => typeof t === 'string')) {
-      out.push(cmd as string[])
+    const event = (rec as { event?: unknown })?.event as Record<string, unknown> | undefined
+    const cmd = event?.command
+    if (!Array.isArray(cmd) || cmd.length === 0 || !cmd.every((t) => typeof t === 'string')) {
+      continue
     }
+    const argv = cmd as string[]
+    const meta = isObject(event?.meta) ? (event!.meta as DomHint) : undefined
+    const varAnn = isObject(event?.var) ? (event!.var as VerbEvent['var']) : undefined
+    const domHash =
+      strOrNull(event?.domHash) ?? strOrNull(event?.fingerprint) ?? strOrNull(event?.dom_hash)
+    const ref = strOrNull(event?.ref) ?? firstRefIn(argv)
+    out.push({ argv, domHash, ref, meta, var: varAnn })
   }
   return out
 }
 
+/** Extract the ref/dom-hash hint from an inner exec envelope's data. */
+function execHint(data: Record<string, unknown>): Record<string, unknown> {
+  const hint: Record<string, unknown> = {}
+  const ref = strOrNull(data.ref)
+  if (ref) hint.ref = ref
+  // The pagechange fingerprint doubles as the step DOM-hash (may be nested).
+  const fp =
+    strOrNull(data.fingerprint) ??
+    strOrNull((isObject(data.pageChange) ? (data.pageChange as Record<string, unknown>) : {}).fingerprint)
+  if (fp) hint.domHash = fp
+  // Carry a DOM hint for variable naming when the verb reported role/name/etc.
+  const meta: DomHint = {}
+  for (const k of ['role', 'name', 'inputType', 'placeholder', 'id', 'ariaLabel'] as const) {
+    const v = strOrNull(data[k])
+    if (v) meta[k] = v
+  }
+  if (Object.keys(meta).length > 0) hint.meta = meta
+  return hint
+}
+
 /**
- * Render the parameterized shell script + the list of parameter names. Each
- * non-flag positional after the verb becomes a `${NAME:-default}` parameter;
- * flag tokens (`-x`/`--x`) are kept literal so the shape is preserved.
+ * Decide whether a filled VALUE is a run-to-run variable, and of what kind.
+ * Order: explicit annotation → DOM hint → value-shape. Returns null when the
+ * value looks like an incidental literal (keeps the stable positional slot).
+ */
+function detectVariable(value: string, meta: DomHint | undefined, ann: VerbEvent['var']): Detection {
+  if (ann && (ann.type || ann.secret)) {
+    return { type: normType(ann.type ?? (ann.secret ? 'secret' : 'value')), secret: !!ann.secret }
+  }
+  const fromMeta = detectFromHint(meta)
+  if (fromMeta) return fromMeta
+  return detectFromShape(value)
+}
+
+function detectFromHint(meta: DomHint | undefined): Detection {
+  if (!meta) return null
+  const t = (meta.inputType ?? '').toLowerCase()
+  if (t === 'password') return { type: 'password', secret: true }
+  if (t === 'email') return { type: 'email', secret: false }
+  if (t === 'tel') return { type: 'phone', secret: false }
+  if (t === 'url') return { type: 'url', secret: false }
+  if (t === 'search') return { type: 'search_term', secret: false }
+  if (t === 'date' || t === 'datetime-local' || t === 'month') return { type: 'date', secret: false }
+  if (t === 'number') return { type: 'number', secret: false }
+  if ((meta.role ?? '').toLowerCase() === 'searchbox') return { type: 'search_term', secret: false }
+  // Keyword scan over the accessible-name/placeholder/id (word-boundary-ish).
+  const hay = [meta.name, meta.placeholder, meta.id, meta.ariaLabel]
+    .filter((s): s is string => typeof s === 'string')
+    .join(' ')
+    .toLowerCase()
+  if (!hay) return null
+  if (/\b(pass\s?word|passwd|pwd)\b/.test(hay)) return { type: 'password', secret: true }
+  if (/\b(cvv|cvc|card\s?number|cc[-\s]?num)\b/.test(hay)) return { type: 'card', secret: true }
+  if (/\b(otp|2fa|one[-\s]?time|verification\s?code)\b/.test(hay)) return { type: 'otp', secret: true }
+  if (/\b(e-?mail)\b/.test(hay)) return { type: 'email', secret: false }
+  if (/\b(phone|tel|mobile)\b/.test(hay)) return { type: 'phone', secret: false }
+  if (/\b(search|query|keyword)\b/.test(hay)) return { type: 'search_term', secret: false }
+  if (/\b(address|street)\b/.test(hay)) return { type: 'address', secret: false }
+  if (/\b(city|town)\b/.test(hay)) return { type: 'city', secret: false }
+  if (/\b(zip|postal|postcode)\b/.test(hay)) return { type: 'postal_code', secret: false }
+  if (/\bdate\b/.test(hay)) return { type: 'date', secret: false }
+  return null
+}
+
+function detectFromShape(value: string): Detection {
+  const v = value.trim()
+  if (!v) return null
+  if (/^https?:\/\/\S+$/i.test(v)) return { type: 'url', secret: false }
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) return { type: 'email', secret: false }
+  if (/^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2})?$/.test(v)) return { type: 'date', secret: false }
+  if (looksLikeCard(v)) return { type: 'card', secret: true }
+  if (/^\+?[\d][\d\s().-]{6,}$/.test(v) && (v.match(/\d/g)?.length ?? 0) >= 7) {
+    return { type: 'phone', secret: false }
+  }
+  return null
+}
+
+/** Luhn check on a bare 13-19 digit run (credit-card shape → treat as secret). */
+function looksLikeCard(v: string): boolean {
+  const digits = v.replace(/[\s-]/g, '')
+  if (!/^\d{13,19}$/.test(digits)) return false
+  let sum = 0
+  let alt = false
+  for (let i = digits.length - 1; i >= 0; i--) {
+    let d = digits.charCodeAt(i) - 48
+    if (alt) {
+      d *= 2
+      if (d > 9) d -= 9
+    }
+    sum += d
+    alt = !alt
+  }
+  return sum % 10 === 0
+}
+
+function normType(t: string): string {
+  return String(t).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'value'
+}
+
+/** The compiled parameter record (default is redacted for secrets). */
+type CompiledParam = { name: string; default: string; detected?: string; secret?: boolean }
+
+/**
+ * Render the parameterized shell script + the parameter list. A detected filled
+ * value becomes a semantically named override parameter (`SEARCH_TERM`, `EMAIL`,
+ * …); a credential becomes a required-at-runtime secret whose value is NEVER
+ * baked into the script; every other non-flag positional keeps its stable
+ * `<VERB>_<cmdIndex>_<argPos>` slot. Flags stay literal (shape preserved).
  */
 function renderScript(
   id: string,
   n: number,
-  commands: string[][],
-): { script: string; parameters: Array<{ name: string; default: string }> } {
-  const parameters: Array<{ name: string; default: string }> = []
+  events: VerbEvent[],
+): { script: string; parameters: CompiledParam[] } {
+  const parameters: CompiledParam[] = []
+  const used = new Set<string>()
   const body: string[] = []
 
-  commands.forEach((cmd, ci) => {
+  events.forEach((ev, ci) => {
+    const cmd = ev.argv
     const verb = cmd[0]
+    const valuePos = INPUT_VERBS.has(verb) ? lastNonFlagIndex(cmd) : -1
     const parts: string[] = ['silver', shellQuote(verb)]
     for (let p = 1; p < cmd.length; p++) {
       const tok = cmd[p]
@@ -347,7 +535,21 @@ function renderScript(
         parts.push(shellQuote(tok))
         continue
       }
+      const detection = p === valuePos ? detectVariable(tok, ev.meta, ev.var) : null
+      if (detection) {
+        const base = ev.var?.name ? normType(ev.var.name).toUpperCase() : detection.type.toUpperCase()
+        const name = uniqueName(base, used)
+        parameters.push({
+          name,
+          default: detection.secret ? '<secret>' : tok,
+          detected: detection.type,
+          ...(detection.secret ? { secret: true } : {}),
+        })
+        parts.push(`"$${name}"`)
+        continue
+      }
       const name = paramName(verb, ci + 1, p)
+      used.add(name)
       parameters.push({ name, default: tok })
       parts.push(`"$${name}"`)
     }
@@ -359,10 +561,12 @@ function renderScript(
     `# Compiled from silver task "${sanitizeComment(id)}" run_${n}.`,
     '# Silver is keyless: this script calls `silver` verbatim by default. Each',
     '# literal below is an override-able parameter — set the env var to vary it.',
+    '# Auto-detected variables (urls/search/email/…) are named by kind; secrets are',
+    '# NOT baked in — export the env var at runtime to supply them.',
     'set -euo pipefail',
     '',
     '# Parameters',
-    ...parameters.map((par) => `${par.name}="\${${par.name}:-${shellEscapeDefault(par.default)}}"`),
+    ...parameters.map(paramLine),
     '',
   ]
 
@@ -370,10 +574,147 @@ function renderScript(
   return { script, parameters }
 }
 
+/** One `# Parameters` line. Secrets are required-at-runtime (no baked value). */
+function paramLine(par: CompiledParam): string {
+  if (par.secret) {
+    return `${par.name}="\${${par.name}:?set ${par.name} (secret; not stored in this script)}"`
+  }
+  const suffix = par.detected ? `  # ${par.detected} (auto-detected)` : ''
+  return `${par.name}="\${${par.name}:-${shellEscapeDefault(par.default)}}"${suffix}`
+}
+
+/** The index of the last non-flag positional in a command, or -1. */
+function lastNonFlagIndex(cmd: string[]): number {
+  for (let p = cmd.length - 1; p >= 1; p--) {
+    if (!cmd[p].startsWith('-')) return p
+  }
+  return -1
+}
+
+/** Ensure a shell-valid, unique parameter name (dedupe with a counter). */
+function uniqueName(base: string, used: Set<string>): string {
+  const clean = base.replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'VALUE'
+  if (!used.has(clean)) {
+    used.add(clean)
+    return clean
+  }
+  let i = 2
+  while (used.has(`${clean}_${i}`)) i++
+  const name = `${clean}_${i}`
+  used.add(name)
+  return name
+}
+
 /** A unique, shell-valid parameter name: `<VERB>_<cmdIndex>_<argPos>`. */
 function paramName(verb: string, cmdIndex: number, argPos: number): string {
   const v = String(verb).toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'ARG'
   return `${v}_${cmdIndex}_${argPos}`
+}
+
+// ---------------------------------------------------------------------------
+// T3 — verb-sequence DOM-hash replay cache + `task replay`.
+// ---------------------------------------------------------------------------
+
+/** Build the replay cache from the recorded verb sequence (keyless). */
+function buildReplayCache(id: string, n: number, events: VerbEvent[]): ReplayCache {
+  const steps: ReplayStep[] = events.map((ev, i) => ({
+    index: i,
+    verb: ev.argv[0],
+    argv: ev.argv,
+    ref: ev.ref,
+    domHash: ev.domHash,
+  }))
+  return { task: id, run: `run_${n}`, builtAt: new Date().toISOString(), steps }
+}
+
+/**
+ * `task replay <id> [<current-dom-hash>]` — the deterministic replay planner.
+ *
+ * Loads (or builds) the verb-sequence DOM-hash cache and, given the DOM hash the
+ * host observes NOW, decides per step whether the recorded ref is known-good and
+ * can be dispatched WITHOUT a host round-trip (hash match), or the host must
+ * self-heal with a fresh snapshot (hash mismatch / no recorded hash). With
+ * `--enable-actions` it also dispatches the reusable steps in order, stopping at
+ * the first step that needs a fresh snapshot so the host can re-resolve. KEYLESS.
+ */
+async function taskReplay(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const id = idAt(flags, 1)
+  if (!id) return badRequest('usage: silver task replay <id> [<current-dom-hash>]')
+  if (!(await taskExists(id))) return badRequest('no such task; run `task start` first')
+  const n = await latestRun(id)
+  if (n === 0) return badRequest('this task has no run yet; run `task start` first')
+
+  // Use the persisted cache, else build it on the fly from the log (and persist).
+  let cache = await loadReplayCache(id, n)
+  if (!cache) {
+    cache = buildReplayCache(id, n, collectVerbEvents(await readLog(id, n)))
+    await saveReplayCache(id, n, cache)
+  }
+
+  // The current DOM hash is a plain positional (the flag parser owns no
+  // `--dom-hash`); the host passes the fingerprint from its latest snapshot.
+  const currentDomHash = flags.args[2] ?? null
+
+  const dispatch = flags.enableActions
+  let dispatchedAll = true
+  const steps = []
+  for (const step of cache.steps) {
+    const decision = decideReplay(step, currentDomHash)
+    let dispatched = false
+    if (dispatch && decision.reuse && dispatchedAll) {
+      // Reuse: dispatch the recorded verb directly with the known-good ref — no
+      // re-snapshot, no re-resolution. Logged like `exec` for the audit trail.
+      const argv = buildInnerArgv(step.argv, flags)
+      const { run } = await import('../cli.js')
+      const res = await run(argv)
+      await appendLog(id, n, { kind: 'replay', command: step.argv, success: res.env.success })
+      dispatched = true
+    } else if (dispatch && !decision.reuse) {
+      // First step that can't be reused halts live dispatch: the host must take a
+      // fresh snapshot and self-heal from here (later steps' hashes are stale too).
+      dispatchedAll = false
+    }
+    steps.push({
+      index: step.index,
+      verb: step.verb,
+      ref: decision.ref,
+      reuse: decision.reuse,
+      reason: decision.reason,
+      dispatched,
+    })
+  }
+  if (dispatch) await refreshManifest(id, n)
+
+  const reused = steps.filter((s) => s.reuse).length
+  return ok({
+    id,
+    run: `run_${n}`,
+    domHash: currentDomHash,
+    total: steps.length,
+    reused,
+    fallback: steps.length - reused,
+    dispatched: dispatch,
+    steps,
+    note: dispatch
+      ? 'reusable steps (matching DOM-hash) were dispatched with their known-good refs; take a fresh snapshot and re-resolve from the first fallback step'
+      : 'planner only: pass --enable-actions to dispatch the reusable steps; a matching DOM-hash means the recorded ref is known-good (no host round-trip), a mismatch means self-heal with a fresh snapshot',
+  })
+}
+
+/** First silver ref (`eN`/`@eN`) among a command's tokens, or null. */
+function firstRefIn(argv: string[]): string | null {
+  for (let i = 1; i < argv.length; i++) {
+    if (/^@?e\d+$/.test(argv[i])) return argv[i]
+  }
+  return null
+}
+
+function isObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
+function strOrNull(v: unknown): string | null {
+  return typeof v === 'string' && v.length > 0 ? v : null
 }
 
 /** Escape a value for use inside a `"${VAR:-<here>}"` default (double-quote ctx). */

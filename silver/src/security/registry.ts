@@ -28,6 +28,11 @@ const READ_ONLY_VERBS: readonly string[] = [
   'get',
   'is',
   'wait',
+  // AC1: `expect <ref|selector> <matcher> [value]` — a deterministic, READ-ONLY
+  // assertion verb ("did it actually work?"). It only READS page/element state
+  // (visibility, enabled, checked, text, value, count, url, title) and never
+  // mutates, so it lives in the read-only set (no --enable-actions needed).
+  'expect',
   'screenshot',
   'open',
   'goto',
@@ -51,6 +56,14 @@ const READ_ONLY_VERBS: readonly string[] = [
   'skill',
   'doctor',
   'version',
+  // S4: the decoupled two-phase confirm gate. `confirm <id>` / `deny <id>`
+  // resolve a PENDING paid/destructive action that was gated with
+  // `--two-phase-confirm`. They are operator-supplied session ops (not
+  // page-injected), so they are read-only-dispatchable at the VERB level;
+  // `confirm` re-runs the actual actor verb and therefore checks
+  // `--enable-actions` INSIDE its handler (mirrors `wait --fn` / `task exec`).
+  'confirm',
+  'deny',
   // Long-task artifact / grep-first memory / subagent orchestration layers.
   // Read-only-dispatchable at the VERB level so `task list|status|resume`,
   // `memory add|search|list`, and `subagent wait|list|status` never require an

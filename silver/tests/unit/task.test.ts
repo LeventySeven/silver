@@ -188,4 +188,184 @@ describe('silver task — Webwright keyless run-folder artifact', () => {
     expect(bad.env.success).toBe(false)
     expect(bad.env.error).not.toContain('escape') // no-leak: the id is never echoed
   })
+
+  // -------------------------------------------------------------------------
+  // T1 — variable auto-detection in `task compile`.
+  // -------------------------------------------------------------------------
+  it('T1: a filled search term compiles to a script with a named --flag for it', async () => {
+    await run(['task', 'start', 'search a shop', '--id', 'vt', '--namespace', NS])
+    // A fill whose DOM hint (role:searchbox) marks the value as a search term.
+    await run([
+      'task',
+      'log',
+      'vt',
+      JSON.stringify({
+        kind: 'exec',
+        command: ['fill', 'e3', 'wireless headphones'],
+        meta: { role: 'searchbox', name: 'Search products' },
+      }),
+      '--namespace',
+      NS,
+    ])
+
+    const compiled = await run(['task', 'compile', 'vt', '--namespace', NS])
+    expect(compiled.env.success).toBe(true)
+    const c = data<{
+      script: string
+      parameters: Array<{ name: string; default: string; detected?: string; secret?: boolean }>
+      variables: Array<{ name: string; type: string }>
+    }>(compiled)
+
+    // The search term is promoted to a semantically NAMED parameter, not an
+    // opaque positional slot — its default reproduces the run.
+    const term = c.parameters.find((p) => p.default === 'wireless headphones')
+    expect(term).toBeDefined()
+    expect(term?.name).toBe('SEARCH_TERM')
+    expect(term?.detected).toBe('search_term')
+    expect(c.variables.some((v) => v.type === 'search_term')).toBe(true)
+
+    const sh = await fs.readFile(c.script, 'utf8')
+    expect(sh).toContain('# Parameters')
+    expect(sh).toContain('SEARCH_TERM="${SEARCH_TERM:-wireless headphones}"')
+    expect(sh).toMatch(/silver 'fill' "\$FILL_\d+_1" "\$SEARCH_TERM"/)
+  })
+
+  it('T1: value-shape detection names an email/url and never bakes a credential', async () => {
+    await run(['task', 'start', 'sign up', '--id', 'vt2', '--namespace', NS])
+    // Email by value-shape (no hint), password flagged secret by DOM hint.
+    await run([
+      'task',
+      'log',
+      'vt2',
+      JSON.stringify({ kind: 'exec', command: ['fill', 'e1', 'ops@skale.solutions'] }),
+      '--namespace',
+      NS,
+    ])
+    await run([
+      'task',
+      'log',
+      'vt2',
+      JSON.stringify({
+        kind: 'exec',
+        command: ['fill', 'e2', 'hunter2secret'],
+        meta: { inputType: 'password', name: 'Password' },
+      }),
+      '--namespace',
+      NS,
+    ])
+
+    const compiled = await run(['task', 'compile', 'vt2', '--namespace', NS])
+    const c = data<{
+      script: string
+      parameters: Array<{ name: string; default: string; detected?: string; secret?: boolean }>
+    }>(compiled)
+
+    const email = c.parameters.find((p) => p.detected === 'email')
+    expect(email?.name).toBe('EMAIL')
+    expect(email?.default).toBe('ops@skale.solutions')
+
+    // The credential is marked secret, its value REDACTED from the parameters,
+    // and required-at-runtime (never baked) in the emitted script.
+    const secret = c.parameters.find((p) => p.secret)
+    expect(secret).toBeDefined()
+    expect(secret?.default).toBe('<secret>')
+    const sh = await fs.readFile(c.script, 'utf8')
+    expect(sh).not.toContain('hunter2secret')
+    expect(sh).toContain(`${secret?.name}="\${${secret?.name}:?`)
+  })
+
+  // -------------------------------------------------------------------------
+  // T2 — run manifest.
+  // -------------------------------------------------------------------------
+  it('T2: a run produces a manifest.json with the expected fields', async () => {
+    await run(['task', 'start', 'index me', '--id', 'mf', '--namespace', NS])
+    const manifestPath = path.join(nsTasks(), 'mf', 'run_1', 'manifest.json')
+    expect(existsSync(manifestPath)).toBe(true)
+    const m = JSON.parse(await fs.readFile(manifestPath, 'utf8'))
+    expect(m.taskId).toBe('mf')
+    expect(m.run).toBe('run_1')
+    expect(m.goal).toBe('index me')
+    expect(typeof m.silverVersion).toBe('string')
+    expect(m.silverVersion.length).toBeGreaterThan(0)
+    expect(typeof m.startedAt).toBe('string')
+    expect(m).toHaveProperty('endedAt')
+    expect(m.verbCount).toBe(0)
+    expect(m.outcome).toBe('in_progress')
+    expect(Array.isArray(m.checkpoints)).toBe(true)
+    expect(m).toHaveProperty('compiledScript')
+
+    // Logging a verb bumps the manifest verb count; compile records the script.
+    await run([
+      'task',
+      'log',
+      'mf',
+      JSON.stringify({ kind: 'exec', command: ['open', 'https://example.com'] }),
+      '--namespace',
+      NS,
+    ])
+    const compiled = await run(['task', 'compile', 'mf', '--namespace', NS])
+    const cscript = data<{ script: string; replayCache: string }>(compiled).script
+    const m2 = JSON.parse(await fs.readFile(manifestPath, 'utf8'))
+    expect(m2.verbCount).toBe(1)
+    expect(m2.compiledScript).toBe(cscript)
+    expect(typeof m2.replayCache).toBe('string')
+
+    // status surfaces the manifest for tooling.
+    const status = await run(['task', 'status', 'mf', '--namespace', NS])
+    const s = data<{ manifest: { taskId: string; verbCount: number } }>(status)
+    expect(s.manifest.taskId).toBe('mf')
+    expect(s.manifest.verbCount).toBe(1)
+  })
+
+  // -------------------------------------------------------------------------
+  // T3 — verb-sequence DOM-hash replay cache.
+  // -------------------------------------------------------------------------
+  it('T3: matching DOM-hash reuses the cached step; a mismatch triggers fallback', async () => {
+    await run(['task', 'start', 'replay me', '--id', 'rp', '--namespace', NS])
+    // Two recorded verbs, each carrying its own DOM-hash + resolved ref.
+    await run([
+      'task',
+      'log',
+      'rp',
+      JSON.stringify({ kind: 'exec', command: ['click', 'e5'], ref: 'e5', domHash: 'HASH_A' }),
+      '--namespace',
+      NS,
+    ])
+    await run([
+      'task',
+      'log',
+      'rp',
+      JSON.stringify({ kind: 'exec', command: ['click', 'e9'], ref: 'e9', domHash: 'HASH_B' }),
+      '--namespace',
+      NS,
+    ])
+
+    // Build the cache (compile persists replay_cache.json alongside the script).
+    await run(['task', 'compile', 'rp', '--namespace', NS])
+    expect(existsSync(path.join(nsTasks(), 'rp', 'run_1', 'replay_cache.json'))).toBe(true)
+
+    // Replay with the current DOM-hash = HASH_A: step 0 is a known-good reuse,
+    // step 1 (HASH_B) mismatches and must fall back to a fresh snapshot.
+    const replayed = await run(['task', 'replay', 'rp', 'HASH_A', '--namespace', NS])
+    expect(replayed.env.success).toBe(true)
+    const r = data<{
+      total: number
+      reused: number
+      fallback: number
+      steps: Array<{ index: number; ref: string | null; reuse: boolean; reason: string }>
+    }>(replayed)
+    expect(r.total).toBe(2)
+    expect(r.reused).toBe(1)
+    expect(r.fallback).toBe(1)
+
+    const hit = r.steps[0]
+    expect(hit.reuse).toBe(true)
+    expect(hit.ref).toBe('e5') // known-good ref reused with NO host round-trip
+    expect(hit.reason).toBe('dom_hash_match')
+
+    const miss = r.steps[1]
+    expect(miss.reuse).toBe(false)
+    expect(miss.ref).toBeNull()
+    expect(miss.reason).toBe('dom_hash_mismatch')
+  })
 })

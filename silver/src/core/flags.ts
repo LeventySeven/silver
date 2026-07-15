@@ -33,6 +33,9 @@ export type ParsedFlags = {
   headed: boolean
   allowedDomains: string[]
   allowFileAccess: boolean
+  /** E2: launch an owned session against an EXISTING user-data-dir (the user's
+   * real logged-in Chrome profile) instead of a throwaway per-session dir. */
+  profile?: string
   maxOutput?: number
   /** ON by default; `--no-content-boundaries` disables. */
   contentBoundaries: boolean
@@ -40,6 +43,15 @@ export type ParsedFlags = {
   confirmActions: string[]
   /** True iff `--confirm-actions` was supplied (engages the confirm gate). */
   confirmActionsProvided: boolean
+  /**
+   * `--two-phase-confirm` (S4): opt into the decoupled confirm/deny protocol.
+   * When set, a paid/destructive action that would otherwise hard-deny with
+   * `confirm_required` on a non-TTY session instead returns
+   * `status:"requires_confirmation"` + a `confirmation_id`; a follow-up
+   * `silver confirm <id>` proceeds (or `silver deny <id>` aborts). OFF by
+   * default so the existing fail-closed hard-deny behavior is unchanged.
+   */
+  twoPhaseConfirm: boolean
   timeout?: number
   state?: string
   incognito: boolean
@@ -166,6 +178,8 @@ const VALUE_FLAGS: Record<string, keyof ParsedFlags> = {
   note: 'note',
   // H1: browser engine to launch for an owned session.
   engine: 'engine',
+  // E2: existing user-data-dir (real Chrome profile) to launch against.
+  profile: 'profile',
   // network / storage verb sub-flags.
   filter: 'filter',
   type: 'type',
@@ -207,6 +221,8 @@ const BOOL_FLAGS: Record<string, keyof ParsedFlags> = {
   bail: 'bail',
   // E4: opt-in permission auto-grant on connect (geolocation/clipboard/…).
   'grant-permissions': 'grantPermissions',
+  // S4: opt into the decoupled confirm/deny two-phase gate.
+  'two-phase-confirm': 'twoPhaseConfirm',
   // NOTE: `--wait` is handled explicitly in the parse loop (it is dual-purpose:
   // a bare boolean for `download --wait`, and `--wait networkidle` for the
   // mutating-verb full-settle opt-in), so it is intentionally NOT listed here.
@@ -246,6 +262,7 @@ function defaults(): ParsedFlags {
     enableActions: false,
     confirmActions: [],
     confirmActionsProvided: false,
+    twoPhaseConfirm: false,
     incognito: false,
     noEncryptState: false,
     compact: false,

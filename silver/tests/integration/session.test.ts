@@ -1,5 +1,10 @@
 import { describe, it, expect, afterAll } from 'vitest'
 import { existsSync } from 'node:fs'
+import { promises as fs } from 'node:fs'
+import * as os from 'node:os'
+import * as path from 'node:path'
+import { createServer, type Server } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import {
   openSession,
   connect,
@@ -7,11 +12,14 @@ import {
   saveRefMap,
   loadRefMap,
   sessionDir,
+  setFetchEgressPolicy,
 } from '../../src/core/session.js'
 import type { RefMap } from '../../src/perception/refmap.js'
 
 // Unique per run so parallel/retry invocations never collide.
 const NAME = `silver-it-${process.pid}-${Date.now()}`
+
+const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
 describe('session lifecycle (real Chromium, detached, CDP reconnect)', () => {
   afterAll(async () => {
@@ -74,6 +82,136 @@ describe('session lifecycle (real Chromium, detached, CDP reconnect)', () => {
       // --- close: kills the detached process and removes the sidecar dir ---
       await closeSession(NAME)
       expect(existsSync(sessionDir(NAME))).toBe(false)
+    },
+  )
+})
+
+// ---------------------------------------------------------------------------
+// S2: CDP Fetch-layer subresource egress guard — closes the exfil hole where a
+// page on an allowed domain beacons to any host via fetch()/<img>/XHR.
+// ---------------------------------------------------------------------------
+describe('S2: CDP Fetch-layer subresource egress', () => {
+  const SNAME = `${NAME}-fetch`
+  let server: Server
+  let hits: Set<string>
+  let base = ''
+
+  afterAll(async () => {
+    setFetchEgressPolicy({ allowFile: false, allowedDomains: [] })
+    try {
+      await closeSession(SNAME)
+    } catch {
+      /* ignore */
+    }
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  })
+
+  it(
+    'blocks a subresource to a non-allowed host (raw-IP + allowlist) while normal subresources load',
+    async () => {
+      hits = new Set<string>()
+      server = createServer((req, res) => {
+        const url = (req.url ?? '/').split('?')[0]
+        hits.add(url)
+        if (url.startsWith('/page')) {
+          const port = (server.address() as AddressInfo).port
+          // Same-origin fetch (/allowed) must pass; a cross-origin fetch to the
+          // raw-IP host (127.0.0.1) is a would-be exfil beacon that the Fetch
+          // guard must BLOCK (raw-IP literals are denied by the egress policy).
+          res.writeHead(200, { 'content-type': 'text/html' })
+          res.end(
+            `<!doctype html><meta charset=utf8><body>hi<script>
+              fetch('/allowed').catch(()=>{});
+              fetch('http://127.0.0.1:${port}/blocked').catch(()=>{});
+            </script></body>`,
+          )
+          return
+        }
+        res.writeHead(200, { 'content-type': 'text/plain' })
+        res.end('ok')
+      })
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+      const port = (server.address() as AddressInfo).port
+      base = `http://localhost:${port}`
+
+      // Default policy: raw-IP subresources are denied, localhost http is allowed.
+      setFetchEgressPolicy({ allowFile: false, allowedDomains: [] })
+      await openSession(SNAME, { headed: false })
+      const { browser, page } = await connect(SNAME)
+      try {
+        await page.goto(`${base}/page`, { waitUntil: 'load' })
+        // Give the async subresource fetches time to fire / be intercepted.
+        for (let i = 0; i < 30 && !hits.has('/allowed'); i++) await delay(100)
+        await delay(300)
+      } finally {
+        await browser.close()
+      }
+
+      // The top-level document loaded and the same-origin subresource passed…
+      expect(hits.has('/page')).toBe(true)
+      expect(hits.has('/allowed')).toBe(true)
+      // …but the cross-origin raw-IP beacon was blocked BEFORE reaching the server.
+      expect(hits.has('/blocked')).toBe(false)
+    },
+  )
+
+  it(
+    'with --allowed-domains set, a normally-reachable subresource host is blocked',
+    async () => {
+      hits.clear()
+      // Restrict subresources to example.com — the localhost page's own
+      // same-origin fetch is now OFF-allowlist and must be blocked.
+      setFetchEgressPolicy({ allowFile: false, allowedDomains: ['example.com'] })
+      const { browser, page } = await connect(SNAME)
+      try {
+        await page.goto(`${base}/page2`, { waitUntil: 'load' })
+        await delay(600)
+      } finally {
+        await browser.close()
+      }
+      // Document navigation still loads (nav path owns navigations)…
+      expect(hits.has('/page2')).toBe(true)
+      // …but the subresource fetch to the non-allowlisted localhost host is blocked.
+      expect(hits.has('/allowed')).toBe(false)
+    },
+  )
+})
+
+// ---------------------------------------------------------------------------
+// E2: real-Chrome-profile launch — `--profile <path>` reuses an EXISTING
+// user-data-dir instead of a throwaway one (the truest keyless auth).
+// ---------------------------------------------------------------------------
+describe('E2: --profile launches against an existing user-data-dir', () => {
+  const PNAME = `${NAME}-profile`
+  let profileDir = ''
+
+  afterAll(async () => {
+    try {
+      await closeSession(PNAME)
+    } catch {
+      /* ignore */
+    }
+    if (profileDir) await fs.rm(profileDir, { recursive: true, force: true }).catch(() => {})
+  })
+
+  it(
+    'reuses the provided profile dir (records it + populates it, never a throwaway)',
+    async () => {
+      profileDir = await fs.mkdtemp(path.join(os.tmpdir(), 'silver-profile-'))
+      // A marker the launch must leave untouched (proves reuse, not recreate).
+      await fs.writeFile(path.join(profileDir, 'MARKER'), 'keep')
+
+      const info = await openSession(PNAME, { headed: false, profile: profileDir })
+      // The session records the passed profile as its user-data-dir…
+      expect(info.userDataDir).toBe(profileDir)
+      // …and Chromium actually launched against it (wrote its profile there),
+      // NOT into a throwaway `<sessionDir>/profile`.
+      expect(existsSync(path.join(profileDir, 'DevToolsActivePort'))).toBe(true)
+      expect(existsSync(path.join(sessionDir(PNAME), 'profile'))).toBe(false)
+      // The pre-existing marker survived (the dir was reused, not wiped).
+      expect(existsSync(path.join(profileDir, 'MARKER'))).toBe(true)
+
+      await closeSession(PNAME)
     },
   )
 })

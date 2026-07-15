@@ -18,12 +18,16 @@
  * Applied by the CLI to snapshot / get-text / read / console output.
  */
 
-/** Stable boundary markers (U+27E6 / U+27E7 — not producible by plain HTML). */
-const BOUNDARY_OPEN = '⟦page-content untrusted⟧'
-const BOUNDARY_CLOSE = '⟦/page-content⟧'
+/**
+ * Stable boundary markers (U+27E6 / U+27E7 — not producible by plain HTML).
+ * Exported so the taint guard (taint.ts) can detect page-content provenance from
+ * the SAME fence this module emits — one marker convention, no drift.
+ */
+export const BOUNDARY_OPEN = '⟦page-content untrusted⟧'
+export const BOUNDARY_CLOSE = '⟦/page-content⟧'
 
-/** Visible breadcrumb left where a forged tag was removed. */
-const NEUTRALIZED = '[PROMPT_INJECTION_NEUTRALIZED]'
+/** Visible breadcrumb left where a forged tag was removed. Exported for taint.ts. */
+export const NEUTRALIZED = '[PROMPT_INJECTION_NEUTRALIZED]'
 
 /**
  * Forged transcript-role / boundary tags, opening or closing forms:

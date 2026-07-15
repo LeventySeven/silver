@@ -130,6 +130,40 @@ export function assertNavigable(url: string, opts: EgressOptions): NavigableResu
   return ALLOW
 }
 
+// ---------------------------------------------------------------------------
+// CDP Fetch-layer subresource egress (adopt-list S2, P0 SECURITY HOLE).
+//
+// `assertNavigable` guards TOP-LEVEL navigation only. A page on an allowed domain
+// can still beacon/exfil via subresource `fetch()`/`<img src>`/XHR/`sendBeacon` to
+// ANY host — invisible to the nav guard. The CDP `Fetch.requestPaused` handler in
+// session.ts calls THIS decision for every paused subresource, applying the SAME
+// egress policy assertNavigable uses (deny file:/data:/blob:/non-http(s) + the
+// known-dangerous/IP-literal denylist; restrict to `--allowed-domains` when set).
+//
+// Document requests (top-level and sub-frame navigations) are the nav path's job
+// (`assertNavigableResolved` before goto) and are left to 'continue' here so the
+// subresource guard never double-blocks a navigation the nav guard already vetted
+// (and so a legitimate `data:`/`blob:` top-level test page still loads).
+// ---------------------------------------------------------------------------
+
+export type FetchEgressDecision = 'continue' | 'block'
+
+/**
+ * Decide whether a CDP-paused request may proceed. `resourceType` is CDP's
+ * `Fetch.requestPaused.resourceType` (`Document`/`Image`/`Stylesheet`/`XHR`/
+ * `Fetch`/`Script`/`Ping`/…). Navigations (`Document`) always continue; every
+ * other (subresource) request is held to `assertNavigable`. Pure; never throws.
+ */
+export function subresourceEgressDecision(
+  url: string,
+  resourceType: string,
+  opts: EgressOptions,
+): FetchEgressDecision {
+  // Navigations are guarded on the nav path — do not re-block them here.
+  if (resourceType === 'Document') return 'continue'
+  return assertNavigable(url, opts).ok ? 'continue' : 'block'
+}
+
 /** true iff `host === d` or `host` ends with `"." + d` for some `d` in list. */
 function matchesAnySuffix(host: string, domains: readonly string[]): boolean {
   for (const d of domains) {
@@ -313,4 +347,39 @@ export function assertContainedPath(target: string, root: string = process.cwd()
     return { ok: true, resolved }
   }
   return PATH_DENY
+}
+
+// ---------------------------------------------------------------------------
+// Server-suggested filename chokepoint (adopt-list S3).
+//
+// A download's `suggestedFilename` (or any page/host-supplied name) is untrusted:
+// `../../../etc/x`, `/etc/passwd`, `..\..\evil`, a NUL, etc. Every disk-writing
+// path that takes such a name must route through this ONE choke — basename-first,
+// then sanitize, then re-assert containment — so a traversal/absolute component
+// can never escape the contained download dir. Mirrors the `redactValue`/`groundRef`
+// single-chokepoint pattern. Never throws; the name is never echoed into errors.
+// ---------------------------------------------------------------------------
+
+export type ContainedFilenameResult =
+  | { ok: true; resolved: string; basename: string }
+  | { ok: false; code: PathDenied }
+
+/**
+ * Reduce an untrusted server-suggested filename to a SAFE basename contained in
+ * `dir`. Any directory components (POSIX or Windows separators) are stripped, the
+ * name is restricted to `[A-Za-z0-9._-]`, leading dots are removed (no `..` /
+ * dotfiles), it is length-capped, and the result is re-checked against
+ * `assertContainedPath`. Falls back to `download` when nothing safe remains.
+ */
+export function containedFilename(suggested: string, dir: string): ContainedFilenameResult {
+  const raw = typeof suggested === 'string' ? suggested : ''
+  // basename-first: collapse any \ to / so a Windows-style path can't smuggle a
+  // separator past POSIX basename, then take the final path component only.
+  let base = path.basename(raw.replace(/\\+/g, '/'))
+  base = base.replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^\.+/, '')
+  if (base.length === 0) base = 'download'
+  base = base.slice(0, 128)
+  const contained = assertContainedPath(base, dir)
+  if (!contained.ok) return { ok: false, code: contained.code }
+  return { ok: true, resolved: contained.resolved, basename: base }
 }

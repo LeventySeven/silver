@@ -26,7 +26,7 @@ import { ERRORS } from './core/errors.js'
 import { parseFlags, type ParsedFlags } from './core/flags.js'
 import { buildRegistry } from './security/registry.js'
 import { handle } from './core/handlers.js'
-import { setNamespace } from './core/session.js'
+import { setNamespace, setFetchEgressPolicy } from './core/session.js'
 import { setStateEncryption } from './core/state-crypto.js'
 // Task-artifact / memory / subagent layers — dispatched here (NOT in
 // handlers.ts) so their modules stay decoupled from the browser-verb handlers.
@@ -83,6 +83,13 @@ export async function run(argv: string[]): Promise<RunResult> {
   // before the registry gate, before dispatch — so `session list/gc`, the lock,
   // and every sidecar resolve within this namespace. (No --namespace → default.)
   setNamespace(flags.namespace)
+
+  // S2: load the operator's egress policy into the CDP Fetch-layer subresource
+  // guard so `--allowed-domains` / `--allow-file-access` actually restrict
+  // subresource fetch()/img/XHR/beacon (not just top-level navigation). Without
+  // this the guard armed on every connect with the default empty allowlist, so a
+  // page on an allowed domain could still exfiltrate anywhere — the real hole.
+  setFetchEgressPolicy({ allowFile: flags.allowFileAccess, allowedDomains: flags.allowedDomains })
 
   // Encryption-at-rest for session sidecars is ON by default; `--no-encrypt-state`
   // opts out (plaintext JSON) for debugging. Reads accept both forms, so this is

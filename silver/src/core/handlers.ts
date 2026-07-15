@@ -20,10 +20,11 @@ import { promises as fs, existsSync, readFileSync, readdirSync } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import type { Page, Locator, CDPSession, Frame } from 'playwright'
 
 import { ok, fail, type Envelope } from './envelope.js'
+import { ERRORS } from './errors.js'
 import type { ParsedFlags } from './flags.js'
 import {
   openSession,
@@ -201,11 +202,76 @@ async function patchState(name: string, patch: Partial<UabState>): Promise<UabSt
 }
 
 // ---------------------------------------------------------------------------
+// S4: pending-confirmation store (pending-confirms.json) — the decoupled
+// two-phase confirm gate. A paid/destructive action gated with
+// `--two-phase-confirm` is PERSISTED here (verb + args + preview + TTL) keyed by
+// a fresh id; a follow-up `silver confirm <id>` re-runs it (pre-approved) and
+// `silver deny <id>` drops it. Encrypted at rest through the shared sidecar
+// crypto (page-authored preview text may be present), never raw fs+JSON.
+// ---------------------------------------------------------------------------
+
+/** How long a pending confirmation stays resolvable before it expires. */
+const CONFIRM_TTL_MS = 5 * 60 * 1000
+
+type PendingConfirm = {
+  id: string
+  verb: string
+  /** The positional args the original command carried (ref, and any value). */
+  args: string[]
+  /** The human-facing preview shown when the confirmation was requested. */
+  preview: unknown
+  createdAt: string
+  ttlMs: number
+}
+
+function pendingPath(name: string): string {
+  return path.join(sessionDir(name), 'pending-confirms.json')
+}
+
+function pendingExpired(rec: PendingConfirm, now: number): boolean {
+  const created = Date.parse(rec.createdAt)
+  if (!Number.isFinite(created)) return true
+  return now - created > (rec.ttlMs ?? CONFIRM_TTL_MS)
+}
+
+/** Load the pending-confirmation map, pruning any expired entries. */
+async function loadPending(name: string): Promise<Record<string, PendingConfirm>> {
+  let map: Record<string, PendingConfirm>
+  try {
+    map = (await readSidecarObject<Record<string, PendingConfirm>>(pendingPath(name))) ?? {}
+  } catch {
+    return {}
+  }
+  const now = Date.now()
+  let changed = false
+  for (const [id, rec] of Object.entries(map)) {
+    if (pendingExpired(rec, now)) {
+      delete map[id]
+      changed = true
+    }
+  }
+  if (changed) await savePending(name, map).catch(() => {})
+  return map
+}
+
+async function savePending(name: string, map: Record<string, PendingConfirm>): Promise<void> {
+  await fs.mkdir(sessionDir(name), { recursive: true })
+  await writeSidecar(pendingPath(name), map)
+}
+
+/** A fresh, unguessable confirmation id (never derived from page content). */
+function newConfirmId(): string {
+  return `c-${randomBytes(6).toString('hex')}`
+}
+
+// ---------------------------------------------------------------------------
 // Connection helpers.
 // ---------------------------------------------------------------------------
 
 function openOpts(flags: ParsedFlags): OpenOptions {
-  return { headed: flags.headed, engine: normalizeEngine(flags.engine) }
+  // E2: thread `--profile` (an existing user-data-dir) into the launch so an
+  // owned session can reuse the user's real logged-in Chrome profile.
+  return { headed: flags.headed, engine: normalizeEngine(flags.engine), profile: flags.profile }
 }
 
 /** Settle policy for MUTATING verbs: `--wait networkidle` opts into the full
@@ -434,6 +500,14 @@ export async function handle(flags: ParsedFlags): Promise<Envelope<unknown>> {
       return handleIs(flags)
     case 'wait':
       return handleWait(flags)
+    // AC1: deterministic read-only assertion ("did it actually work?").
+    case 'expect':
+      return handleExpect(flags)
+    // S4: decoupled two-phase confirm gate resolution.
+    case 'confirm':
+      return handleConfirm(flags)
+    case 'deny':
+      return handleDeny(flags)
     // extract
     case 'extract':
       return handleExtract(flags)
@@ -538,11 +612,20 @@ async function handleOpen(flags: ParsedFlags): Promise<Envelope<unknown>> {
       prevTree: null,
       fingerprint: fp.fingerprint,
     })
-    return ok({
-      url: page.url(),
-      title: await page.title().catch(() => ''),
-      page_changed: fp.page_changed,
-    })
+    // R2/R3: detect CAPTCHA / auth-wall right after navigation. Surface both as
+    // structured booleans on the envelope AND as an advisory warning so the host
+    // can branch immediately (CAPTCHA = hand back; auth = load state/cookies).
+    const hz = await detectHazards(page)
+    return ok(
+      {
+        url: page.url(),
+        title: await page.title().catch(() => ''),
+        page_changed: fp.page_changed,
+        ...(hz.captcha ? { captcha_detected: true } : {}),
+        ...(hz.auth ? { auth_required: true } : {}),
+      },
+      hazardWarning(hz),
+    )
   })
 }
 
@@ -840,7 +923,10 @@ async function handleSnapshot(flags: ParsedFlags): Promise<Envelope<unknown>> {
       ...(prev?.extract ? { extract: prev.extract } : {}),
     })
 
-    return ok(presentPageText(obsv.output, flags), warnIf(fp.page_changed))
+    // R2/R3: cheap keyless CAPTCHA / auth-wall detection, surfaced as an advisory
+    // warning alongside the page_changed flag (a read path never hard-blocks).
+    const hz = await detectHazards(page)
+    return ok(presentPageText(obsv.output, flags), hazardWarning(hz, fp.page_changed))
   })
 }
 
@@ -848,10 +934,75 @@ function warnIf(pageChanged: boolean): string | undefined {
   return pageChanged ? 'the page changed during this command; refs may be stale' : undefined
 }
 
+// ---------------------------------------------------------------------------
+// R2/R3: keyless CAPTCHA + auth-wall DETECTION. `captcha_detected` and
+// `auth_required` are declared in errors.ts but were never emitted — this closes
+// two visible reliability holes. Detection is a cheap in-page heuristic (no model
+// call): known CAPTCHA iframe hosts / container classes / "I'm not a robot"
+// signals; and a login form + login-ish URL/title for the auth wall. The codes
+// are surfaced as advisory warnings (read-only paths never hard-block), so the
+// host stops and escalates (CAPTCHA = hand back, never solve; auth = load a saved
+// state/cookies or use a profile) instead of burning retries.
+// ---------------------------------------------------------------------------
+
+type Hazards = { captcha: boolean; auth: boolean }
+
+/** In-page detector (constant script — no interpolation of any host/page value). */
+const HAZARD_DETECT_JS = `(function(){
+  var captcha=false, auth=false;
+  try {
+    var ifr=document.getElementsByTagName('iframe');
+    for (var i=0;i<ifr.length;i++){
+      var src=(ifr[i].getAttribute('src')||'').toLowerCase();
+      if (/recaptcha|hcaptcha|turnstile|arkoselabs|funcaptcha|geetest|captcha-delivery/.test(src)){captcha=true;break;}
+    }
+    if (!captcha && document.querySelector('.g-recaptcha,.h-captcha,.cf-turnstile,[data-sitekey],#px-captcha')) captcha=true;
+    if (!captcha){
+      var body=document.body?String(document.body.innerText||''):'';
+      if (/i'?m not a robot|i am not a robot|verify you are human|please complete the (security|captcha)/i.test(body)) captcha=true;
+    }
+    var pw=document.querySelector('input[type=password]');
+    var u=String(location.href||'').toLowerCase();
+    var t=String(document.title||'').toLowerCase();
+    var loginSignal=/(\\/login|\\/signin|\\/sign-in|\\/sso|\\/auth\\b|\\/oauth|accounts\\.|login\\?|signin\\?)/.test(u)
+      || /(log ?in|sign ?in|sign ?on|authenticate)/.test(t);
+    if (pw && loginSignal) auth=true;
+  } catch(e){}
+  return {captcha:captcha, auth:auth};
+})()`
+
+/** Run the CAPTCHA/auth-wall heuristic on the current page. Best-effort — a
+ * detector failure never fails the command (returns "nothing detected"). */
+async function detectHazards(page: Page): Promise<Hazards> {
+  try {
+    const r = (await page.evaluate(HAZARD_DETECT_JS)) as Hazards
+    return { captcha: Boolean(r?.captcha), auth: Boolean(r?.auth) }
+  } catch {
+    return { captcha: false, auth: false }
+  }
+}
+
+/** Compose the advisory warning for a read/nav path from detected hazards +
+ * the page-changed flag. `captcha_detected` / `auth_required` code tokens are
+ * embedded so the host can branch on them; messages come from the ERRORS table. */
+function hazardWarning(hz: Hazards, pageChanged = false): string | undefined {
+  const parts: string[] = []
+  if (hz.captcha) parts.push(`captcha_detected: ${ERRORS.captcha_detected.message}`)
+  if (hz.auth) parts.push(`auth_required: ${ERRORS.auth_required.message}`)
+  const pc = warnIf(pageChanged)
+  if (pc) parts.push(pc)
+  return parts.length > 0 ? parts.join(' | ') : undefined
+}
+
 async function handleRead(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const url = flags.args[0]
   if (url) {
-    const fetched = await fetchGuarded(url, flags)
+    // D6: when a LIVE session exists, attach that session's cookies for the
+    // target origin to the fetch so `read` can hit authenticated site pages/APIs
+    // cheaply (order-of-magnitude cheaper than snapshot+click). Still egress-
+    // guarded per-hop + neutralized; the cookie only rides same-origin hops.
+    const cookieHeader = await sessionCookieHeader(flags, url)
+    const fetched = await fetchGuarded(url, flags, cookieHeader)
     if (!fetched.ok) return fail(fetched.code)
     if (!fetched.res.ok) return fail('page_crash')
     const html = await fetched.res.text()
@@ -876,10 +1027,12 @@ async function handleRead(flags: ParsedFlags): Promise<Envelope<unknown>> {
 async function fetchGuarded(
   url: string,
   flags: ParsedFlags,
+  cookieHeader?: string | null,
 ): Promise<{ ok: true; res: Response } | { ok: false; code: 'navigation_blocked' }> {
   const MAX_HOPS = 10
   const opts = { allowFile: flags.allowFileAccess, allowedDomains: flags.allowedDomains }
   const signal = flags.timeout ? AbortSignal.timeout(flags.timeout) : undefined
+  const targetOrigin = safeOrigin(url)
   let current = url
   for (let hop = 0; hop < MAX_HOPS; hop++) {
     // Resolved guard per hop (C1 + P1-SEC5): a redirect Location that lexically
@@ -887,8 +1040,13 @@ async function fetchGuarded(
     if (!(await assertNavigableResolved(current, opts)).ok) {
       return { ok: false, code: 'navigation_blocked' }
     }
+    // D6: only send the session cookie on hops whose origin matches the ORIGINAL
+    // target — a cross-origin redirect must never leak the jar to another host.
+    const headers =
+      cookieHeader && safeOrigin(current) === targetOrigin ? { Cookie: cookieHeader } : undefined
     const res = await fetch(current, {
       redirect: 'manual',
+      ...(headers ? { headers } : {}),
       ...(signal ? { signal } : {}),
     })
     if (res.status >= 300 && res.status < 400) {
@@ -905,6 +1063,28 @@ async function fetchGuarded(
   }
   // Too many redirects — fail closed rather than loop.
   return { ok: false, code: 'navigation_blocked' }
+}
+
+/**
+ * D6: the `Cookie:` header value for `url` drawn from a LIVE session's browser
+ * context cookies, or null when no live session exists (keeps `read` browser-free
+ * in that case) / the origin has no cookies. Best-effort — never throws, never
+ * spawns a browser (a dead/absent session returns null before any connect).
+ */
+async function sessionCookieHeader(flags: ParsedFlags, url: string): Promise<string | null> {
+  const info = await readSidecar(flags.session).catch(() => null)
+  if (!info) return null
+  const live = info.external === true || isPidAlive(info.pid)
+  if (!live) return null
+  try {
+    return await withConnection(flags, async ({ context }) => {
+      const cookies = await context.cookies(url)
+      if (!cookies || cookies.length === 0) return null
+      return cookies.map((c) => `${c.name}=${c.value}`).join('; ')
+    })
+  } catch {
+    return null
+  }
 }
 
 async function handleScreenshot(flags: ParsedFlags): Promise<Envelope<unknown>> {
@@ -968,6 +1148,11 @@ async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
     const g = groundRef(refmap, ref)
     if (!g.ok) return fail(g.code)
     if (destructivePaidBlocks(g.entry.name, flags, verb)) {
+      // S4: with `--two-phase-confirm`, DON'T hard-deny — persist the pending
+      // action and hand back a `requires_confirmation` id the host resolves with
+      // a separate `silver confirm <id>` / `deny <id>`. This lets an automated
+      // loop approve in-band without pre-listing every verb by name.
+      if (flags.twoPhaseConfirm) return requireConfirmation(flags, g.entry, verb)
       // E2: attach a structured PREVIEW to the gated envelope — the target's
       // accessible name + the form-field values about to submit + any extracted
       // amount — so the human/host approves a concrete action, not "buy
@@ -1049,6 +1234,111 @@ async function confirmRequiredWithPreview(
   } catch {
     return base
   }
+}
+
+/**
+ * S4: build the `requires_confirmation` envelope for the two-phase gate. Persists
+ * the pending action (verb + args + preview) under a fresh id with a TTL, and
+ * returns `{status:"requires_confirmation", confirmation_id, preview}`. The host
+ * proceeds with `silver confirm <id>` or aborts with `silver deny <id>`. The
+ * error string is a fixed instruction (no id / no page content interpolated —
+ * the id/preview live in `data`, upholding the no-leak invariant on `error`).
+ */
+async function requireConfirmation(
+  flags: ParsedFlags,
+  target: RefEntry,
+  verb: string,
+): Promise<Envelope<unknown>> {
+  let preview: unknown = null
+  const build = confirmPreview.buildConfirmPreview
+  if (build) {
+    try {
+      preview = (await Promise.resolve(build({ name: target.name }))) ?? null
+    } catch {
+      preview = null
+    }
+  }
+  const id = newConfirmId()
+  try {
+    const pending = await loadPending(flags.session)
+    pending[id] = {
+      id,
+      verb,
+      args: flags.args,
+      preview,
+      createdAt: new Date().toISOString(),
+      ttlMs: CONFIRM_TTL_MS,
+    }
+    await savePending(flags.session, pending)
+  } catch {
+    // If we cannot persist the pending action, fall back to the hard deny so we
+    // never hand back an id the host can't resolve.
+    return fail('confirm_required')
+  }
+  return {
+    success: false,
+    data: { status: 'requires_confirmation', confirmation_id: id, preview },
+    error:
+      'this looks like a paid/destructive action; run `silver confirm <id>` to proceed or `silver deny <id>` to abort',
+  }
+}
+
+/**
+ * `silver confirm <id>` (S4): resolve a pending two-phase confirmation by
+ * RE-RUNNING the original actor verb, this time pre-approved (so the gate lets
+ * it through). One-shot: the pending record is removed before execution. The
+ * command itself executes an action, so it requires `--enable-actions` (gated
+ * in-handler, mirroring `wait --fn`).
+ */
+async function handleConfirm(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const id = flags.args[0]
+  if (!id) return badRequest('usage: silver confirm <confirmation-id>')
+  if (!flags.enableActions) return fail('not_permitted')
+
+  const pending = await loadPending(flags.session)
+  const rec = pending[id]
+  if (!rec) {
+    return badRequest(
+      'no such pending confirmation (it may have expired or already been resolved); re-run the original command',
+    )
+  }
+  // One-shot: drop it BEFORE executing so a retry can never double-fire the action.
+  delete pending[id]
+  await savePending(flags.session, pending)
+
+  // Rebuild the original command's flags, pre-approving the verb by name so the
+  // paid/destructive gate (and the confirm-actions gate) both let it through.
+  const reFlags: ParsedFlags = {
+    ...flags,
+    verb: rec.verb,
+    args: rec.args,
+    enableActions: true,
+    twoPhaseConfirm: false,
+    confirmActionsProvided: true,
+    confirmActions: Array.from(new Set([...flags.confirmActions, rec.verb])),
+  }
+  const env = await handleAct(reFlags)
+  if (!env.success) return env
+  // Tag the successful envelope so the host can tie it back to the confirmation.
+  const data = (env.data ?? {}) as Record<string, unknown>
+  return ok({ ...data, confirmed: id })
+}
+
+/**
+ * `silver deny <id>` (S4): abort a pending two-phase confirmation without ever
+ * executing the action. Idempotent — denying an unknown/expired id still
+ * succeeds (the action is, correctly, not performed).
+ */
+async function handleDeny(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const id = flags.args[0]
+  if (!id) return badRequest('usage: silver deny <confirmation-id>')
+  const pending = await loadPending(flags.session)
+  const existed = Object.prototype.hasOwnProperty.call(pending, id)
+  if (existed) {
+    delete pending[id]
+    await savePending(flags.session, pending)
+  }
+  return ok({ denied: true, confirmation_id: id, existed })
 }
 
 // B1 coordinate actuation: prefer the sibling's actions.ts impls; fall back to
@@ -1298,6 +1588,171 @@ async function withLocator(
     await cleanupStamp(page).catch(() => {})
     await cdp.detach().catch(() => {})
   }
+}
+
+// ---------------------------------------------------------------------------
+// expect (AC1) — the marquee trust primitive. A deterministic, READ-ONLY
+// assertion that collapses "did it actually work?" into ONE call, so the host
+// verifies the GOAL, not just a bare success:true.
+//
+//   silver expect <ref|selector> visible|hidden|enabled|checked
+//   silver expect <ref|selector> text-contains <value>
+//   silver expect <ref|selector> value-equals <value>
+//   silver expect <selector>     count <n>
+//   silver expect url-matches <glob|substring>
+//   silver expect title-contains <value>
+//
+// Returns success:true ONLY when the assertion holds; otherwise a failure
+// envelope carrying {matched:false, matcher, expected, observed} so the host
+// sees actual-vs-expected. Keyless: Playwright state reads + string compares.
+// ---------------------------------------------------------------------------
+
+/** Matchers that assert on the PAGE (no ref/selector target). */
+const PAGE_MATCHERS: ReadonlySet<string> = new Set(['url-matches', 'title-contains'])
+/** Matchers that assert on a resolved ELEMENT. */
+const ELEMENT_MATCHERS: ReadonlySet<string> = new Set([
+  'visible',
+  'hidden',
+  'enabled',
+  'checked',
+  'text-contains',
+  'value-equals',
+])
+const EXPECT_USAGE =
+  'usage: silver expect <ref|selector> <visible|hidden|enabled|checked|text-contains|value-equals|count> [value]  |  silver expect <url-matches|title-contains> <value>'
+
+/** Simple glob/substring URL match: `*` is a wildcard; otherwise a substring test. */
+function urlMatches(url: string, pattern: string): boolean {
+  if (!pattern.includes('*')) return url.includes(pattern)
+  const rx = new RegExp(
+    '^' + pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$',
+  )
+  return rx.test(url)
+}
+
+/** Build the assertion result envelope: ok when matched, else a failure with the
+ * actual-vs-expected in `data` (never in `error`, which stays a fixed string). */
+function assertionResult(
+  matched: boolean,
+  matcher: string,
+  expected: string | null,
+  observed: string,
+): Envelope<unknown> {
+  const data = { matched, matcher, expected, observed }
+  if (matched) return ok(data)
+  return { success: false, data, error: `assertion failed: ${matcher}` }
+}
+
+async function handleExpect(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const a = flags.args
+  let target: string | undefined
+  let matcher: string | undefined
+  let value: string | undefined
+  if (a[0] !== undefined && PAGE_MATCHERS.has(a[0])) {
+    matcher = a[0]
+    value = a[1]
+  } else {
+    target = a[0]
+    matcher = a[1]
+    value = a[2]
+  }
+  if (!matcher || (!PAGE_MATCHERS.has(matcher) && !ELEMENT_MATCHERS.has(matcher) && matcher !== 'count')) {
+    return badRequest(EXPECT_USAGE)
+  }
+  if ((matcher === 'text-contains' || matcher === 'value-equals') && value === undefined) {
+    return badRequest(`the "${matcher}" matcher requires a value: silver expect <ref|selector> ${matcher} <value>`)
+  }
+  if (matcher === 'count' && (value === undefined || !/^\d+$/.test(value))) {
+    return badRequest('the "count" matcher requires a non-negative integer: silver expect <selector> count <n>')
+  }
+  if (PAGE_MATCHERS.has(matcher) && value === undefined) {
+    return badRequest(`the "${matcher}" matcher requires a value: silver expect ${matcher} <value>`)
+  }
+  if (!PAGE_MATCHERS.has(matcher) && !target) {
+    return badRequest('a ref or selector is required: ' + EXPECT_USAGE)
+  }
+
+  return withConnection(flags, async ({ page }) => {
+    // Page-level matchers first (no element to resolve).
+    if (matcher === 'url-matches') {
+      const url = page.url()
+      return assertionResult(urlMatches(url, value as string), matcher, value as string, presentPageText(url, flags))
+    }
+    if (matcher === 'title-contains') {
+      const title = await page.title().catch(() => '')
+      return assertionResult(
+        title.includes(value as string),
+        matcher,
+        value as string,
+        presentPageText(title, flags),
+      )
+    }
+    if (matcher === 'count') {
+      // Scope to the active frame (set via `frame <sel>`), else the main frame.
+      const frame = await resolveActiveFrame(page, flags.session)
+      const n = await frame.locator(target as string).count()
+      return assertionResult(n === Number(value), matcher, value as string, String(n))
+    }
+
+    // Element matchers: resolve `target` (a grounded @ref, or a CSS selector).
+    let cdp: CDPSession | null = null
+    try {
+      let loc: Locator
+      if (parseRef(target as string)) {
+        const refmap = await loadRefMap(flags.session)
+        if (!refmap) return fail('element_not_found')
+        const g = groundRef(refmap, target as string)
+        if (!g.ok) return fail(g.code)
+        cdp = await page.context().newCDPSession(page)
+        loc = await toLocator(page, cdp, g.entry, g.ref)
+      } else {
+        const frame = await resolveActiveFrame(page, flags.session)
+        loc = frame.locator(target as string).first()
+      }
+      const timeout = flags.timeout ?? 1500
+      switch (matcher) {
+        case 'visible': {
+          const v = await loc.isVisible().catch(() => false)
+          return assertionResult(v, matcher, 'true', String(v))
+        }
+        case 'hidden': {
+          const v = await loc.isHidden().catch(() => true)
+          return assertionResult(v, matcher, 'true', String(v))
+        }
+        case 'enabled': {
+          const v = await loc.isEnabled({ timeout }).catch(() => false)
+          return assertionResult(v, matcher, 'true', String(v))
+        }
+        case 'checked': {
+          const v = await loc.isChecked({ timeout }).catch(() => false)
+          return assertionResult(v, matcher, 'true', String(v))
+        }
+        case 'text-contains': {
+          const t = (await loc.textContent({ timeout }).catch(() => null)) ?? ''
+          return assertionResult(
+            t.includes(value as string),
+            matcher,
+            value as string,
+            presentPageText(t, flags),
+          )
+        }
+        case 'value-equals': {
+          const v = await loc.inputValue({ timeout }).catch(() => null)
+          return assertionResult(
+            v === value,
+            matcher,
+            value as string,
+            v === null ? '(no value)' : presentPageText(v, flags),
+          )
+        }
+        default:
+          return badRequest(EXPECT_USAGE)
+      }
+    } finally {
+      await cleanupStamp(page).catch(() => {})
+      if (cdp) await cdp.detach().catch(() => {})
+    }
+  })
 }
 
 // ---------------------------------------------------------------------------

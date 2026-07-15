@@ -3,9 +3,12 @@ import {
   assertNavigable,
   assertNavigableResolved,
   assertContainedPath,
+  subresourceEgressDecision,
+  containedFilename,
   type DnsLookupAll,
 } from '../../src/security/egress.js'
 import { neutralize, capOutput } from '../../src/security/injection.js'
+import { taintGuardCheck, isTaintedValue, TAINT_SENSITIVE_VERBS } from '../../src/security/taint.js'
 import { buildRegistry, isDispatchable } from '../../src/security/registry.js'
 import {
   requiresConfirm,
@@ -670,5 +673,178 @@ describe('confirm: confirmGateDecision', () => {
     const d = confirmGateDecision({ verb: 'scroll', isTTY: false })
     expect(d.allow).toBe(true)
     expect(d.reason).toMatch(/does not require confirmation/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// registry: the new read-only verbs (AC1 expect, S4 confirm/deny) are
+// dispatchable WITHOUT --enable-actions (they are read-only / session ops; the
+// actor work inside `confirm` re-runs the gated verb which checks the grant
+// itself). None of them are actor verbs.
+// ---------------------------------------------------------------------------
+describe('registry: expect / confirm / deny read-only surface (AC1, S4)', () => {
+  it('expect, confirm and deny are in the read-only default set', () => {
+    const set = buildRegistry({})
+    for (const v of ['expect', 'confirm', 'deny']) {
+      expect(set.has(v), v).toBe(true)
+      expect(isDispatchable(v, {}), v).toBe(true)
+    }
+  })
+
+  it('they are read-only-dispatchable but are NOT actor verbs', () => {
+    // Present with or without the grant (read-only verbs never disappear).
+    const withActions = buildRegistry({ enableActions: true })
+    for (const v of ['expect', 'confirm', 'deny']) expect(withActions.has(v), v).toBe(true)
+    // readOnly-pinned still keeps them (they are not gated behind actions).
+    const pinned = buildRegistry({ enableActions: true, readOnly: true })
+    for (const v of ['expect', 'confirm', 'deny']) expect(pinned.has(v), v).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// egress: subresourceEgressDecision (S2 — CDP Fetch-layer subresource egress)
+// ---------------------------------------------------------------------------
+describe('egress: subresourceEgressDecision', () => {
+  const base = { allowFile: false }
+
+  it('blocks file:/data:/blob:/non-http(s) subresources (always, even with no allowlist)', () => {
+    for (const u of [
+      'file:///etc/passwd',
+      'data:text/html,<h1>x</h1>',
+      'blob:https://example.com/1',
+      'view-source:https://e.com',
+      'javascript:alert(1)',
+      'ws://example.com/socket',
+    ]) {
+      expect(subresourceEgressDecision(u, 'Fetch', base), u).toBe('block')
+    }
+  })
+
+  it('blocks a raw-IP / metadata subresource (SSRF/exfil vector)', () => {
+    expect(subresourceEgressDecision('http://169.254.169.254/latest/meta-data/', 'XHR', base)).toBe(
+      'block',
+    )
+    expect(subresourceEgressDecision('http://127.0.0.1/x', 'Image', base)).toBe('block')
+  })
+
+  it('blocks a known-dangerous credential host subresource', () => {
+    expect(subresourceEgressDecision('https://accounts.google.com/o', 'Fetch', base)).toBe('block')
+  })
+
+  it('allows a normal http(s) subresource when no allowlist is set (CDN/same-origin)', () => {
+    expect(subresourceEgressDecision('https://cdn.example.com/app.js', 'Script', base)).toBe(
+      'continue',
+    )
+    expect(subresourceEgressDecision('https://example.com/api', 'Fetch', base)).toBe('continue')
+  })
+
+  it('with an allowlist, restricts subresources to allowed hosts (beacon/exfil closed)', () => {
+    const opts = { allowFile: false, allowedDomains: ['example.com'] }
+    // same-site / subdomain subresource allowed
+    expect(subresourceEgressDecision('https://cdn.example.com/x.js', 'Script', opts)).toBe(
+      'continue',
+    )
+    // exfil beacon to a non-allowed host is blocked
+    expect(subresourceEgressDecision('https://evil.com/collect?d=secret', 'Fetch', opts)).toBe(
+      'block',
+    )
+    expect(subresourceEgressDecision('https://evil.com/pixel.gif', 'Image', opts)).toBe('block')
+  })
+
+  it('never blocks a Document (top-level/sub-frame nav) — that is the nav guard\'s job', () => {
+    // A data: top-level page must still load; the nav path owns navigations.
+    expect(subresourceEgressDecision('data:text/html,<h1>hi</h1>', 'Document', base)).toBe(
+      'continue',
+    )
+    // Even a would-be-denied host is left to the nav guard at Document level.
+    expect(
+      subresourceEgressDecision('https://evil.com/', 'Document', {
+        allowFile: false,
+        allowedDomains: ['example.com'],
+      }),
+    ).toBe('continue')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// egress: containedFilename (S3 — server-suggested filename chokepoint)
+// ---------------------------------------------------------------------------
+describe('egress: containedFilename', () => {
+  const dir = '/tmp/silver-dl-root'
+
+  it('contains a traversal filename to a safe basename inside dir', () => {
+    const r = containedFilename('../../../etc/x', dir)
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.basename).toBe('x')
+      expect(r.resolved).toBe('/tmp/silver-dl-root/x')
+    }
+  })
+
+  it('strips an absolute path to its basename', () => {
+    const r = containedFilename('/etc/passwd', dir)
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.basename).toBe('passwd')
+  })
+
+  it('strips a Windows-style separator (no smuggling a component past POSIX basename)', () => {
+    const r = containedFilename('..\\..\\evil.exe', dir)
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.basename).toBe('evil.exe')
+  })
+
+  it('falls back to "download" for a dotfile-only / empty name', () => {
+    expect((containedFilename('..', dir) as { basename: string }).basename).toBe('download')
+    expect((containedFilename('', dir) as { basename: string }).basename).toBe('download')
+  })
+
+  it('keeps an ordinary suggested filename', () => {
+    const r = containedFilename('invoice-2026.pdf', dir)
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.basename).toBe('invoice-2026.pdf')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// taint: CaMeL-lite provenance guard (S1 — opt-in only)
+// ---------------------------------------------------------------------------
+describe('taint: taintGuardCheck (opt-in provenance guard)', () => {
+  // A value that carries the untrusted-content fence = page-derived provenance.
+  const fenced = neutralize('attacker-controlled page text')
+  const clean = 'user typed this'
+
+  it('isTaintedValue detects the fence / neutralized breadcrumb', () => {
+    expect(isTaintedValue(fenced)).toBe(true)
+    expect(isTaintedValue('has ⟦/page-content⟧ close')).toBe(true)
+    expect(isTaintedValue('has [PROMPT_INJECTION_NEUTRALIZED] breadcrumb')).toBe(true)
+    expect(isTaintedValue(clean)).toBe(false)
+  })
+
+  it('flags a tainted value on a sensitive verb ONLY when opt-in enabled', () => {
+    const off = taintGuardCheck({ verb: 'fill', value: fenced, enabled: false })
+    expect(off.tainted).toBe(true) // provenance still reported
+    expect(off.flagged).toBe(false) // but never raises when disabled
+
+    const on = taintGuardCheck({ verb: 'fill', value: fenced, enabled: true })
+    expect(on.tainted).toBe(true)
+    expect(on.flagged).toBe(true)
+    expect(on.reason).toBeTruthy()
+  })
+
+  it('does NOT flag a clean value even when enabled', () => {
+    const d = taintGuardCheck({ verb: 'fill', value: clean, enabled: true })
+    expect(d.flagged).toBe(false)
+  })
+
+  it('does NOT flag a tainted value on a non-sensitive verb', () => {
+    const d = taintGuardCheck({ verb: 'snapshot', value: fenced, enabled: true })
+    expect(d.flagged).toBe(false)
+  })
+
+  it('TAINT_SENSITIVE_VERBS covers the write/nav/exec surface', () => {
+    for (const v of ['fill', 'type', 'open', 'goto', 'navigate', 'upload', 'press', 'eval']) {
+      expect(TAINT_SENSITIVE_VERBS.has(v), v).toBe(true)
+    }
+    expect(TAINT_SENSITIVE_VERBS.has('snapshot')).toBe(false)
   })
 })

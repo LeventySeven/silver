@@ -25,9 +25,9 @@
  *   - No match / no live locator -> `ResolveError` (caller maps to
  *     `element_not_found`). A handle is NEVER cached across commands.
  */
-import type { Page, Locator, CDPSession } from 'playwright'
+import type { Page, Locator, CDPSession, Frame } from 'playwright'
 import type { RefEntry } from '../perception/refmap.js'
-import { snapshotNodes, MAIN_FRAME_ID } from '../perception/walk.js'
+import { snapshotNodes, MAIN_FRAME_ID, findOopifFrame } from '../perception/walk.js'
 
 /** The attribute we stamp on a node to bridge backendNodeId -> a CSS selector. */
 export const REF_ATTR = 'data-silver-ref'
@@ -155,6 +155,26 @@ export async function toLocator(
   entry: RefEntry,
   ref: string,
 ): Promise<Locator> {
+  // E6 CROSS-ORIGIN (OOPIF) PATH: a ref inside a cross-origin iframe lives in a
+  // SEPARATE renderer target, so its backendNodeId cannot be resolved or stamped
+  // over the page's CDP session — we must drive the OOPIF's own session and locate
+  // inside its Playwright `Frame`. Same-process frames never match here (they have
+  // no separate session), so this only diverts genuine OOPIF refs.
+  if (entry.frameId !== MAIN_FRAME_ID) {
+    const oopif = await findOopifFrame(page, entry.frameId)
+    if (oopif) {
+      try {
+        const loc = await resolveInOopif(page, oopif.session, oopif.frame, entry, ref)
+        if (loc) return loc
+        throw new ResolveError()
+      } finally {
+        await oopif.session.detach().catch(() => {})
+      }
+    }
+    // No OOPIF matched → fall through: it is a same-process frame ref, handled
+    // by the page-session fast/slow paths below (stamp lands, locate scans frames).
+  }
+
   // FAST PATH: the backendNodeId is still live in the current document. For a
   // same-process iframe the child node is reachable from the page's CDP session,
   // so the stamp lands; we then locate it inside its owning frame.
@@ -175,4 +195,46 @@ export async function toLocator(
     throw new ResolveError()
   }
   throw new ResolveError()
+}
+
+/**
+ * E6: resolve a ref that lives inside a cross-origin OOPIF, driving the OOPIF's
+ * OWN CDP session and locating inside its Playwright `Frame`.
+ *
+ * FAST PATH: stamp the ref's original (OOPIF-target-local) backendNodeId over the
+ * OOPIF session, then `frame.locator([data-silver-ref=…])`. SLOW PATH: re-snapshot
+ * the page (which re-splices the OOPIF via its session, minting fresh OOPIF-local
+ * backendNodeIds) and re-match by (role,name,nth,frameId), then stamp THAT id over
+ * the OOPIF session. Returns null if neither lands (caller throws ResolveError).
+ */
+async function resolveInOopif(
+  page: Page,
+  session: CDPSession,
+  frame: Frame,
+  entry: RefEntry,
+  ref: string,
+): Promise<Locator | null> {
+  const sel = refSelector(ref)
+  // FAST: the backendNodeId minted at snapshot time is still live in the OOPIF.
+  try {
+    if (await stampByBackendNode(session, entry.backendNodeId, ref)) {
+      const loc = frame.locator(sel).first()
+      if ((await loc.count()) > 0) return loc
+    }
+  } catch {
+    /* stale/detached OOPIF backendNodeId — fall through to the slow path */
+  }
+
+  // SLOW: re-snapshot + re-match by shape, then stamp the fresh OOPIF-local id.
+  const backendNodeId = await rematchByShape(page, entry)
+  if (backendNodeId === null) return null
+  try {
+    if (await stampByBackendNode(session, backendNodeId, ref)) {
+      const loc = frame.locator(sel).first()
+      if ((await loc.count()) > 0) return loc
+    }
+  } catch {
+    return null
+  }
+  return null
 }

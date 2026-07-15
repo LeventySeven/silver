@@ -132,6 +132,25 @@ type FrameTreeNode = {
   childFrames?: FrameTreeNode[]
 }
 
+/**
+ * An out-of-process iframe (OOPIF) reached over its OWN CDP session (E6).
+ *
+ * A cross-origin iframe runs in a SEPARATE renderer process, so the parent
+ * page's CDP session cannot see its accessibility/DOM tree — `getFullAXTree
+ * ({frameId})` on the page session returns nothing for it (the exact vercel-labs
+ * #925 bug). Playwright already auto-attaches to OOPIF targets (via Chromium's
+ * `Target.setAutoAttach({flatten:true})`), exposing each as a `Frame` whose own
+ * CDP session is reachable with `context.newCDPSession(frame)` — that call
+ * SUCCEEDS only for a genuine OOPIF and THROWS for a same-process frame ("this
+ * frame does not have a separate CDP session"), which is our discriminator.
+ */
+type OopifSession = {
+  /** A CDP session bound to the OOPIF's own target. */
+  session: CDPSession
+  /** The OOPIF document's URL (for per-frame relative-href resolution). */
+  url: string
+}
+
 /** C1: a form-control's format metadata, captured in the in-page scan. */
 type FormHint = {
   /** Normalized control type: an `<input type>` or `'select'`. */
@@ -164,19 +183,29 @@ type CursorInfo = {
  * Build the flat SnapNode list for the given page.
  *
  * The main frame is walked first; then each child `iframe` node has its OWN
- * accessibility subtree fetched (via `Accessibility.getFullAXTree({frameId})`
- * over the SAME CDP session — same-process iframes share the page's target) and
- * SPLICED inline directly under the host `Iframe` node, one semantic level
- * deeper, so a `<button>` inside an iframe becomes ref-eligible and clickable.
+ * accessibility subtree fetched and SPLICED inline directly under the host
+ * `Iframe` node, one semantic level deeper, so a `<button>` inside an iframe
+ * becomes ref-eligible and clickable. Two frame classes are handled:
+ *   - SAME-PROCESS child frames share the page's target, so their subtree comes
+ *     from `Accessibility.getFullAXTree({frameId})` over the page's CDP session.
+ *   - CROSS-ORIGIN out-of-process iframes (OOPIFs — Stripe/OAuth/checkout/embed
+ *     widgets) run in a SEPARATE renderer the page session cannot see (E6). We
+ *     reach each over its OWN CDP session (`context.newCDPSession(frame)`, which
+ *     rides Chromium's flattened `Target.setAutoAttach`) and snapshot its whole
+ *     AX tree there, then splice it in identically — frame-prefixed refs, the
+ *     OOPIF's real `frameId` in the SnapNode so the resolver can act inside it.
  * Each spliced node carries the child frame's real CDP `frameId` so the resolver
  * can act inside the owning frame. Recursion is bounded (`MAX_FRAME_DEPTH`) and
- * cross-origin / detached frames are skipped silently (they simply don't appear).
+ * detached / unreachable frames are skipped silently (they simply don't appear).
  */
 export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Promise<SnapNode[]> {
   const interactive = opts.interactive ?? false
   const cap = Math.min(opts.maxDepth ?? MAX_LEVELS, MAX_LEVELS)
 
   const cdp = await page.context().newCDPSession(page)
+  // E6: map each OOPIF frameId -> its own CDP session (empty when the page has no
+  // cross-origin iframes). Built once; every session detached in `finally`.
+  const oopifSessions = await collectOopifSessions(page)
   try {
     await cdp.send('DOM.enable').catch(() => {})
     await cdp.send('Accessibility.enable').catch(() => {})
@@ -244,32 +273,48 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
     }
 
     // Walk the main frame, then recursively splice child frames inline.
-    return await walkFrame(MAIN_FRAME_ID, 0, 0)
+    return await walkFrame(MAIN_FRAME_ID, 0, 0, cdp, domByBackend, false)
 
     /**
      * Walk ONE frame's accessibility subtree into a flat SnapNode list, splicing
      * any nested iframe content inline under its host node.
+     *
+     * @param frameCdp  the CDP session to drive this frame's AX/DOM calls — the
+     *                  page session for the main + same-process frames, or the
+     *                  OOPIF's own session for a cross-origin frame.
+     * @param domLookup backendNodeId -> DOM attrs for THIS frame (the global
+     *                  pierced map for same-process; a per-frame map for an OOPIF,
+     *                  whose backendNodeIds live in a different target's id space).
+     * @param isOopif   true when `frameCdp` is an OOPIF's own session (its AX tree
+     *                  is fetched whole, with no `frameId` filter).
      */
     async function walkFrame(
       frameId: string,
       baseLevel: number,
       depth: number,
+      frameCdp: CDPSession,
+      domLookup: Map<number, { nodeName: string; attrs: Record<string, string> }>,
+      isOopif: boolean,
     ): Promise<SnapNode[]> {
       let axNodes: AXNode[]
       try {
-        const resp = (await (frameId === MAIN_FRAME_ID
-          ? cdp.send('Accessibility.getFullAXTree')
-          : cdp.send('Accessibility.getFullAXTree', { frameId }))) as { nodes: AXNode[] }
+        const resp = (await (isOopif || frameId === MAIN_FRAME_ID
+          ? frameCdp.send('Accessibility.getFullAXTree')
+          : frameCdp.send('Accessibility.getFullAXTree', { frameId }))) as { nodes: AXNode[] }
         axNodes = resp.nodes
       } catch {
-        return [] // cross-origin / detached child frame — skip silently.
+        return [] // detached / unreachable child frame — skip silently.
       }
       const axById = new Map<string, AXNode>()
       for (const n of axNodes) axById.set(n.nodeId, n)
 
       const isMain = frameId === MAIN_FRAME_ID
       const useScope = isMain ? scopeSet : null
-      const baseUrl = isMain ? pageUrl : (frameBaseUrl.get(frameId) ?? pageUrl)
+      const baseUrl = isMain
+        ? pageUrl
+        : isOopif
+          ? oopifSessions.get(frameId)?.url || pageUrl
+          : (frameBaseUrl.get(frameId) ?? pageUrl)
 
       const result: SnapNode[] = []
       const roots = findRoots(axNodes, axById, useScope)
@@ -299,7 +344,7 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
           return
         }
 
-        const dom = backend >= 0 ? domByBackend.get(backend) : undefined
+        const dom = backend >= 0 ? domLookup.get(backend) : undefined
         const attrs = dom?.attrs ?? {}
         const rawName = asString(node.name?.value)
         const name = accessibleName(rawName, {
@@ -363,11 +408,37 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
 
         // Splice the child frame's subtree directly under this Iframe host node,
         // one level deeper, so its contents nest correctly in the serializer.
+        // The iframe element's frameId is resolved over the CURRENT frame's
+        // session (nested OOPIFs describe their child iframes in their own DOM).
         if (role === 'Iframe' && backend >= 0 && depth < MAX_FRAME_DEPTH) {
-          const childFrameId = await resolveChildFrameId(cdp, backend)
+          const childFrameId = await resolveChildFrameId(frameCdp, backend)
           if (childFrameId && childFrameId !== frameId) {
-            const childNodes = await walkFrame(childFrameId, level + 1, depth + 1)
-            for (const cn of childNodes) result.push(cn)
+            const oopif = oopifSessions.get(childFrameId)
+            if (oopif) {
+              // Cross-origin OOPIF: walk its tree over ITS OWN session, joined to
+              // a per-frame DOM map (its backendNodeIds are a separate id space).
+              const childDom = await buildFrameDom(oopif.session)
+              const childNodes = await walkFrame(
+                childFrameId,
+                level + 1,
+                depth + 1,
+                oopif.session,
+                childDom,
+                true,
+              )
+              for (const cn of childNodes) result.push(cn)
+            } else {
+              // Same-process child frame: page session, shared pierced DOM map.
+              const childNodes = await walkFrame(
+                childFrameId,
+                level + 1,
+                depth + 1,
+                cdp,
+                domByBackend,
+                false,
+              )
+              for (const cn of childNodes) result.push(cn)
+            }
           }
         }
 
@@ -375,8 +446,108 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
       }
     }
   } finally {
+    for (const { session } of oopifSessions.values()) {
+      await session.detach().catch(() => {})
+    }
     await cdp.detach().catch(() => {})
   }
+}
+
+/**
+ * E6: build the OOPIF frameId -> own-session map for `page`.
+ *
+ * Playwright already auto-attaches to every OOPIF target (Chromium flattened
+ * `Target.setAutoAttach`), so each is a `Frame` in `page.frames()`. We probe each
+ * non-main frame with `context.newCDPSession(frame)`: it SUCCEEDS only for a real
+ * OOPIF (a same-process frame throws "does not have a separate CDP session") and
+ * yields a session bound to that OOPIF's target. Its `Page.getFrameTree` root id
+ * is the OOPIF's own frameId — the key the parent tree's Iframe host resolves to.
+ * Accessibility + DOM are enabled up-front so the walk can snapshot immediately.
+ * All errors are swallowed: an unreachable OOPIF simply never appears.
+ */
+async function collectOopifSessions(page: Page): Promise<Map<string, OopifSession>> {
+  const out = new Map<string, OopifSession>()
+  const main = page.mainFrame()
+  for (const frame of page.frames()) {
+    if (frame === main) continue
+    let session: CDPSession
+    try {
+      // Throws for a same-process frame — those are handled over the page session.
+      session = await page.context().newCDPSession(frame)
+    } catch {
+      continue
+    }
+    try {
+      const tree = (await session.send('Page.getFrameTree')) as { frameTree: FrameTreeNode }
+      const rootId = tree.frameTree.frame.id
+      const url = tree.frameTree.frame.url ?? ''
+      if (rootId && !out.has(rootId)) {
+        await session.send('Accessibility.enable').catch(() => {})
+        await session.send('DOM.enable').catch(() => {})
+        out.set(rootId, { session, url })
+      } else {
+        await session.detach().catch(() => {})
+      }
+    } catch {
+      await session.detach().catch(() => {})
+    }
+  }
+  return out
+}
+
+/**
+ * Build a backendNodeId -> DOM attrs map for ONE frame's own target, over its
+ * session (E6). An OOPIF's backendNodeIds are a SEPARATE id space from the page
+ * target's, so its DOM attributes (href/placeholder/type=password/…) must be
+ * indexed from its own `DOM.getDocument`, not the page's pierced tree. Returns an
+ * empty map on failure — the AX node's own computed name still carries through.
+ */
+async function buildFrameDom(
+  session: CDPSession,
+): Promise<Map<number, { nodeName: string; attrs: Record<string, string> }>> {
+  const byBackend = new Map<number, { nodeName: string; attrs: Record<string, string> }>()
+  try {
+    const doc = (await session.send('DOM.getDocument', { depth: -1, pierce: true })) as {
+      root: DomNode
+    }
+    collectDom(doc.root, byBackend, new Map())
+  } catch {
+    /* best-effort — names still come from the AX tree */
+  }
+  return byBackend
+}
+
+/**
+ * E6: locate the OOPIF `Frame` + a fresh CDP session for `frameId` on `page`, or
+ * null if no OOPIF has that root frameId. Used by the resolver to stamp/act inside
+ * a cross-origin frame. The caller owns the returned session's lifecycle (detach).
+ * All non-matching sessions probed along the way are detached here.
+ */
+export async function findOopifFrame(
+  page: Page,
+  frameId: string,
+): Promise<{ session: CDPSession; frame: import('playwright').Frame } | null> {
+  const main = page.mainFrame()
+  for (const frame of page.frames()) {
+    if (frame === main) continue
+    let session: CDPSession
+    try {
+      session = await page.context().newCDPSession(frame)
+    } catch {
+      continue // same-process frame — no separate session.
+    }
+    try {
+      const tree = (await session.send('Page.getFrameTree')) as { frameTree: FrameTreeNode }
+      if (tree.frameTree.frame.id === frameId) {
+        await session.send('DOM.enable').catch(() => {})
+        return { session, frame }
+      }
+      await session.detach().catch(() => {})
+    } catch {
+      await session.detach().catch(() => {})
+    }
+  }
+  return null
 }
 
 /**

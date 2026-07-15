@@ -25,6 +25,10 @@ import { capOutput } from '../security/injection.js'
 
 export const TASKS_SUB = 'tasks'
 
+/** Run-folder filenames for the durability index (T2) and replay cache (T3). */
+export const MANIFEST_FILE = 'manifest.json'
+export const REPLAY_CACHE_FILE = 'replay_cache.json'
+
 /** Hard bound on any single stored free-text field, so a hostile page value
  * handed to `task start`/`task log` cannot write an unbounded file. */
 const MAX_TEXT = 200_000
@@ -163,6 +167,9 @@ export async function startRun(id: string, goal: string): Promise<StartedRun> {
   await fs.writeFile(path.join(dir, 'action_log.jsonl'), '', 'utf8')
   await writeJson(path.join(dir, 'checkpoint.json'), freshCheckpoint(id, runName, meta.goal))
   await appendLog(id, n, { kind: 'run_start', goal: meta.goal })
+  // Seed the T2 run manifest so a run is externally-indexable from the first
+  // moment (list/status/resume + tooling); later ops refresh it in place.
+  await refreshManifest(id, n)
 
   return { id, run: runName, runNumber: n, dir, goal: meta.goal }
 }
@@ -241,4 +248,209 @@ export async function listTaskIds(): Promise<string[]> {
     if (e.isDirectory() && (await taskExists(e.name))) out.push(e.name)
   }
   return out.sort()
+}
+
+// ---------------------------------------------------------------------------
+// Silver version (single source of truth: package.json), keyless, cached.
+// ---------------------------------------------------------------------------
+
+let _version: string | null = null
+
+/**
+ * The Silver version, read once from the packaged `package.json`. Falls back to
+ * a static string if the file can't be read (never throws — a manifest write
+ * must not fail because version discovery hiccuped). KEYLESS: file read only.
+ */
+export async function silverVersion(): Promise<string> {
+  if (_version !== null) return _version
+  try {
+    const pkgUrl = new URL('../../package.json', import.meta.url)
+    const raw = await fs.readFile(pkgUrl, 'utf8')
+    const parsed = JSON.parse(raw) as { version?: unknown }
+    _version = typeof parsed.version === 'string' ? parsed.version : '0.0.0'
+  } catch {
+    _version = '0.0.0'
+  }
+  return _version
+}
+
+// ---------------------------------------------------------------------------
+// T2 — run manifest: a machine-readable index of a run for list/status/resume
+// and external tooling. Seeded at startRun, refreshed on every mutating op.
+// ---------------------------------------------------------------------------
+
+export type RunManifest = {
+  /** The task id (namespace-scoped). */
+  taskId: string
+  /** The run folder name (`run_<n>`). */
+  run: string
+  /** The original goal (bounded free text). */
+  goal: string
+  /** Silver version that produced/updated this run. */
+  silverVersion: string
+  /** ISO timestamp the run folder was opened. */
+  startedAt: string
+  /** ISO timestamp the run reached a terminal outcome, else null. */
+  endedAt: string | null
+  /** Count of recorded verb invocations (exec/action log events). */
+  verbCount: number
+  /** Terminal/interim outcome mirrored from the checkpoint status. */
+  outcome: string
+  /** Screenshot refs captured at each checkpoint (relative filenames). */
+  checkpoints: string[]
+  /** Path to the compiled re-runnable script, once `task compile` has run. */
+  compiledScript: string | null
+  /** Path to the verb-sequence replay cache, once built. */
+  replayCache: string | null
+}
+
+/** Statuses that mean the run is finished (endedAt is stamped). */
+const TERMINAL_STATUS = new Set([
+  'done',
+  'success',
+  'succeeded',
+  'complete',
+  'completed',
+  'failed',
+  'failure',
+  'blocked',
+  'aborted',
+  'cancelled',
+  'canceled',
+])
+
+function manifestPath(id: string, n: number): string {
+  return path.join(runDirPath(id, n), MANIFEST_FILE)
+}
+
+export async function readManifest(id: string, n: number): Promise<RunManifest | null> {
+  return readJson<RunManifest>(manifestPath(id, n))
+}
+
+/** Count recorded verb invocations (log events carrying a `command` array). */
+function countVerbs(log: unknown[]): number {
+  let c = 0
+  for (const rec of log) {
+    const event = (rec as { event?: unknown })?.event
+    const cmd = (event as { command?: unknown })?.command
+    if (Array.isArray(cmd) && cmd.length > 0) c++
+  }
+  return c
+}
+
+/** Collect checkpoint screenshot refs from the log + latest checkpoint. */
+function checkpointRefs(log: unknown[], cp: Checkpoint | null): string[] {
+  const refs: string[] = []
+  for (const rec of log) {
+    const event = (rec as { event?: unknown })?.event as
+      | { kind?: unknown; screenshot?: unknown }
+      | undefined
+    if (event?.kind === 'checkpoint' && typeof event.screenshot === 'string') {
+      refs.push(event.screenshot)
+    }
+  }
+  if (cp?.lastScreenshot && !refs.includes(cp.lastScreenshot)) refs.push(cp.lastScreenshot)
+  return refs
+}
+
+/**
+ * (Re)compute the run manifest from the durable artifacts (log + checkpoint)
+ * and merge an optional patch (compiledScript / replayCache / outcome override).
+ * Idempotent: safe to call after any mutating task op. KEYLESS.
+ */
+export async function refreshManifest(
+  id: string,
+  n: number,
+  patch: Partial<RunManifest> = {},
+): Promise<RunManifest> {
+  const existing = await readManifest(id, n)
+  const meta = await readJson<TaskMeta>(path.join(taskDir(id), 'meta.json'))
+  const cp = await loadCheckpoint(id, n)
+  const log = await readLog(id, n)
+
+  const status = cp?.status ?? existing?.outcome ?? 'unknown'
+  const terminal = TERMINAL_STATUS.has(status)
+  const startedAt = existing?.startedAt ?? meta?.createdAt ?? new Date().toISOString()
+
+  const manifest: RunManifest = {
+    taskId: id,
+    run: `run_${n}`,
+    goal: bound(meta?.goal ?? existing?.goal ?? ''),
+    silverVersion: await silverVersion(),
+    startedAt,
+    endedAt: terminal ? (cp?.updatedAt ?? existing?.endedAt ?? new Date().toISOString()) : null,
+    verbCount: countVerbs(log),
+    outcome: status,
+    checkpoints: checkpointRefs(log, cp),
+    compiledScript: existing?.compiledScript ?? null,
+    replayCache: existing?.replayCache ?? null,
+    ...patch,
+  }
+  await writeJson(manifestPath(id, n), manifest)
+  return manifest
+}
+
+// ---------------------------------------------------------------------------
+// T3 — verb-sequence DOM-hash replay cache. One entry per recorded verb, keyed
+// by the DOM fingerprint at that step. On replay a matching hash means the
+// recorded ref is known-good (deterministic replay, no host round-trip); a
+// mismatch means self-heal (fresh snapshot + host). Stored in the run folder.
+// ---------------------------------------------------------------------------
+
+export type ReplayStep = {
+  /** Zero-based position in the recorded verb sequence. */
+  index: number
+  /** The verb (e.g. `click`, `fill`). */
+  verb: string
+  /** The full argv token array (`[verb, ...args]`). */
+  argv: string[]
+  /** The resolved ref (`eN`) the step acted on, when known. */
+  ref: string | null
+  /** DOM fingerprint recorded at this step (reuses the pagechange fingerprint). */
+  domHash: string | null
+}
+
+export type ReplayCache = {
+  task: string
+  run: string
+  builtAt: string
+  steps: ReplayStep[]
+}
+
+function replayCachePath(id: string, n: number): string {
+  return path.join(runDirPath(id, n), REPLAY_CACHE_FILE)
+}
+
+export async function saveReplayCache(id: string, n: number, cache: ReplayCache): Promise<void> {
+  await fs.mkdir(runDirPath(id, n), { recursive: true }).catch(() => {})
+  await writeJson(replayCachePath(id, n), cache)
+}
+
+export async function loadReplayCache(id: string, n: number): Promise<ReplayCache | null> {
+  return readJson<ReplayCache>(replayCachePath(id, n))
+}
+
+/**
+ * The core replay decision (pure, keyless): given a recorded step and the DOM
+ * hash observed NOW, decide whether the recorded ref is known-good and can be
+ * dispatched deterministically without a host round-trip, or the caller must
+ * fall back to a fresh snapshot + host resolution (self-heal).
+ *
+ * A hit requires a non-empty recorded hash that equals the current hash AND a
+ * recorded ref. Everything else falls back — a missing hash is never a hit
+ * (we have no basis to claim the recorded ref is still valid).
+ */
+export function decideReplay(
+  step: ReplayStep,
+  currentDomHash: string | null | undefined,
+): { reuse: boolean; ref: string | null; reason: string } {
+  if (!step.domHash) return { reuse: false, ref: null, reason: 'no_recorded_hash' }
+  if (!step.ref) return { reuse: false, ref: null, reason: 'no_recorded_ref' }
+  if (currentDomHash === null || currentDomHash === undefined || currentDomHash === '') {
+    return { reuse: false, ref: null, reason: 'no_current_hash' }
+  }
+  if (currentDomHash !== step.domHash) {
+    return { reuse: false, ref: null, reason: 'dom_hash_mismatch' }
+  }
+  return { reuse: true, ref: step.ref, reason: 'dom_hash_match' }
 }

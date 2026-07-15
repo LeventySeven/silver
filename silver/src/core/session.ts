@@ -18,6 +18,11 @@ import * as path from 'node:path'
 import type { Browser, BrowserContext, BrowserType, Page } from 'playwright'
 import type { RefMap } from '../perception/refmap.js'
 import { decodeStateBuffer, encryptJson, isStateEncryptionEnabled } from './state-crypto.js'
+import {
+  containedFilename,
+  subresourceEgressDecision,
+  type EgressOptions,
+} from '../security/egress.js'
 
 /** Playwright browser engines Silver can launch (H1). Default chromium. */
 export type Engine = 'chromium' | 'firefox' | 'webkit'
@@ -63,6 +68,20 @@ export type OpenOptions = {
   idleTimeoutMs?: number
   /** Browser engine to launch (H1). Default chromium. */
   engine?: Engine
+  /**
+   * Real-Chrome-profile launch (adopt-list E2): an EXISTING user-data-dir (the
+   * user's logged-in profile) to launch against instead of a throwaway one — the
+   * truest keyless auth, no credential ever enters Silver. When set it becomes the
+   * `--user-data-dir` and is REUSED across the session's lifetime, so its cookies
+   * and storage carry the logged-in session.
+   *
+   * ISOLATION TRADE-OFF (documented): pointing at a real profile means Silver
+   * shares that profile's cookies, extensions, and history — there is NO isolation
+   * from the user's normal browsing, and the profile must NOT be in use by another
+   * running Chrome (the user-data-dir lock is exclusive). Prefer a dedicated copied
+   * profile for unattended runs; use the live profile only for interactive auth.
+   */
+  profile?: string
 }
 
 /**
@@ -92,7 +111,123 @@ export async function grantDefaultPermissions(
     .catch(() => {})
 }
 
-/** Strip any path separators / traversal from a page-supplied download name. */
+// ---------------------------------------------------------------------------
+// Fetch-layer egress policy (adopt-list S2). The subresource egress guard is
+// enabled on EVERY connect (below). Its policy is process-wide, mirroring the
+// namespace pattern: the CLI sets it ONCE from `--allow-file-access` /
+// `--allowed-domains` (see setFetchEgressPolicy), and every per-command reconnect
+// re-arms the guard with the current policy. Default (unset) = the nav denylist
+// default: file:/data:/blob:/non-http(s)/raw-IP/known-dangerous subresources are
+// blocked, ordinary http(s) subresources pass, no allowlist restriction.
+// ---------------------------------------------------------------------------
+
+let fetchEgressPolicy: EgressOptions = { allowFile: false, allowedDomains: [] }
+
+/** Set the process-wide subresource egress policy (call once from the CLI). */
+export function setFetchEgressPolicy(opts: EgressOptions): void {
+  fetchEgressPolicy = {
+    allowFile: Boolean(opts?.allowFile),
+    allowedDomains: opts?.allowedDomains ? [...opts.allowedDomains] : [],
+  }
+}
+
+/** The active subresource egress policy (for tests / observability). */
+export function currentFetchEgressPolicy(): EgressOptions {
+  return fetchEgressPolicy
+}
+
+/**
+ * CDP `Fetch.enable` interception patterns for the S2 subresource egress guard:
+ * one wildcard-URL pattern per interceptable SUBRESOURCE `resourceType`. `Document`
+ * is intentionally OMITTED so navigations — and the `Document`-classified request a
+ * `download`-attribute link fires (E4) — are never paused by the Fetch domain
+ * (pausing+continuing a download-destined Document request drops the download).
+ * `WebSocket` is not interceptable by the Fetch domain and is likewise omitted.
+ */
+// Every `resourceType` the CDP Fetch filter accepts EXCEPT `Document` (probed
+// against Chromium: `TextTrack`/`Prefetch`/`Manifest`/`SignedExchange`/`Preflight`/
+// `WebSocket` are rejected by `Fetch.enable`, and a single unknown type aborts the
+// whole call — so this list is exactly the accepted subresource set). This spans
+// the real exfil vectors (`fetch()`/XHR/`<img>`/`<script>`/beacon/EventSource).
+const FETCH_GUARD_RESOURCE_TYPES = [
+  'Stylesheet',
+  'Image',
+  'Media',
+  'Font',
+  'Script',
+  'XHR',
+  'Fetch',
+  'EventSource',
+  'Ping',
+  'CSPViolationReport',
+  'Other',
+] as const
+const FETCH_GUARD_PATTERNS = FETCH_GUARD_RESOURCE_TYPES.map((resourceType) => ({
+  urlPattern: '*',
+  resourceType,
+}))
+
+/**
+ * Enable the CDP `Fetch`-layer subresource egress guard on a connected context
+ * (adopt-list S2 — closes the exfil hole where a page on an allowed domain
+ * beacons to any host via `fetch()`/`<img>`/XHR). For each page (and any page
+ * opened later this command) a `Fetch.enable` interceptor holds every subresource
+ * request to `subresourceEgressDecision` (the same policy `assertNavigable` uses);
+ * a denied request is `Fetch.failRequest`'d with `BlockedByClient`, everything
+ * else `Fetch.continueRequest`'d. Best-effort and non-blocking: a target that
+ * cannot be armed (gone / non-CDP engine) is skipped rather than failing the
+ * command. Chromium-only (CDP); firefox/webkit have no `Fetch` domain.
+ */
+export async function enableFetchEgressGuard(
+  context: BrowserContext,
+  opts: EgressOptions = fetchEgressPolicy,
+): Promise<void> {
+  const arm = async (page: Page): Promise<void> => {
+    let cdp: import('playwright').CDPSession
+    try {
+      cdp = await context.newCDPSession(page)
+    } catch {
+      return // page/target gone, or engine without a CDP Fetch domain
+    }
+    cdp.on('Fetch.requestPaused', (evt) => {
+      const requestId = evt.requestId
+      const url = evt.request?.url ?? ''
+      const resourceType = String(evt.resourceType ?? '')
+      const decision = subresourceEgressDecision(url, resourceType, opts)
+      if (decision === 'block') {
+        void cdp
+          .send('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' })
+          .catch(() => {})
+      } else {
+        void cdp.send('Fetch.continueRequest', { requestId }).catch(() => {})
+      }
+    })
+    try {
+      // Intercept every SUBRESOURCE type but deliberately NOT `Document`:
+      // navigations (and the download a `download`-attribute link triggers, which
+      // Chromium classifies as a `Document` request) are the nav path's job and are
+      // vetted by `assertNavigableResolved` before goto. Pausing a Document request
+      // in the Fetch domain and continuing it drops the page-initiated download
+      // (E4) on the floor — so navigations are left entirely native here while the
+      // exfil vectors (`fetch()`/`<img>`/XHR/beacon/…) stay guarded.
+      await cdp.send('Fetch.enable', { patterns: FETCH_GUARD_PATTERNS })
+    } catch {
+      /* target vanished before enable landed — nothing to guard */
+    }
+  }
+  try {
+    await Promise.all(context.pages().map((p) => arm(p)))
+  } catch {
+    /* best-effort across existing pages */
+  }
+  // Cover any tab opened DURING this command (e.g. resolveActivePage → newPage,
+  // or a window.open) so a subresource from a fresh tab is guarded too.
+  context.on('page', (p) => {
+    void arm(p)
+  })
+}
+
+/** Strip any path separators / traversal from a page-supplied download name (S3). */
 function sanitizeDownloadName(name: string): string {
   const base = path.basename(name || 'download')
   const cleaned = base.replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^\.+/, '')
@@ -119,7 +254,13 @@ export function autoHandleDownloads(
     const p = (async () => {
       try {
         await fs.mkdir(saveDir, { recursive: true })
-        const dest = path.join(saveDir, sanitizeDownloadName(d.suggestedFilename()))
+        // S3 chokepoint: a server-suggested filename with traversal/absolute
+        // components is reduced to a safe basename contained in saveDir. Belt to
+        // sanitizeDownloadName's suspenders — one function owns containment.
+        const contained = containedFilename(d.suggestedFilename(), saveDir)
+        const dest = contained.ok
+          ? contained.resolved
+          : path.join(saveDir, sanitizeDownloadName(d.suggestedFilename()))
         await d.saveAs(dest)
         last = d.suggestedFilename()
       } catch {
@@ -321,7 +462,10 @@ function assertName(name: string): string {
  */
 export async function openSession(name: string, opts: OpenOptions = {}): Promise<SessionInfo> {
   const dir = sessionDir(name)
-  const userDataDir = opts.userDataDir ?? path.join(dir, 'profile')
+  // E2 real-Chrome-profile: `profile` (an EXISTING user-data-dir) wins over an
+  // explicit userDataDir override, which wins over the throwaway per-session dir.
+  // Whichever is chosen is recorded in the sidecar and REUSED on every reconnect.
+  const userDataDir = opts.profile ?? opts.userDataDir ?? path.join(dir, 'profile')
   await fs.mkdir(userDataDir, { recursive: true })
 
   const engine = normalizeEngine(opts.engine)
@@ -492,6 +636,10 @@ export async function connect(name: string): Promise<Connection> {
   const page = context.pages()[0] ?? (await context.newPage())
   // Deterministic viewport (P0-8); best-effort over a CDP-connected page.
   await page.setViewportSize({ width: VIEWPORT.width, height: VIEWPORT.height }).catch(() => {})
+  // S2: re-arm the CDP Fetch-layer subresource egress guard on EVERY connect (the
+  // per-command reconnect model means it must be re-enabled each time). Never
+  // blocks the connect itself — a failure to arm is swallowed.
+  await enableFetchEgressGuard(context, fetchEgressPolicy).catch(() => {})
   return { browser, context, page }
 }
 

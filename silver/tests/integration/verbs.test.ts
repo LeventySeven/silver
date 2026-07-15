@@ -13,7 +13,7 @@ const NAME = `silver-verbs-${process.pid}-${Date.now()}`
 // TWO `.inner` buttons (frame-scoping ground truth), a load-time console.log, and
 // endpoints the network tests hit.
 const PAGE = `<!doctype html>
-<html><body>
+<html><head><title>Silver verbs</title></head><body>
   <h1>Silver verbs</h1>
   <input id="kbd" aria-label="kbd field">
   <button class="inner" id="mainbtn">Main</button>
@@ -29,9 +29,32 @@ const MOUSE_PAGE = `<!doctype html>
        onclick="window.__mc=(window.__mc||0)+1"></div>
 </body></html>`
 
+// R2 fixture: a page hosting a recaptcha iframe (detection by iframe src glob).
+const CAPTCHA_PAGE = `<!doctype html>
+<html><head><title>Verify</title></head><body>
+  <h1>Please complete the security check</h1>
+  <iframe src="https://www.google.com/recaptcha/api2/anchor?k=abc"></iframe>
+</body></html>`
+
+// R3 fixture: a login wall — a password field + a login-ish title (served at
+// a /login path so the URL signal fires too).
+const LOGIN_PAGE = `<!doctype html>
+<html><head><title>Sign in to continue</title></head><body>
+  <h1>Log in</h1>
+  <form><input name="user" aria-label="username">
+  <input type="password" aria-label="password"></form>
+</body></html>`
+
+// S4 fixture: a paid "Buy now" control that records that it was clicked.
+const BUY_PAGE = `<!doctype html>
+<html><body>
+  <button id="buy" onclick="document.body.setAttribute('data-bought','1')">Buy now</button>
+</body></html>`
+
 let server: Server
 let pageUrl: string
 let mouseUrl: string
+let baseUrl: string
 
 function firstRefWithRole(map: RefMap, role: string): string {
   for (const [ref, entry] of Object.entries(map.entries)) {
@@ -59,11 +82,34 @@ describe('vercel-parity verbs (real Chromium via the run() entry)', () => {
         res.end(MOUSE_PAGE)
         return
       }
+      if (url.startsWith('/captcha')) {
+        res.writeHead(200, { 'content-type': 'text/html' })
+        res.end(CAPTCHA_PAGE)
+        return
+      }
+      if (url.startsWith('/login')) {
+        res.writeHead(200, { 'content-type': 'text/html' })
+        res.end(LOGIN_PAGE)
+        return
+      }
+      if (url.startsWith('/buy')) {
+        res.writeHead(200, { 'content-type': 'text/html' })
+        res.end(BUY_PAGE)
+        return
+      }
+      // D6: echo back the Cookie header the fetch arrived with, so a test can
+      // prove the session's cookies rode along.
+      if (url.startsWith('/echo-cookie')) {
+        res.writeHead(200, { 'content-type': 'text/plain' })
+        res.end('COOKIE:' + (req.headers.cookie ?? 'none'))
+        return
+      }
       res.writeHead(200, { 'content-type': 'text/html' })
       res.end(PAGE)
     })
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
     const port = (server.address() as AddressInfo).port
+    baseUrl = `http://localhost:${port}`
     pageUrl = `http://localhost:${port}/`
     mouseUrl = `http://localhost:${port}/mouse`
   })
@@ -275,5 +321,138 @@ describe('vercel-parity verbs (real Chromium via the run() entry)', () => {
     ])
     expect(scrolled.env.success).toBe(true)
     expect((scrolled.env.data as { scrolled: boolean }).scrolled).toBe(true)
+  })
+
+  // --- AC1: expect / assertion primitive ----------------------------------
+  it('AC1: expect asserts element + page state (present passes, absent fails)', async () => {
+    await run(['open', pageUrl, '--session', NAME])
+    await run(['snapshot', '-i', '--session', NAME])
+
+    // A present element is visible → the assertion holds.
+    const vis = await run(['expect', '.inner', 'visible', '--session', NAME])
+    expect(vis.env.success).toBe(true)
+    expect((vis.env.data as { matched: boolean }).matched).toBe(true)
+
+    // An absent element → the assertion fails cleanly (matched:false, not a throw).
+    const absent = await run(['expect', '.no-such-element-xyz', 'visible', '--session', NAME])
+    expect(absent.env.success).toBe(false)
+    expect((absent.env.data as { matched: boolean }).matched).toBe(false)
+
+    // A grounded @ref resolves through the same grounding gate.
+    const map = await loadRefMap(NAME)
+    const btnRef = firstRefWithRole(map as RefMap, 'button')
+    const refVis = await run(['expect', `@${btnRef}`, 'visible', '--session', NAME])
+    expect(refVis.env.success).toBe(true)
+
+    // text-contains: pass and fail.
+    const txt = await run(['expect', 'h1', 'text-contains', 'Silver verbs', '--session', NAME])
+    expect(txt.env.success).toBe(true)
+    const txtNo = await run(['expect', 'h1', 'text-contains', 'not-in-the-page', '--session', NAME])
+    expect(txtNo.env.success).toBe(false)
+
+    // count: the main frame has exactly one `.inner`.
+    const cnt = await run(['expect', '.inner', 'count', '1', '--session', NAME])
+    expect(cnt.env.success).toBe(true)
+    const cntNo = await run(['expect', '.inner', 'count', '5', '--session', NAME])
+    expect(cntNo.env.success).toBe(false)
+    expect((cntNo.env.data as { observed: string }).observed).toBe('1')
+
+    // Page-level matchers need no target.
+    const title = await run(['expect', 'title-contains', 'Silver', '--session', NAME])
+    expect(title.env.success).toBe(true)
+    const url = await run(['expect', 'url-matches', 'localhost', '--session', NAME])
+    expect(url.env.success).toBe(true)
+    const urlNo = await run(['expect', 'url-matches', 'example.com', '--session', NAME])
+    expect(urlNo.env.success).toBe(false)
+  })
+
+  // --- R2/R3: CAPTCHA + auth-wall detection (dead codes now emitted) -------
+  it('R2/R3: snapshot/open surface captcha_detected and auth_required', async () => {
+    // A recaptcha iframe → captcha_detected on the snapshot warning + open flag.
+    await run(['open', `${baseUrl}/captcha`, '--session', NAME])
+    const capSnap = await run(['snapshot', '-i', '--session', NAME])
+    expect(capSnap.env.warning ?? '').toContain('captcha_detected')
+    const capOpen = await run(['open', `${baseUrl}/captcha`, '--session', NAME])
+    expect((capOpen.env.data as { captcha_detected?: boolean }).captcha_detected).toBe(true)
+
+    // A login wall (password field + login URL/title) → auth_required.
+    await run(['open', `${baseUrl}/login`, '--session', NAME])
+    const loginSnap = await run(['snapshot', '-i', '--session', NAME])
+    expect(loginSnap.env.warning ?? '').toContain('auth_required')
+    const loginOpen = await run(['open', `${baseUrl}/login`, '--session', NAME])
+    expect((loginOpen.env.data as { auth_required?: boolean }).auth_required).toBe(true)
+
+    // A plain page trips neither detector.
+    await run(['open', pageUrl, '--session', NAME])
+    const normal = await run(['snapshot', '-i', '--session', NAME])
+    expect(normal.env.warning ?? '').not.toContain('captcha_detected')
+    expect(normal.env.warning ?? '').not.toContain('auth_required')
+  })
+
+  // --- D6: cookie-authenticated read fetch --------------------------------
+  it('D6: read attaches the live session cookies to the fetch Cookie header', async () => {
+    await run(['open', pageUrl, '--session', NAME])
+    // Seed a cookie in the browser context (same origin as the echo endpoint).
+    await run(['eval', "document.cookie='silversess=abc123'", '--enable-actions', '--session', NAME])
+
+    const r = await run(['read', `${baseUrl}/echo-cookie`, '--session', NAME])
+    expect(r.env.success).toBe(true)
+    // The echo endpoint reflects the Cookie header it received.
+    expect(r.env.data as string).toContain('silversess=abc123')
+  })
+
+  // --- S4: two-phase confirm / deny gate ----------------------------------
+  it('S4: a gated buy returns requires_confirmation; confirm proceeds, deny aborts', async () => {
+    const origTTY = process.stdout.isTTY
+    process.stdout.isTTY = false
+    try {
+      await run(['open', `${baseUrl}/buy`, '--session', NAME])
+      await run(['snapshot', '-i', '--session', NAME])
+      const map = await loadRefMap(NAME)
+      const buyRef = firstRefWithRole(map as RefMap, 'button')
+
+      // Default (no --two-phase-confirm): the paid control still hard-denies.
+      const hard = await run(['click', `@${buyRef}`, '--enable-actions', '--session', NAME])
+      expect(hard.env.success).toBe(false)
+      expect(hard.env.error).toBe(ERRORS.confirm_required.message)
+
+      // deny path: request → deny → the click never fires.
+      const p1 = await run([
+        'click', `@${buyRef}`, '--enable-actions', '--two-phase-confirm', '--session', NAME,
+      ])
+      expect(p1.env.success).toBe(false)
+      const d1 = p1.env.data as { status: string; confirmation_id: string }
+      expect(d1.status).toBe('requires_confirmation')
+      expect(typeof d1.confirmation_id).toBe('string')
+      expect(d1.confirmation_id.length).toBeGreaterThan(0)
+
+      const denied = await run(['deny', d1.confirmation_id, '--session', NAME])
+      expect(denied.env.success).toBe(true)
+      expect((denied.env.data as { denied: boolean }).denied).toBe(true)
+      const notBought = await run([
+        'eval', "document.body.getAttribute('data-bought')", '--enable-actions', '--session', NAME,
+      ])
+      expect(notBought.env.data as string).toContain('null')
+
+      // confirm path: request → confirm → the click fires (data-bought set).
+      const p2 = await run([
+        'click', `@${buyRef}`, '--enable-actions', '--two-phase-confirm', '--session', NAME,
+      ])
+      const id2 = (p2.env.data as { confirmation_id: string }).confirmation_id
+      const confirmed = await run(['confirm', id2, '--enable-actions', '--session', NAME])
+      expect(confirmed.env.success).toBe(true)
+      expect((confirmed.env.data as { confirmed: string }).confirmed).toBe(id2)
+
+      const bought = await run([
+        'eval', "document.body.getAttribute('data-bought')", '--enable-actions', '--session', NAME,
+      ])
+      expect(bought.env.data as string).toContain('1')
+
+      // One-shot: re-confirming the same id no longer resolves.
+      const again = await run(['confirm', id2, '--enable-actions', '--session', NAME])
+      expect(again.env.success).toBe(false)
+    } finally {
+      process.stdout.isTTY = origTTY
+    }
   })
 })
