@@ -1,0 +1,35 @@
+{
+  "name": "agent-browser",
+  "version": "0.1.0",
+  "private": true,
+  "description": "uab — keyless browser-automation CLI for AI sub-agents, built on Playwright. An agent-browser-compatible superset that never calls a model.",
+  "license": "MIT",
+  "author": "ultimate-agent-browser",
+  "type": "module",
+  "bin": {
+    "uab": "./dist/cli.js"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "files": [
+    "dist",
+    "SKILL.md",
+    "NOTICE",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "vitest run",
+    "dev": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "playwright": "^1.61.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

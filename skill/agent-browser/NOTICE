@@ -1,0 +1,27 @@
+ultimate-agent-browser (uab)
+Copyright (c) 2026 ultimate-agent-browser
+
+This product is licensed under the MIT License (see LICENSE).
+
+It adapts patterns and design ideas — not verbatim code, except where noted —
+from the following open-source projects. We gratefully credit them:
+
+  * vercel-labs/agent-browser  (Apache License 2.0)
+      - snapshot line grammar and @eN ref format
+      - role allowlists (INTERACTIVE / CONTENT / STRUCTURAL)
+      - parseRef tolerance (@e12 | ref=e12 | e12)
+      - response-envelope shape
+
+  * browserbase/stagehand  (MIT License)
+      - ID-grounded extract: schema transform / id-string schema / URL injection
+        and reverse-mapping approach
+
+  * browser-use/browser-use  (MIT License)
+      - interactive-element heuristic cascade and backendNodeId selector map
+
+The browser engine and all actuation are provided by Microsoft Playwright
+(Apache License 2.0), which is the sole runtime browser dependency.
+
+Portions of the Apache-2.0 licensed material are used under the terms of that
+license; a copy of the Apache License 2.0 is available at
+https://www.apache.org/licenses/LICENSE-2.0
