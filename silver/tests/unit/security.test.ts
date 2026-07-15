@@ -12,7 +12,16 @@ import {
   confirmGateDecision,
   isDestructivePaidName,
   MUTATING_VERBS,
+  extractAmount,
+  buildConfirmPreview,
 } from '../../src/security/confirm.js'
+import {
+  buildSecretRegistry,
+  parseSecretSpec,
+  domainMatches,
+  hasSecretToken,
+  SecretRegistry,
+} from '../../src/security/secret.js'
 import { ERRORS } from '../../src/core/errors.js'
 
 // ---------------------------------------------------------------------------
@@ -381,6 +390,155 @@ describe('errors: new hardening codes', () => {
       expect(m).not.toContain('/etc')
       expect(m.toLowerCase()).not.toContain('password=')
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// secret: <secret> write-path indirection + domain scope (E1)
+// ---------------------------------------------------------------------------
+describe('secret: domainMatches (~20-line scope matcher)', () => {
+  it('exact + subdomain suffix, on a dot boundary (bank.com ≠ evil.com)', () => {
+    expect(domainMatches('bank.com', 'bank.com')).toBe(true)
+    expect(domainMatches('bank.com', 'login.bank.com')).toBe(true)
+    expect(domainMatches('bank.com', 'evil.com')).toBe(false)
+    // the classic suffix-forgery: bank.com.evil.com must NOT match
+    expect(domainMatches('bank.com', 'bank.com.evil.com')).toBe(false)
+  })
+  it('glob wildcard expands within the host', () => {
+    expect(domainMatches('*.bank.com', 'login.bank.com')).toBe(true)
+    expect(domainMatches('*.bank.com', 'evil.com')).toBe(false)
+  })
+  it('`*` opts out of scoping; empty host/glob never matches', () => {
+    expect(domainMatches('*', 'anything.example')).toBe(true)
+    expect(domainMatches('bank.com', '')).toBe(false)
+    expect(domainMatches('', 'bank.com')).toBe(false)
+  })
+  it('normalizes case + a leading dot in the glob', () => {
+    expect(domainMatches('.BANK.COM', 'login.bank.com')).toBe(true)
+  })
+})
+
+describe('secret: parseSecretSpec', () => {
+  it('parses NAME=VALUE (domain defaults to *) and NAME@DOMAIN=VALUE', () => {
+    expect(parseSecretSpec('PW=hunter2')).toEqual({ name: 'PW', value: 'hunter2', domain: '*' })
+    expect(parseSecretSpec('PW@bank.com=hunter2')).toEqual({
+      name: 'PW',
+      value: 'hunter2',
+      domain: 'bank.com',
+    })
+  })
+  it('splits on the FIRST = so a value may contain = ; uppercases the name', () => {
+    expect(parseSecretSpec('tok@bank.com=a=b=c')).toEqual({
+      name: 'TOK',
+      value: 'a=b=c',
+      domain: 'bank.com',
+    })
+  })
+  it('returns null for a malformed spec', () => {
+    expect(parseSecretSpec('nodelimiter')).toBeNull()
+    expect(parseSecretSpec('=novalue')).toBeNull()
+  })
+})
+
+describe('secret: SecretRegistry.resolveValue (domain-scoped, fail-closed)', () => {
+  const reg = buildSecretRegistry(['BANK_PW@bank.com=s3cr3t-value'])
+
+  it('resolves a token on the matching domain', () => {
+    const r = reg.resolveValue('<secret>BANK_PW</secret>', 'https://login.bank.com/signin')
+    expect(r.refused).toBe(false)
+    expect(r.usedSecret).toBe(true)
+    expect(r.value).toBe('s3cr3t-value')
+  })
+
+  it('REFUSES on a mismatched domain (the anti-exfiltration guarantee)', () => {
+    const r = reg.resolveValue('<secret>BANK_PW</secret>', 'https://evil.com/steal')
+    expect(r.refused).toBe(true)
+    expect(r.usedSecret).toBe(false)
+    // the raw secret is NOT emitted on refusal (original token returned)
+    expect(r.value).not.toContain('s3cr3t-value')
+  })
+
+  it('REFUSES an unknown secret name (never types the literal token)', () => {
+    const r = reg.resolveValue('<secret>NOPE</secret>', 'https://bank.com/')
+    expect(r.refused).toBe(true)
+  })
+
+  it('passes plain values through untouched (no token, no work)', () => {
+    const r = reg.resolveValue('just typing this', 'https://bank.com/')
+    expect(r).toEqual({ value: 'just typing this', usedSecret: false, refused: false })
+  })
+
+  it('hasSecretToken / hasTokens detect the token', () => {
+    expect(hasSecretToken('<secret>X</secret>')).toBe(true)
+    expect(hasSecretToken('nope')).toBe(false)
+    expect(reg.hasTokens('<SECRET>X</SECRET>')).toBe(true)
+  })
+})
+
+describe('secret: buildSecretRegistry from env', () => {
+  it('reads SILVER_SECRET_<NAME>, with an optional DOMAIN|VALUE form; flags override env', () => {
+    const reg = buildSecretRegistry(['FROM_FLAG@x.com=flagval'], {
+      SILVER_SECRET_ENV_ONE: 'bank.com|env-scoped',
+      SILVER_SECRET_ENV_TWO: 'no-domain',
+    } as NodeJS.ProcessEnv)
+    expect(reg instanceof SecretRegistry).toBe(true)
+    expect(reg.resolveValue('<secret>ENV_ONE</secret>', 'https://bank.com/').value).toBe(
+      'env-scoped',
+    )
+    // no-domain env secret resolves anywhere (domain *)
+    expect(reg.resolveValue('<secret>ENV_TWO</secret>', 'https://anywhere.example/').value).toBe(
+      'no-domain',
+    )
+    expect(reg.size).toBe(3)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// confirm: extractAmount + buildConfirmPreview (E2, keyless)
+// ---------------------------------------------------------------------------
+describe('confirm: extractAmount', () => {
+  it('anchors on a total label and pulls the adjacent amount', () => {
+    expect(extractAmount('Cart\nGrand total: $49.99\nShip to…')).toBe('$49.99')
+    expect(extractAmount('Order total £1,299.00 due now')).toBe('£1,299.00')
+    expect(extractAmount('Amount due: USD 12.50')).toBe('USD 12.50')
+  })
+  it('prefers grand total over a bare subtotal-style total', () => {
+    expect(extractAmount('Total: $5.00 ... Grand total: $42.00')).toBe('$42.00')
+  })
+  it('falls back to the first currency amount when no label matches', () => {
+    expect(extractAmount('pay €9.90 to continue')).toBe('€9.90')
+  })
+  it('returns null when there is no amount', () => {
+    expect(extractAmount('no prices on this page')).toBeNull()
+    expect(extractAmount('')).toBeNull()
+  })
+})
+
+describe('confirm: buildConfirmPreview', () => {
+  it('shows the target name, the amount, and redacted field values', () => {
+    const preview = buildConfirmPreview({
+      name: 'Place order',
+      formValues: { email: 'a@b.com', password: 'hunter2', card: '4111 1111 1111 1111' },
+      pageText: 'Grand total: $49.99',
+    })
+    expect(preview).toContain('Place order')
+    expect(preview).toContain('$49.99')
+    expect(preview).toContain('email = a@b.com')
+    // password + card fields are masked, never echoed literally
+    expect(preview).not.toContain('hunter2')
+    expect(preview).not.toContain('4111 1111 1111 1111')
+    expect(preview).toContain('[redacted]')
+  })
+  it('masks a <secret> token value in the preview (never shows the token)', () => {
+    const preview = buildConfirmPreview({
+      name: 'Pay now',
+      formValues: { token: '<secret>BANK_PW</secret>' },
+    })
+    expect(preview).toContain('[redacted]')
+    expect(preview).not.toContain('BANK_PW')
+  })
+  it('degrades to a name-only preview with no fields/amount', () => {
+    expect(buildConfirmPreview({ name: 'Delete account' })).toContain('Delete account')
   })
 })
 

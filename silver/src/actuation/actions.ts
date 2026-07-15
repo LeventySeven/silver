@@ -24,7 +24,8 @@ import type { RefMap } from '../perception/refmap.js'
 import { groundRef } from '../perception/refmap.js'
 import { ok, fail, type Envelope } from '../core/envelope.js'
 import type { ErrorCode } from '../core/errors.js'
-import { redactValue } from '../security/redact.js'
+import { redactValue, REDACTED } from '../security/redact.js'
+import type { SecretRegistry } from '../security/secret.js'
 import { toLocator, ResolveError, REF_ATTR } from './resolve.js'
 
 /** Ref-based actuation verbs. */
@@ -54,6 +55,15 @@ export type ActOptions = {
   selectValues?: string[]
   /** `upload`: file paths (multiple). Falls back to `value`. */
   files?: string[]
+  /**
+   * `fill`/`type`: the CLI-process secret registry. When set and the value
+   * carries a `<secret>NAME</secret>` token, it is resolved here (WRITE-path
+   * choke point, symmetric to `redactValue` on the read side) against the live
+   * page URL for domain scope. The raw secret NEVER enters an envelope: a
+   * secret-derived read-back is force-redacted. Resolved by the CLI, so the host
+   * context/argv never held the credential (adopt-list E1).
+   */
+  secrets?: SecretRegistry
 }
 
 export type ActResult = {
@@ -144,17 +154,42 @@ export async function act(
     return actFail<ActResult>('element_not_found')
   }
 
+  // 2b. WRITE-path secret indirection (adopt-list E1): resolve any
+  // `<secret>NAME</secret>` token in a fill/type value at the SAME choke point
+  // `redactValue` occupies on the read side (symmetric). Domain-scoped against
+  // the live page URL, so a bank.com secret refuses on evil.com even under
+  // injection. Refusal FAILS CLOSED — the literal token is never dispatched.
+  let effectiveValue = value
+  let usedSecret = false
+  if (
+    value !== undefined &&
+    (verb === 'fill' || verb === 'type') &&
+    opts.secrets !== undefined &&
+    opts.secrets.hasTokens(value)
+  ) {
+    const r = opts.secrets.resolveValue(value, page.url())
+    if (r.refused) return actFail<ActResult>('not_permitted')
+    effectiveValue = r.value
+    usedSecret = r.usedSecret
+  }
+
   // 3. Dispatch to Playwright; cleanup the stamped attribute regardless.
   try {
-    const result = await dispatch(page, cdp, locator, verb, grounded.ref, value, refmap, opts)
+    const result = await dispatch(page, cdp, locator, verb, grounded.ref, effectiveValue, refmap, opts)
     // Redact the `fill` read-back through the SAME choke point `get value` uses
     // (fix F5): a raw read-back would otherwise ECHO a just-typed password/card
-    // un-redacted back to the host. isPassword comes from the live DOM `type`;
-    // role/name come from the grounded ref for the password-hint check.
+    // un-redacted back to the host. A secret-derived value is ALWAYS masked
+    // (it may land in a plain text field redactValue would not otherwise catch).
+    // isPassword comes from the live DOM `type`; role/name come from the grounded
+    // ref for the password-hint check.
     if (result.value !== undefined) {
-      const type = ((await locator.getAttribute('type').catch(() => null)) ?? '').toLowerCase()
-      const isPassword = type === 'password'
-      result.value = redactValue(grounded.entry.role, grounded.entry.name, result.value, isPassword)
+      if (usedSecret) {
+        result.value = REDACTED
+      } else {
+        const type = ((await locator.getAttribute('type').catch(() => null)) ?? '').toLowerCase()
+        const isPassword = type === 'password'
+        result.value = redactValue(grounded.entry.role, grounded.entry.name, result.value, isPassword)
+      }
     }
     return ok(result)
   } catch (err) {
@@ -369,5 +404,87 @@ export async function cleanupStamp(page: Page): Promise<void> {
     } catch {
       /* frame detached / cross-origin / navigating — best effort, never throw */
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Coordinate fallback verbs (adopt-list B1) — the AX-less escape hatch.
+//
+// Canvas widgets, custom no-name <div> controls, virtualized lists, and
+// shadow-DOM SPAs have NO accessible-name / AX node, so ref/`find` grounding
+// returns `element_not_found` and they are otherwise un-actable. These verbs
+// bypass groundRef/toLocator ENTIRELY and drive page.mouse/page.keyboard at raw
+// (x, y) viewport coordinates the host derived from a screenshot. There is no
+// grounding gate here by design — the fixed viewport makes coordinates stable,
+// and the caller (CLI) still gates these behind --enable-actions + confirm.
+// ---------------------------------------------------------------------------
+
+export type CoordResult = {
+  verb: 'click' | 'type' | 'drag'
+  x: number
+  y: number
+  /** `drag`: destination coordinates. */
+  x2?: number
+  y2?: number
+}
+
+export type CoordOptions = {
+  /** `coordType`: secret registry for `<secret>` token resolution (E1 parity). */
+  secrets?: SecretRegistry
+}
+
+/** Click at raw viewport coordinates via page.mouse (no ref, no locator). */
+export async function coordClick(page: Page, x: number, y: number): Promise<Envelope<CoordResult>> {
+  try {
+    await page.mouse.click(x, y)
+    return ok({ verb: 'click', x, y })
+  } catch (err) {
+    return actFail<CoordResult>(mapActionError(err))
+  }
+}
+
+/**
+ * Focus a point (click) then type `text` via page.keyboard. The typed text is
+ * NEVER echoed in the envelope (it may be a credential); `<secret>` tokens are
+ * resolved against the live page URL when a registry is supplied (E1 parity).
+ */
+export async function coordType(
+  page: Page,
+  x: number,
+  y: number,
+  text: string,
+  opts: CoordOptions = {},
+): Promise<Envelope<CoordResult>> {
+  let effective = text
+  if (opts.secrets !== undefined && opts.secrets.hasTokens(text)) {
+    const r = opts.secrets.resolveValue(text, page.url())
+    if (r.refused) return actFail<CoordResult>('not_permitted')
+    effective = r.value
+  }
+  try {
+    await page.mouse.click(x, y)
+    await page.keyboard.type(effective)
+    return ok({ verb: 'type', x, y })
+  } catch (err) {
+    return actFail<CoordResult>(mapActionError(err))
+  }
+}
+
+/** Press-drag from (x1,y1) to (x2,y2) via page.mouse (no ref, no locator). */
+export async function coordDrag(
+  page: Page,
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+): Promise<Envelope<CoordResult>> {
+  try {
+    await page.mouse.move(x1, y1)
+    await page.mouse.down()
+    await page.mouse.move(x2, y2)
+    await page.mouse.up()
+    return ok({ verb: 'drag', x: x1, y: y1, x2, y2 })
+  } catch (err) {
+    return actFail<CoordResult>(mapActionError(err))
   }
 }

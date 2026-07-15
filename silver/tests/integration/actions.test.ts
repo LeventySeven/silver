@@ -4,8 +4,9 @@ import { openSession, connect, closeSession, saveRefMap } from '../../src/core/s
 import { snapshotNodes } from '../../src/perception/walk.js'
 import { render } from '../../src/perception/serialize.js'
 import { groundRef, newGeneration, type RefMap } from '../../src/perception/refmap.js'
-import { act } from '../../src/actuation/actions.js'
+import { act, coordClick, coordType, coordDrag } from '../../src/actuation/actions.js'
 import { settleAndFingerprint } from '../../src/actuation/pagechange.js'
+import { buildSecretRegistry } from '../../src/security/secret.js'
 import { ERRORS } from '../../src/core/errors.js'
 
 // Unique per run so parallel/retry invocations never collide.
@@ -114,6 +115,90 @@ describe('actuation (real Chromium, Playwright delegation + stale-ref guard)', (
       } finally {
         await cdp.detach().catch(() => {})
         await browser.close()
+      }
+    },
+  )
+
+  it(
+    'resolves a <secret> in fill on the matching domain, refuses on mismatch, never leaks (E1)',
+    async () => {
+      const S = `${NAME}-sec`
+      await openSession(S, { headed: false })
+      const { browser, page } = await connect(S)
+      const cdp: CDPSession = await page.context().newCDPSession(page)
+      try {
+        // Serve the fixture on ANY host so page.url() carries a real domain.
+        await page.route('**/*', (route) =>
+          route.fulfill({ contentType: 'text/html', body: FIXTURE }),
+        )
+        const registry = buildSecretRegistry(['BANK_PW@bank.example=s3cr3t-value'])
+
+        // --- matching domain: the token resolves, the SECRET reaches the DOM,
+        //     but the envelope read-back is force-redacted (never leaks). ---
+        await page.goto('http://bank.example/login')
+        const map1 = await takeSnapshot(page, 1, null)
+        const inputRef = refFor(map1, 'textbox', 'Name field')
+        const okEnv = await act(page, cdp, 'fill', inputRef, '<secret>BANK_PW</secret>', map1, {
+          secrets: registry,
+        })
+        expect(okEnv.success).toBe(true)
+        expect(await page.locator('#inp').inputValue()).toBe('s3cr3t-value') // reached the page
+        expect(okEnv.data?.value).toBe('[redacted]') // but masked in the envelope
+        expect(JSON.stringify(okEnv)).not.toContain('s3cr3t-value')
+
+        // --- mismatched domain: REFUSED, and the secret never reaches the DOM. ---
+        await page.goto('http://evil.example/steal')
+        const map2 = await takeSnapshot(page, 2, map1)
+        const inputRef2 = refFor(map2, 'textbox', 'Name field')
+        const refused = await act(page, cdp, 'fill', inputRef2, '<secret>BANK_PW</secret>', map2, {
+          secrets: registry,
+        })
+        expect(refused.success).toBe(false)
+        expect(JSON.stringify(refused)).not.toContain('s3cr3t-value')
+        expect(await page.locator('#inp').inputValue()).not.toContain('s3cr3t-value')
+      } finally {
+        await cdp.detach().catch(() => {})
+        await browser.close()
+        await closeSession(S).catch(() => {})
+      }
+    },
+  )
+
+  it(
+    'coordinate verbs drive page.mouse/keyboard, bypassing refs (B1)',
+    async () => {
+      const S = `${NAME}-coord`
+      await openSession(S, { headed: false })
+      const { browser, page } = await connect(S)
+      try {
+        await page.setContent(FIXTURE, { waitUntil: 'load' })
+
+        // coordClick at the guard button's center fires its onclick (no ref).
+        await page.evaluate('window.__guardClicked=false')
+        const gbox = await page.locator('#guard').boundingBox()
+        if (!gbox) throw new Error('no bounding box for #guard')
+        const cx = gbox.x + gbox.width / 2
+        const cy = gbox.y + gbox.height / 2
+        const clickEnv = await coordClick(page, cx, cy)
+        expect(clickEnv.success).toBe(true)
+        expect(await page.evaluate('window.__guardClicked')).toBe(true)
+
+        // coordType focuses the input at (x,y) and types — WITHOUT echoing text.
+        const ibox = await page.locator('#inp').boundingBox()
+        if (!ibox) throw new Error('no bounding box for #inp')
+        const typeEnv = await coordType(page, ibox.x + 5, ibox.y + 5, 'typed-here')
+        expect(typeEnv.success).toBe(true)
+        expect(await page.locator('#inp').inputValue()).toBe('typed-here')
+        expect(JSON.stringify(typeEnv)).not.toContain('typed-here')
+
+        // coordDrag returns a success envelope carrying the destination coords.
+        const dragEnv = await coordDrag(page, cx, cy, cx + 10, cy + 10)
+        expect(dragEnv.success).toBe(true)
+        expect(dragEnv.data?.verb).toBe('drag')
+        expect(dragEnv.data?.x2).toBe(cx + 10)
+      } finally {
+        await browser.close()
+        await closeSession(S).catch(() => {})
       }
     },
   )

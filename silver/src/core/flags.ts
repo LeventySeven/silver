@@ -83,6 +83,8 @@ export type ParsedFlags = {
   tag?: string
   /** `task checkpoint --note <t>` — free-text checkpoint note. */
   note?: string
+  /** `skill --list` — enumerate the reference topics (G5). */
+  list: boolean
   /** `subagent spawn --background` — non-blocking child (host collects later). */
   background: boolean
   /** `subagent spawn --tab` — child runs on its own tab in a shared browser. */
@@ -111,6 +113,27 @@ export type ParsedFlags = {
   /** `--wait networkidle`: on a mutating verb (open/click/…), opt into the full
    * network-idle wait instead of the lowered default budget (engine-plan P1b). */
   waitNetworkidle: boolean
+  /**
+   * `--engine firefox|webkit|chromium` (default chromium): the Playwright
+   * browser type to LAUNCH for an owned session (H1). Default stays chromium for
+   * CDP/console parity; firefox/webkit are the real fix for TLS/H2-fingerprint
+   * sites that fail under Chromium (cars.com et al). Threaded into openSession.
+   */
+  engine?: string
+  /**
+   * `--grant-permissions`: on session connect, auto-grant the low-risk browser
+   * permission prompts (geolocation/clipboard/notifications) so a task that hits
+   * a permission dialog does not hang (E4). Flag-gated — OFF by default.
+   */
+  grantPermissions: boolean
+  // ---- coordinate-verb fallback (B1): raw {x,y} for canvas/custom widgets with
+  // no AX ref. Numeric pairs; each consumes TWO following tokens. ----
+  /** `click --at <x> <y>` / `type --at <x> <y> <text>`: click/type target point. */
+  at?: [number, number]
+  /** `drag --from <x> <y> --to <x> <y>`: drag start point. */
+  from?: [number, number]
+  /** `drag --from <x> <y> --to <x> <y>`: drag end point. */
+  to?: [number, number]
   // ---- positionals ----
   verb: string
   args: string[]
@@ -141,6 +164,8 @@ const VALUE_FLAGS: Record<string, keyof ParsedFlags> = {
   id: 'id',
   tag: 'tag',
   note: 'note',
+  // H1: browser engine to launch for an owned session.
+  engine: 'engine',
   // network / storage verb sub-flags.
   filter: 'filter',
   type: 'type',
@@ -172,6 +197,7 @@ const BOOL_FLAGS: Record<string, keyof ParsedFlags> = {
   all: 'all',
   stdin: 'stdin',
   force: 'force',
+  list: 'list',
   // subagent spawn boolean flags.
   background: 'background',
   tab: 'tab',
@@ -179,6 +205,8 @@ const BOOL_FLAGS: Record<string, keyof ParsedFlags> = {
   abort: 'abort',
   clear: 'clear',
   bail: 'bail',
+  // E4: opt-in permission auto-grant on connect (geolocation/clipboard/…).
+  'grant-permissions': 'grantPermissions',
   // NOTE: `--wait` is handled explicitly in the parse loop (it is dual-purpose:
   // a bare boolean for `download --wait`, and `--wait networkidle` for the
   // mutating-verb full-settle opt-in), so it is intentionally NOT listed here.
@@ -186,6 +214,13 @@ const BOOL_FLAGS: Record<string, keyof ParsedFlags> = {
 
 /** `--load` (and `--load networkidle`): optional-value flag. */
 const OPTIONAL_VALUE_FLAGS = new Set(['load'])
+
+/** Coordinate-pair flags (B1): each consumes TWO following numeric tokens. */
+const PAIR_FLAGS: Record<string, 'at' | 'from' | 'to'> = {
+  at: 'at',
+  from: 'from',
+  to: 'to',
+}
 
 const SHORT_BOOL: Record<string, keyof ParsedFlags> = {
   i: 'interactive',
@@ -220,6 +255,7 @@ function defaults(): ParsedFlags {
     all: false,
     stdin: false,
     force: false,
+    list: false,
     background: false,
     tab: false,
     resourceTypes: [],
@@ -228,6 +264,7 @@ function defaults(): ParsedFlags {
     bail: false,
     wait: false,
     waitNetworkidle: false,
+    grantPermissions: false,
     verb: '',
     args: [],
   }
@@ -273,6 +310,25 @@ export function parseFlags(argv: string[]): ParsedFlags {
         f.wait = true
         const val = inlineValue ?? (argv[i + 1] === 'networkidle' ? argv[++i] : undefined)
         if (val === 'networkidle') f.waitNetworkidle = true
+        continue
+      }
+      // Coordinate-pair flags (B1): `--at x y`, `--from x y`, `--to x y`. Each
+      // consumes the next TWO tokens as finite numbers; a `--at=x,y` inline form
+      // is also accepted. A malformed pair leaves the field undefined (the verb
+      // handler then reports a clean usage error), never a partial coordinate.
+      if (name in PAIR_FLAGS) {
+        const key = PAIR_FLAGS[name]
+        let xs: string | undefined
+        let ys: string | undefined
+        if (inlineValue !== undefined) {
+          ;[xs, ys] = inlineValue.split(',')
+        } else {
+          xs = argv[++i]
+          ys = argv[++i]
+        }
+        const x = Number(xs)
+        const y = Number(ys)
+        if (Number.isFinite(x) && Number.isFinite(y)) f[key] = [x, y]
         continue
       }
       if (name in CSV_FLAGS) {

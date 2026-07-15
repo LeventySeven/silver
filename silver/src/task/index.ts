@@ -76,8 +76,10 @@ export async function handleTask(flags: ParsedFlags): Promise<Envelope<unknown>>
       return taskResume(flags)
     case 'exec':
       return taskExec(flags)
+    case 'compile':
+      return taskCompile(flags)
     default:
-      return badRequest('usage: silver task start|log|checkpoint|status|list|resume|exec')
+      return badRequest('usage: silver task start|log|checkpoint|status|list|resume|exec|compile')
   }
 }
 
@@ -266,6 +268,130 @@ async function taskExec(flags: ParsedFlags): Promise<Envelope<unknown>> {
     error: res.env.error,
     ...(res.env.warning ? { warning: res.env.warning } : {}),
   }
+}
+
+/**
+ * `task compile <id>` — the durable, re-runnable artifact (adopt-list F1).
+ *
+ * Reads the latest run's action_log.jsonl, pulls the recorded `exec` command
+ * invocations, promotes each literal argument into a named `--flag`-style shell
+ * parameter (Webwright's `# Parameters` shape), and emits a runnable `silver`
+ * script whose DEFAULTS reproduce the task verbatim and whose parameters let a
+ * human/cron vary it — with ZERO further LLM. The script IS the artifact
+ * (task/store.ts's stated intent, now delivered). KEYLESS: pure text assembly.
+ */
+async function taskCompile(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const id = idAt(flags, 1)
+  if (!id) return badRequest('usage: silver task compile <id>')
+  if (!(await taskExists(id))) return badRequest('no such task; run `task start` first')
+  const n = await latestRun(id)
+  if (n === 0) return badRequest('this task has no run yet; run `task start` first')
+
+  const log = await readLog(id, n)
+  const commands = extractCommands(log)
+  const { script, parameters } = renderScript(id, n, commands)
+
+  const scriptName = 'compiled.sh'
+  const out = path.join(runDirPath(id, n), scriptName)
+  await fs.mkdir(path.dirname(out), { recursive: true })
+  await fs.writeFile(out, script, { encoding: 'utf8', mode: 0o755 })
+
+  await appendLog(id, n, { kind: 'compile', script: scriptName, commands: commands.length })
+
+  return ok({
+    id,
+    run: `run_${n}`,
+    script: out,
+    scriptName,
+    commands: commands.length,
+    parameters,
+    note: 're-run this script to reproduce the task verbatim; override any parameter (env var) to vary it — no LLM needed',
+  })
+}
+
+/** Pull the recorded silver command invocations (exec entries) from a log. */
+function extractCommands(log: unknown[]): string[][] {
+  const out: string[][] = []
+  for (const rec of log) {
+    // appendLog wraps every event as { ts, event }. An exec event carries the
+    // verbatim command token array under `command`.
+    const event = (rec as { event?: unknown })?.event
+    const cmd = (event as { command?: unknown })?.command
+    if (Array.isArray(cmd) && cmd.length > 0 && cmd.every((t) => typeof t === 'string')) {
+      out.push(cmd as string[])
+    }
+  }
+  return out
+}
+
+/**
+ * Render the parameterized shell script + the list of parameter names. Each
+ * non-flag positional after the verb becomes a `${NAME:-default}` parameter;
+ * flag tokens (`-x`/`--x`) are kept literal so the shape is preserved.
+ */
+function renderScript(
+  id: string,
+  n: number,
+  commands: string[][],
+): { script: string; parameters: Array<{ name: string; default: string }> } {
+  const parameters: Array<{ name: string; default: string }> = []
+  const body: string[] = []
+
+  commands.forEach((cmd, ci) => {
+    const verb = cmd[0]
+    const parts: string[] = ['silver', shellQuote(verb)]
+    for (let p = 1; p < cmd.length; p++) {
+      const tok = cmd[p]
+      if (tok.startsWith('-')) {
+        // A flag (or its literal switch) — keep verbatim, do not parameterize.
+        parts.push(shellQuote(tok))
+        continue
+      }
+      const name = paramName(verb, ci + 1, p)
+      parameters.push({ name, default: tok })
+      parts.push(`"$${name}"`)
+    }
+    body.push(parts.join(' '))
+  })
+
+  const header = [
+    '#!/usr/bin/env bash',
+    `# Compiled from silver task "${sanitizeComment(id)}" run_${n}.`,
+    '# Silver is keyless: this script calls `silver` verbatim by default. Each',
+    '# literal below is an override-able parameter — set the env var to vary it.',
+    'set -euo pipefail',
+    '',
+    '# Parameters',
+    ...parameters.map((par) => `${par.name}="\${${par.name}:-${shellEscapeDefault(par.default)}}"`),
+    '',
+  ]
+
+  const script = [...header, ...body, ''].join('\n')
+  return { script, parameters }
+}
+
+/** A unique, shell-valid parameter name: `<VERB>_<cmdIndex>_<argPos>`. */
+function paramName(verb: string, cmdIndex: number, argPos: number): string {
+  const v = String(verb).toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'ARG'
+  return `${v}_${cmdIndex}_${argPos}`
+}
+
+/** Escape a value for use inside a `"${VAR:-<here>}"` default (double-quote ctx). */
+function shellEscapeDefault(s: string): string {
+  return String(s ?? '')
+    .replace(/[\\"$`]/g, '\\$&')
+    .replace(/[\r\n]+/g, ' ')
+}
+
+/** Single-quote a literal token for the script body (safe for any content). */
+function shellQuote(s: string): string {
+  const v = String(s ?? '')
+  return `'` + v.replace(/'/g, `'\\''`).replace(/[\r\n]+/g, ' ') + `'`
+}
+
+/** Strip anything that could break out of a `#` comment line. */
+function sanitizeComment(s: string): string {
+  return String(s ?? '').replace(/[\r\n]+/g, ' ').slice(0, 80)
 }
 
 // ---------------------------------------------------------------------------

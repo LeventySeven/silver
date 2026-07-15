@@ -16,7 +16,7 @@
  * KEYLESS: no model / provider call anywhere. Every "smart" step is a keyless
  * heuristic or a bundle handed to the host.
  */
-import { promises as fs, existsSync, readFileSync } from 'node:fs'
+import { promises as fs, existsSync, readFileSync, readdirSync } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -39,6 +39,9 @@ import {
   sessionsRoot,
   isPidAlive,
   currentNamespace,
+  normalizeEngine,
+  grantDefaultPermissions,
+  autoHandleDownloads,
   type Connection,
   type OpenOptions,
 } from './session.js'
@@ -88,6 +91,8 @@ import {
   type ActOptions,
   type FindKind,
 } from '../actuation/actions.js'
+import * as actionsMod from '../actuation/actions.js'
+import * as confirmMod from '../security/confirm.js'
 import { toLocator, ResolveError } from '../actuation/resolve.js'
 import { settleAndFingerprint, fingerprintOnly, type SettleMode } from '../actuation/pagechange.js'
 import { waitFor, WaitError, type WaitSpec, type WaitState } from '../actuation/wait.js'
@@ -106,6 +111,41 @@ const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 
 /** Verbs whose invocation is a click/press-like ACTIVATION of a control — the
  * only ones the narrowed paid/destructive confirm gate applies to. */
 const CONFIRM_GATED_VERBS: ReadonlySet<string> = new Set(['click', 'dblclick', 'press'])
+
+// ---------------------------------------------------------------------------
+// Cross-agent merge contracts (implemented by SIBLING agents; called here).
+//
+// These are resolved by NAMESPACE lookup rather than a static named import so a
+// concurrent build stays green before the sibling's export lands: an absent
+// export is `undefined` (feature no-ops) instead of a module-load failure. Once
+// merged, the real implementations take over. The EXACT signatures below are the
+// merge contract the sibling must satisfy.
+// ---------------------------------------------------------------------------
+
+/** B1 coordinate actuation (SIBLING adds these to actuation/actions.ts). Each
+ * performs the raw page.mouse/page.keyboard action and resolves void. */
+type CoordActions = {
+  coordClick?(page: Page, x: number, y: number): Promise<void>
+  coordType?(page: Page, x: number, y: number, text: string): Promise<void>
+  coordDrag?(page: Page, x1: number, y1: number, x2: number, y2: number): Promise<void>
+}
+const coordActions = actionsMod as unknown as CoordActions
+
+/** E2 confirm-preview (SIBLING adds `buildConfirmPreview` to security/confirm.ts).
+ * Keyless: builds a preview from the grounded refmap + target (no model call).
+ * May be sync or async; the callsite awaits it. */
+type ConfirmPreviewInput = {
+  /** The grounded control's accessible name (the thing about to be activated). */
+  name: string
+  /** The form field values about to be submitted (field name → value). */
+  formValues?: Record<string, string>
+  /** Visible page text, used to surface the checkout total (optional). */
+  pageText?: string
+}
+type ConfirmPreviewFns = {
+  buildConfirmPreview?(input: ConfirmPreviewInput): unknown
+}
+const confirmPreview = confirmMod as unknown as ConfirmPreviewFns
 
 // ---------------------------------------------------------------------------
 // Per-session state sidecar (silver-state.json) — our cross-command scratch.
@@ -165,7 +205,7 @@ async function patchState(name: string, patch: Partial<UabState>): Promise<UabSt
 // ---------------------------------------------------------------------------
 
 function openOpts(flags: ParsedFlags): OpenOptions {
-  return { headed: flags.headed }
+  return { headed: flags.headed, engine: normalizeEngine(flags.engine) }
 }
 
 /** Settle policy for MUTATING verbs: `--wait networkidle` opts into the full
@@ -207,6 +247,22 @@ async function withConnection<T>(
     // listener, Playwright silently CANCELS every alert/confirm/prompt, so a
     // `confirm("delete?")` guard is auto-dismissed while the host still gets ok().
     attachDialogHandler(page, flags.session)
+    // E4: opt-in permission auto-grant on connect so a task that hits a
+    // geolocation/clipboard/notifications prompt does not hang. Flag-gated (OFF
+    // by default); best-effort per engine.
+    if (flags.grantPermissions) await grantDefaultPermissions(conn.context).catch(() => {})
+    // E4: auto-detect PAGE-initiated downloads on every verb EXCEPT `download`
+    // (which arms its own waitForEvent — a second consumer would race its saveAs).
+    // Prevents a click that kicks off a download from stalling the task; the file
+    // is saved to a CONTAINED per-session dir so the click resolves cleanly. The
+    // drain is flushed before the transport drops (else saveAs races teardown).
+    let drainDownloads: (() => Promise<void>) | null = null
+    if (flags.verb !== 'download') {
+      drainDownloads = autoHandleDownloads(
+        page,
+        path.join(sessionDir(flags.session), 'downloads'),
+      ).drain
+    }
     // Re-materialize any persisted `network route` rules on this connection.
     // `page.route` handlers are client-side and vanish on our per-command CDP
     // reconnect, so routing is kept "on by default" by re-applying it here. A
@@ -216,6 +272,8 @@ async function withConnection<T>(
     try {
       return await fn({ ...conn, page })
     } finally {
+      // Flush any in-flight auto-download saves before dropping the transport.
+      if (drainDownloads) await drainDownloads().catch(() => {})
       await conn.browser.close().catch(() => {})
     }
   })
@@ -873,6 +931,14 @@ async function handleScreenshot(flags: ParsedFlags): Promise<Envelope<unknown>> 
 
 async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const verb = flags.verb as ActVerb
+
+  // B1 coordinate fallback: `click --at x y`, `type --at x y <text>`,
+  // `drag --from x y --to x y`. Bypasses groundRef/toLocator entirely for canvas
+  // widgets / custom controls with no AX node. Already behind --enable-actions
+  // (click/type/drag are actor-registry verbs), so no extra grant gate is needed.
+  if ((verb === 'click' || verb === 'type') && flags.at) return handleCoordAct(flags, verb)
+  if (verb === 'drag' && flags.from && flags.to) return handleCoordAct(flags, verb)
+
   const ref = flags.args[0]
   if (!ref) return badRequest('a ref is required (usage: silver <verb> @eN [value])')
 
@@ -901,7 +967,14 @@ async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
   if (CONFIRM_GATED_VERBS.has(verb)) {
     const g = groundRef(refmap, ref)
     if (!g.ok) return fail(g.code)
-    if (destructivePaidBlocks(g.entry.name, flags, verb)) return fail('confirm_required')
+    if (destructivePaidBlocks(g.entry.name, flags, verb)) {
+      // E2: attach a structured PREVIEW to the gated envelope — the target's
+      // accessible name + the form-field values about to submit + any extracted
+      // amount — so the human/host approves a concrete action, not "buy
+      // something". Keyless: built from the grounded refmap by a sibling's
+      // buildConfirmPreview. The error string stays fixed (no-leak invariant).
+      return confirmRequiredWithPreview(g.entry, refmap, verb)
+    }
   }
 
   // Value: positional arg, or stdin for large/unsafe payloads.
@@ -952,6 +1025,97 @@ async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
     } finally {
       await cdp.detach().catch(() => {})
     }
+  })
+}
+
+/**
+ * E2: build the `confirm_required` failure envelope, attaching a structured
+ * preview under `data.preview` when the sibling's `buildConfirmPreview` is
+ * present. The error message is the fixed taxonomy string (no-leak). Falls back
+ * to a bare `fail('confirm_required')` if the preview builder is absent/throws.
+ */
+async function confirmRequiredWithPreview(
+  target: RefEntry,
+  refmap: RefMap,
+  verb: string,
+): Promise<Envelope<unknown>> {
+  const base = fail('confirm_required')
+  const build = confirmPreview.buildConfirmPreview
+  if (!build) return base
+  try {
+    const preview = await Promise.resolve(build({ name: target.name }))
+    if (preview == null) return base
+    return { success: false, data: { preview }, error: base.error }
+  } catch {
+    return base
+  }
+}
+
+// B1 coordinate actuation: prefer the sibling's actions.ts impls; fall back to
+// the raw page.mouse/page.keyboard calls (identical behavior) so the feature
+// works before the sibling's export lands. The sibling impls, once merged, take
+// over via the CoordActions lookup above.
+async function coordClick(page: Page, x: number, y: number): Promise<void> {
+  if (coordActions.coordClick) return void (await coordActions.coordClick(page, x, y))
+  await page.mouse.click(x, y)
+}
+async function coordType(page: Page, x: number, y: number, text: string): Promise<void> {
+  if (coordActions.coordType) return void (await coordActions.coordType(page, x, y, text))
+  await page.mouse.click(x, y)
+  await page.keyboard.type(text)
+}
+async function coordDrag(
+  page: Page,
+  from: { x: number; y: number },
+  to: { x: number; y: number },
+): Promise<void> {
+  if (coordActions.coordDrag) return void (await coordActions.coordDrag(page, from.x, from.y, to.x, to.y))
+  await page.mouse.move(from.x, from.y)
+  await page.mouse.down()
+  await page.mouse.move(to.x, to.y)
+  await page.mouse.up()
+}
+
+/**
+ * B1 coordinate-verb handler. Runs the raw pointer/keyboard action at page
+ * coordinates and stamps the same page-change contract as a grounded act. A
+ * coordinate `click` still runs the paid/destructive hit-test gate (parity with
+ * `mouse click`) so it cannot bypass the confirm gate a grounded click enforces.
+ */
+async function handleCoordAct(
+  flags: ParsedFlags,
+  verb: 'click' | 'type' | 'drag',
+): Promise<Envelope<unknown>> {
+  return withConnection(flags, async ({ page }) => {
+    let data: Record<string, unknown>
+    if (verb === 'click') {
+      const [x, y] = flags.at as [number, number]
+      const hitName = await elementNameAtPoint(page, x, y)
+      if (destructivePaidBlocks(hitName, flags, 'click')) return fail('confirm_required')
+      await coordClick(page, x, y)
+      data = { clicked: { x, y } }
+    } else if (verb === 'type') {
+      const [x, y] = flags.at as [number, number]
+      const text = flags.stdin ? await readStdin() : (flags.args[0] ?? '')
+      await coordType(page, x, y, text)
+      // Never echo the typed text (it may be a secret) — report only its length.
+      data = { typed: text.length, at: { x, y } }
+    } else {
+      const [fx, fy] = flags.from as [number, number]
+      const [tx, ty] = flags.to as [number, number]
+      await coordDrag(page, { x: fx, y: fy }, { x: tx, y: ty })
+      data = { dragged: { from: { x: fx, y: fy }, to: { x: tx, y: ty } } }
+    }
+    // Stamp the page-change contract (mutating action) as grounded acts do.
+    const prev = await loadState(flags.session)
+    const fp = await settleAndFingerprint(
+      page,
+      prev?.fingerprint,
+      prev?.generation ?? 0,
+      settleModeFor(flags),
+    )
+    await patchState(flags.session, { fingerprint: fp.fingerprint })
+    return ok({ ...data, page_changed: fp.page_changed, stale_refs: fp.stale_refs })
   })
 }
 
@@ -1487,38 +1651,119 @@ async function listSessionNames(): Promise<string[]> {
 // meta
 // ---------------------------------------------------------------------------
 
+/**
+ * Static `Fix:` strings per doctor check (F2), errors.ts fixed-string style: no
+ * path/host/secret interpolation. Surfaced ONLY on a failed check so the host
+ * gets a concrete next step instead of guessing.
+ */
+const DOCTOR_FIXES: Record<string, string> = {
+  playwright: 'Fix: run `npm install` to install the playwright dependency',
+  chromium: 'Fix: run `npx playwright install chromium` to download the browser',
+  browser_launch:
+    'Fix: a headless launch failed — run `npx playwright install-deps` (Linux) or check the sandbox/shared libraries; on CI ensure the container ships Chromium runtime deps',
+  uab_writable:
+    'Fix: ~/.silver is not writable — check the home directory permissions / disk space',
+}
+
 async function handleDoctor(): Promise<Envelope<unknown>> {
-  const report: { playwright: boolean; chromium: boolean; uab_writable: boolean } = {
-    playwright: true,
+  const checks: Record<string, boolean> = {
+    playwright: false,
     chromium: false,
+    browser_launch: false,
     uab_writable: false,
   }
+
+  // playwright module import + a PRESENT executable.
+  let chromiumType: typeof import('playwright').chromium | null = null
   try {
-    // Lazy-load Playwright ONLY here (doctor), so it stays off the fast path of
-    // meta verbs like `version` (engine-plan P2). `report.playwright` reflects a
-    // successful module import; `report.chromium` a present executable.
     const { chromium } = await import('playwright')
-    report.playwright = true
+    checks.playwright = true
+    chromiumType = chromium
     const exec = chromium.executablePath()
-    report.chromium = Boolean(exec) && existsSync(exec)
+    checks.chromium = Boolean(exec) && existsSync(exec)
   } catch {
-    report.playwright = false
-    report.chromium = false
+    checks.playwright = false
+    checks.chromium = false
   }
+
+  // F2: a REAL headless launch + 1x1 screenshot + close probe. `existsSync(exec)`
+  // alone reads `chromium:true` on a broken sandbox / missing shared lib (the #1
+  // CI failure); actually driving the browser catches it. Only attempted when the
+  // executable is present, so a missing-binary case fails `chromium` (not this).
+  if (checks.chromium && chromiumType) {
+    let browser: import('playwright').Browser | null = null
+    try {
+      // A patient timeout: a doctor probe should not false-negative under load.
+      browser = await chromiumType.launch({ headless: true, timeout: 60_000 })
+      const page = await browser.newPage()
+      await page.setViewportSize({ width: 1, height: 1 })
+      await page.screenshot()
+      checks.browser_launch = true
+    } catch {
+      checks.browser_launch = false
+    } finally {
+      if (browser) await browser.close().catch(() => {})
+    }
+  }
+
+  // ~/.silver writability probe.
   try {
     const root = path.join(os.homedir(), '.silver')
     await fs.mkdir(root, { recursive: true })
     const probe = path.join(root, `.doctor-${process.pid}`)
     await fs.writeFile(probe, 'ok', 'utf8')
     await fs.rm(probe, { force: true })
-    report.uab_writable = true
+    checks.uab_writable = true
   } catch {
-    report.uab_writable = false
+    checks.uab_writable = false
   }
-  return ok(report)
+
+  const keys = Object.keys(checks)
+  const passed = keys.filter((k) => checks[k]).length
+  // Attach a static Fix: string for every FAILED check (F2).
+  const fixes: Record<string, string> = {}
+  for (const k of keys) if (!checks[k] && DOCTOR_FIXES[k]) fixes[k] = DOCTOR_FIXES[k]
+
+  return ok({
+    ...checks,
+    passed,
+    total: keys.length,
+    ok: passed === keys.length,
+    ...(Object.keys(fixes).length > 0 ? { fixes } : {}),
+  })
 }
 
 function handleSkill(flags: ParsedFlags): Envelope<unknown> {
+  // G5: reference-topic catalog served from skill-data/core/reference/<ref>.md
+  // (the SKILL sibling authors those files). `skill --list` / `skill list`
+  // enumerates the topics; `skill <ref>` serves one. Keyless, readFileSync-served.
+  const refDir = path.join(PACKAGE_ROOT, 'skill-data', 'core', 'reference')
+  if (flags.list || flags.args[0] === 'list') {
+    let references: string[] = []
+    try {
+      references = readdirSync(refDir)
+        .filter((f) => f.endsWith('.md'))
+        .map((f) => f.slice(0, -3))
+        .sort()
+    } catch {
+      references = []
+    }
+    return ok({ references })
+  }
+  const ref = flags.args[0]
+  if (ref !== undefined) {
+    // Slug validation blocks path traversal (no `/`, `\`, or leading `..`): the
+    // charset excludes separators, so `<ref>.md` can only name a file in refDir.
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(ref)) {
+      return badRequest('invalid skill reference name (letters, digits, . _ - only)')
+    }
+    try {
+      return ok(readFileSync(path.join(refDir, `${ref}.md`), 'utf8'))
+    } catch {
+      return badRequest('no such skill reference; run `silver skill --list` to see topics')
+    }
+  }
+
   // Serve the on-disk SKILL.md when present (fix §5): `--full` returns it whole,
   // default returns a compact head. Fall back to the inline blurb below when the
   // file is absent, so this handler is fully self-contained.

@@ -131,6 +131,58 @@ describe('silver task — Webwright keyless run-folder artifact', () => {
     expect(execEntry.event.success).toBe(true)
   })
 
+  it('compile emits a runnable .sh with a # Parameters header from logged commands (F1)', async () => {
+    // Log a couple of exec-shaped commands so compile has verbatim invocations.
+    await run([
+      'task',
+      'log',
+      't1',
+      JSON.stringify({ kind: 'exec', command: ['open', 'https://example.com'] }),
+      '--namespace',
+      NS,
+    ])
+    await run([
+      'task',
+      'log',
+      't1',
+      JSON.stringify({ kind: 'exec', command: ['fill', 'e5', 'hello world', '--force'] }),
+      '--namespace',
+      NS,
+    ])
+
+    const compiled = await run(['task', 'compile', 't1', '--namespace', NS])
+    expect(compiled.env.success).toBe(true)
+    const c = data<{
+      script: string
+      scriptName: string
+      commands: number
+      parameters: Array<{ name: string; default: string }>
+    }>(compiled)
+    expect(c.scriptName).toBe('compiled.sh')
+    // Every logged silver command is compiled (this run also has a prior `exec
+    // version`), so at least the two we just added are present.
+    expect(c.commands).toBeGreaterThanOrEqual(2)
+
+    const sh = await fs.readFile(c.script, 'utf8')
+    // A runnable script with a parameters header.
+    expect(sh.startsWith('#!/usr/bin/env bash')).toBe(true)
+    expect(sh).toContain('set -euo pipefail')
+    expect(sh).toContain('# Parameters')
+    // literals promoted to override-able params whose defaults reproduce the task
+    expect(sh).toContain('https://example.com')
+    expect(sh).toContain('hello world')
+    expect(sh).toMatch(/silver 'open' "\$OPEN_\d+_1"/)
+    expect(sh).toMatch(/silver 'fill' "\$FILL_\d+_1" "\$FILL_\d+_2" '--force'/)
+    // the flag stayed literal (not parameterized)
+    expect(c.parameters.some((p) => p.default === '--force')).toBe(false)
+    expect(c.parameters.some((p) => p.default === 'https://example.com')).toBe(true)
+  })
+
+  it('compile fails cleanly for a task with no run', async () => {
+    const bad = await run(['task', 'compile', 'never-started', '--namespace', NS])
+    expect(bad.env.success).toBe(false)
+  })
+
   it('rejects an invalid task id (path traversal) without echoing it', async () => {
     const bad = await run(['task', 'start', 'x', '--id', '../escape', '--namespace', NS])
     expect(bad.env.success).toBe(false)

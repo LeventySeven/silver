@@ -15,9 +15,17 @@ import { spawn } from 'node:child_process'
 import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import type { Browser, BrowserContext, Page } from 'playwright'
+import type { Browser, BrowserContext, BrowserType, Page } from 'playwright'
 import type { RefMap } from '../perception/refmap.js'
 import { decodeStateBuffer, encryptJson, isStateEncryptionEnabled } from './state-crypto.js'
+
+/** Playwright browser engines Silver can launch (H1). Default chromium. */
+export type Engine = 'chromium' | 'firefox' | 'webkit'
+
+/** Normalize a `--engine` value to a supported engine (default chromium). */
+export function normalizeEngine(e: string | undefined): Engine {
+  return e === 'firefox' ? 'firefox' : e === 'webkit' ? 'webkit' : 'chromium'
+}
 
 export type SessionInfo = {
   port: number
@@ -31,6 +39,17 @@ export type SessionInfo = {
    * auto-respawned into a fresh owned browser, and `session gc` never reaps it.
    */
   external?: boolean
+  /**
+   * The Playwright engine this session launches (H1). Absent/`chromium` uses the
+   * detached-CDP daemon model (survives across commands). `firefox`/`webkit`
+   * speak Playwright's own protocol (not CDP-over-devtools-port), so they use a
+   * launch-per-command persistent-context model instead — see `connectLaunched`.
+   */
+  engine?: Engine
+  /** The persistent profile dir (recorded for the non-chromium relaunch path). */
+  userDataDir?: string
+  /** Whether to launch headed (recorded for the non-chromium relaunch path). */
+  headed?: boolean
 }
 
 export type OpenOptions = {
@@ -42,6 +61,83 @@ export type OpenOptions = {
   port?: number
   /** Recorded for later idle-reaping logic; unused by open itself. */
   idleTimeoutMs?: number
+  /** Browser engine to launch (H1). Default chromium. */
+  engine?: Engine
+}
+
+/**
+ * Low-risk permission prompts auto-granted on connect when `--grant-permissions`
+ * is set (E4), so a task that hits one of these dialogs does not hang. NOT
+ * granted by default — the flag is the opt-in. (Camera/microphone are
+ * deliberately EXCLUDED — higher-risk, and not needed for the hang class.)
+ */
+export const AUTO_GRANT_PERMISSIONS: readonly string[] = [
+  'geolocation',
+  'clipboard-read',
+  'clipboard-write',
+  'notifications',
+]
+
+/**
+ * Grant the low-risk permission set on `context` (E4). Best-effort: a permission
+ * name an engine does not recognize is skipped rather than throwing. Optionally
+ * scoped to one origin; without an origin it applies context-wide.
+ */
+export async function grantDefaultPermissions(
+  context: BrowserContext,
+  origin?: string,
+): Promise<void> {
+  await context
+    .grantPermissions([...AUTO_GRANT_PERMISSIONS], origin ? { origin } : undefined)
+    .catch(() => {})
+}
+
+/** Strip any path separators / traversal from a page-supplied download name. */
+function sanitizeDownloadName(name: string): string {
+  const base = path.basename(name || 'download')
+  const cleaned = base.replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^\.+/, '')
+  return cleaned.length > 0 ? cleaned.slice(0, 128) : 'download'
+}
+
+/**
+ * Auto-detect PAGE-initiated downloads (E4). Without a `download` listener a
+ * click that kicks off a download can leave the artifact pending and stall the
+ * task. This handler saves each download to a CONTAINED per-session dir (never a
+ * page-chosen path — the suggested filename is sanitized) so the click resolves.
+ * Returns a getter for the last saved (contained) filename, for observability.
+ *
+ * NOT attached for the explicit `download` verb, which arms its own
+ * `waitForEvent('download')` — a second consumer would race its `saveAs`.
+ */
+export function autoHandleDownloads(
+  page: Page,
+  saveDir: string,
+): { last: () => string | null; drain: () => Promise<void> } {
+  let last: string | null = null
+  const pending = new Set<Promise<void>>()
+  page.on('download', (d) => {
+    const p = (async () => {
+      try {
+        await fs.mkdir(saveDir, { recursive: true })
+        const dest = path.join(saveDir, sanitizeDownloadName(d.suggestedFilename()))
+        await d.saveAs(dest)
+        last = d.suggestedFilename()
+      } catch {
+        await d.delete().catch(() => {})
+      }
+    })()
+    pending.add(p)
+    void p.finally(() => pending.delete(p))
+  })
+  return {
+    last: () => last,
+    // Await in-flight saves so a caller can flush BEFORE dropping the CDP
+    // transport (else saveAs races teardown and the artifact is lost). Empty in
+    // the common no-download case → zero added latency.
+    drain: async () => {
+      if (pending.size > 0) await Promise.allSettled([...pending])
+    },
+  }
 }
 
 export type Connection = {
@@ -74,6 +170,16 @@ const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
  */
 async function loadChromium(): Promise<typeof import('playwright').chromium> {
   return (await import('playwright')).chromium
+}
+
+/**
+ * Lazily import the Playwright `BrowserType` for `engine` (H1). Generalizes
+ * `loadChromium` to firefox/webkit — Playwright bundles all three, so this adds
+ * no new dependency. Kept a DYNAMIC import for the same fast-path reason.
+ */
+export async function loadBrowser(engine: Engine): Promise<BrowserType> {
+  const pw = await import('playwright')
+  return engine === 'firefox' ? pw.firefox : engine === 'webkit' ? pw.webkit : pw.chromium
 }
 
 /**
@@ -218,6 +324,27 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
   const userDataDir = opts.userDataDir ?? path.join(dir, 'profile')
   await fs.mkdir(userDataDir, { recursive: true })
 
+  const engine = normalizeEngine(opts.engine)
+  // Non-chromium (firefox/webkit) do NOT speak CDP over a devtools port, so the
+  // detached-daemon-reconnect model does not apply. Record a lightweight sidecar;
+  // `connect` launches a fresh persistent context per command against this
+  // profile dir (disk state — cookies/storage — persists; live navigation does
+  // not carry across commands). This is the H1 fix for TLS/H2-fingerprint sites.
+  if (engine !== 'chromium') {
+    const info: SessionInfo = {
+      port: 0,
+      pid: 0,
+      wsEndpoint: '',
+      createdAt: new Date().toISOString(),
+      engine,
+      userDataDir,
+      headed: Boolean(opts.headed),
+    }
+    await fs.mkdir(dir, { recursive: true })
+    await writeSidecar(sidecarPath(name), info)
+    return info
+  }
+
   const requestedPort = opts.port ?? 0
   const chromium = await loadChromium()
   const execPath = chromium.executablePath()
@@ -267,6 +394,9 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
       pid,
       wsEndpoint,
       createdAt: new Date().toISOString(),
+      engine: 'chromium',
+      userDataDir,
+      headed: Boolean(opts.headed),
     }
     await fs.mkdir(dir, { recursive: true })
     await writeSidecar(sidecarPath(name), info)
@@ -340,6 +470,10 @@ export async function readSidecar(name: string): Promise<SessionInfo> {
  */
 export async function connect(name: string): Promise<Connection> {
   const info = await readSidecar(name)
+  // Non-chromium (firefox/webkit): launch a fresh persistent context per command
+  // (no surviving CDP daemon). Disk state persists via the profile dir.
+  const engine = normalizeEngine(info.engine)
+  if (engine !== 'chromium') return connectLaunched(name, info, engine)
   // PID-liveness (P1-S1): a stale sidecar whose browser died would otherwise
   // hang on a dead CDP endpoint. Treat a dead pid as "no live session" so the
   // caller (ensureConnected) re-spawns instead. Skipped for EXTERNAL sessions:
@@ -358,6 +492,37 @@ export async function connect(name: string): Promise<Connection> {
   const page = context.pages()[0] ?? (await context.newPage())
   // Deterministic viewport (P0-8); best-effort over a CDP-connected page.
   await page.setViewportSize({ width: VIEWPORT.width, height: VIEWPORT.height }).catch(() => {})
+  return { browser, context, page }
+}
+
+/**
+ * Non-chromium connect (H1): launch a fresh persistent context for `engine`
+ * against the session's profile dir and adapt it to the `Connection` shape.
+ *
+ * firefox/webkit do not expose a reconnectable CDP devtools port, so there is no
+ * long-lived daemon to attach to — each command relaunches. `launchPersistentContext`
+ * keeps disk state (cookies/localStorage) across relaunches. The returned
+ * `browser` is a thin shim over the context (only `close`/`contexts` are used on
+ * this path) since a persistent context has no owning `Browser`.
+ */
+async function connectLaunched(
+  name: string,
+  info: SessionInfo,
+  engine: Engine,
+): Promise<Connection> {
+  const userDataDir = info.userDataDir ?? path.join(sessionDir(name), 'profile')
+  const browserType = await loadBrowser(engine)
+  const context = await browserType.launchPersistentContext(userDataDir, {
+    headless: !info.headed,
+    viewport: { width: VIEWPORT.width, height: VIEWPORT.height },
+  })
+  const page = context.pages()[0] ?? (await context.newPage())
+  await page.setViewportSize({ width: VIEWPORT.width, height: VIEWPORT.height }).catch(() => {})
+  // A persistent context has no `Browser`; expose only what callers use here.
+  const browser = {
+    close: () => context.close(),
+    contexts: () => [context],
+  } as unknown as Browser
   return { browser, context, page }
 }
 

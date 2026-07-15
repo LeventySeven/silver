@@ -13,6 +13,7 @@
  *    host must treat a retry of a mutating verb as a fresh consequential action,
  *    never a safe idempotent replay.
  */
+import { redactValue, REDACTED } from './redact.js'
 
 /**
  * Verbs tagged `idempotent:false` — state-mutating, spending, or irreversible.
@@ -110,4 +111,125 @@ export function confirmGateDecision(input: ConfirmGateInput): ConfirmGateDecisio
     allow: false,
     reason: 'confirmation required but no TTY and verb not pre-approved (fail-closed)',
   }
+}
+
+// ---------------------------------------------------------------------------
+// Structured confirm-gate preview + amount extraction (adopt-list E2, keyless).
+//
+// The boolean gate above says "may this proceed"; this builds the HUMAN-facing
+// preview so a paid confirm shows a CONCRETE artifact ("here is exactly what
+// will be submitted, for $49.99") instead of "buy something". No model call —
+// the target name + form values already exist in the resolve/snapshot layer, and
+// the amount is a local regex over the visible page text.
+// ---------------------------------------------------------------------------
+
+/**
+ * ~24 checkout/total label variants (longest-first so "grand total" wins over a
+ * bare "total"). Matched case-insensitively; an amount is sought in the ~40
+ * chars following the label before falling back to the first amount on the page.
+ */
+const TOTAL_LABELS: readonly string[] = [
+  'total to be charged',
+  'order summary total',
+  'amount to pay',
+  'total to pay',
+  'total payment',
+  'payment total',
+  'you will pay',
+  'grand total',
+  'order total',
+  'total amount',
+  'total charge',
+  'charged today',
+  'total price',
+  'final total',
+  'balance due',
+  'amount due',
+  'total cost',
+  'cart total',
+  'net total',
+  'total due',
+  'due today',
+  'you pay',
+  'total',
+  'amount',
+].slice().sort((a, b) => b.length - a.length)
+
+/**
+ * Decimal-currency amount: a currency symbol/code adjacent to a grouped number,
+ * either order. Matches `$49.99`, `£1,299`, `USD 49.99`, `49.99 EUR`, `12 dollars`.
+ */
+const AMOUNT_RE =
+  /(?:[$£€¥₹]\s?\d[\d,]*(?:\.\d{1,2})?)|(?:(?:USD|EUR|GBP|CAD|AUD)\s?\d[\d,]*(?:\.\d{1,2})?)|(?:\d[\d,]*(?:\.\d{2})?\s?(?:USD|EUR|GBP|CAD|AUD|dollars?|euros?))/i
+
+/**
+ * Extract a checkout total from free page text — label-anchored first, then the
+ * first standalone currency amount anywhere. Returns the matched amount string
+ * (original casing/symbol preserved) or null. Keyless; a local regex only.
+ */
+export function extractAmount(text: string): string | null {
+  const s = String(text ?? '')
+  if (!s) return null
+  const lower = s.toLowerCase()
+  for (const label of TOTAL_LABELS) {
+    let from = 0
+    let idx = lower.indexOf(label, from)
+    while (idx !== -1) {
+      const window = s.slice(idx + label.length, idx + label.length + 40)
+      const m = window.match(AMOUNT_RE)
+      if (m) return m[0].trim()
+      from = idx + label.length
+      idx = lower.indexOf(label, from)
+    }
+  }
+  const m = s.match(AMOUNT_RE)
+  return m ? m[0].trim() : null
+}
+
+export type ConfirmPreviewInput = {
+  /** The grounded control's accessible name (the thing about to be activated). */
+  name: string
+  /** The form field values about to be submitted (field name → value). */
+  formValues?: Record<string, string>
+  /** Visible page text, used to surface the checkout total (optional). */
+  pageText?: string
+}
+
+/** One-line whitespace-collapse + hard length cap for a value shown in a preview. */
+function clip(s: string, max: number): string {
+  const t = String(s ?? '').replace(/\s+/g, ' ').trim()
+  return t.length > max ? t.slice(0, max) + '…' : t
+}
+
+/**
+ * Redact a form value for display: any `<secret>` token, password-hinted field,
+ * or card-shaped value is masked via the read-path `redactValue` choke point so
+ * the preview never leaks a credential the way the raw submission would.
+ */
+function previewValue(field: string, value: string): string {
+  const v = String(value ?? '')
+  if (/<secret>/i.test(v)) return REDACTED
+  return clip(redactValue('', field, v, /password|passwd|pwd/i.test(field)), 80)
+}
+
+/**
+ * Build the structured confirm preview string a paid/destructive confirm shows.
+ * Keyless — echoes the target name, the amount (if any), and the redacted field
+ * values already present in the resolve layer. The caller (handleAct) passes
+ * these in; this module invents nothing.
+ */
+export function buildConfirmPreview(input: ConfirmPreviewInput): string {
+  const name = clip(input.name, 120) || '(unnamed control)'
+  const lines: string[] = [`About to submit via: "${name}"`]
+
+  const amount = input.pageText ? extractAmount(input.pageText) : null
+  if (amount) lines.push(`Amount: ${amount}`)
+
+  const fv = input.formValues ?? {}
+  const keys = Object.keys(fv)
+  if (keys.length > 0) {
+    lines.push('Fields to submit:')
+    for (const k of keys) lines.push(`  ${clip(k, 60)} = ${previewValue(k, fv[k])}`)
+  }
+  return lines.join('\n')
 }
