@@ -122,10 +122,12 @@ or stop; don't retry.
 | `scroll @ref` | Scroll a ref into view. |
 | `scrollintoview @ref` | Scroll a grounded ref into view (alias `scrollinto`). |
 | `upload @ref <file…>` | Set file inputs (each file must be a **contained** path). |
+| `download <@ref\|selector> <path>` | Click the ref/selector, capture the triggered download, save it to a **contained** path (`{saved:true}`; the path is never echoed). `download --wait [path]` awaits the *next* download without a click. |
 | `drag @src @dst` | Drag one ref onto another. |
 | `find <kind> <value> [action] [text]` | Semantic locate, no snapshot needed. `kind` ∈ `role,text,label,placeholder,testid,first,last,nth`; flags `--name` (role name), `--index` (nth). Optionally act in the same call. |
 | `mouse move\|click <x> <y> [button]` · `mouse down\|up [button]` · `mouse wheel <dy> [dx]` | Raw pointer input at page coordinates. |
 | `keyboard type <text>` · `keyboard press\|down\|up <key>` | Raw keyboard input (typed length reported, never the text). |
+| `keydown <key>` · `keyup <key>` | Hold / release a single key on the page's focused element (raw, page-level — completes the keyboard surface alongside `press`). |
 | `eval "<js>"` (or `eval --stdin`) | Run **your own** JS in the page / active frame. Result neutralized + capped. Keyless (your code, not a model). |
 
 `find` is registry-classified as an actor verb, so **it needs `--enable-actions` even just to
@@ -166,6 +168,7 @@ and `resolve`, resolve fails `ref_stale` — extract again for fresh IDs.
 | `clipboard read` | Read the async clipboard (neutralized). |
 | `clipboard write <text>` (or `--stdin`) | Write the clipboard. **Actor sub-op** (`--enable-actions`). |
 | `dialog status` | The last auto-accepted `alert`/`confirm`/`prompt` (type + message). Registry-classified actor, so needs `--enable-actions`. |
+| `set viewport <w> <h>` · `set offline <true\|false>` · `set color-scheme <dark\|light\|no-preference>` · `set geolocation <lat> <lng>` · `set timezone <tz>` · `set locale <loc>` | Mutate browser/page emulation state. **Actor verb** (`--enable-actions`). Overrides are **per-connection** under the reconnect model — apply `set` in the same flow that needs it (an unknown subcommand returns a typed error listing the valid ones). |
 
 Dialogs are **auto-accepted** the instant they appear (a `prompt` returns its default text),
 so a page's `confirm("delete?")` guard resolves instead of being silently cancelled;
@@ -253,11 +256,6 @@ hand). Each result returns a `path#Lline` `ref` so a follow-up read pulls the fu
 | `version` | `{name, version}`. |
 | `doctor` | Install check: `{playwright, chromium, uab_writable}`. |
 | `skill [--full]` | This guide (compact head, or the whole doc). |
-
-> **Not yet implemented (honest note):** the registry lists a few actor verbs with no handler
-> in this build — `download`, `set`, `keydown`, `keyup`. They dispatch but return
-> `not implemented in v1`; don't rely on them. Use `keyboard down|up <key>` for key-hold,
-> `storage … set` for storage, and `network requests`/`har` to observe downloads' requests.
 
 ---
 

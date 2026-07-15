@@ -103,6 +103,8 @@ export type ParsedFlags = {
   clear: boolean
   /** `batch --bail`: stop on the first failing sub-command. */
   bail: boolean
+  /** `download --wait [path]`: await the NEXT download without a click. */
+  wait: boolean
   // ---- positionals ----
   verb: string
   args: string[]
@@ -170,6 +172,8 @@ const BOOL_FLAGS: Record<string, keyof ParsedFlags> = {
   abort: 'abort',
   clear: 'clear',
   bail: 'bail',
+  // download verb boolean flag (await the next download without a click).
+  wait: 'wait',
 }
 
 /** `--load` (and `--load networkidle`): optional-value flag. */
@@ -212,6 +216,7 @@ function defaults(): ParsedFlags {
     abort: false,
     clear: false,
     bail: false,
+    wait: false,
     verb: '',
     args: [],
   }

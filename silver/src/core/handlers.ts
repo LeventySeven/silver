@@ -89,7 +89,7 @@ import {
   type ActOptions,
   type FindKind,
 } from '../actuation/actions.js'
-import { toLocator } from '../actuation/resolve.js'
+import { toLocator, ResolveError } from '../actuation/resolve.js'
 import { settleAndFingerprint } from '../actuation/pagechange.js'
 import { waitFor, WaitError, type WaitSpec, type WaitState } from '../actuation/wait.js'
 import { buildBundle, type JsonSchema } from '../extract/transform.js'
@@ -415,6 +415,16 @@ export async function handle(flags: ParsedFlags): Promise<Envelope<unknown>> {
       return handleMouse(flags)
     case 'keyboard':
       return handleKeyboard(flags)
+    // download a file triggered by a click (or await the next one with --wait).
+    case 'download':
+      return handleDownload(flags)
+    // raw key hold/release — complete the keyboard surface alongside `press`.
+    case 'keydown':
+    case 'keyup':
+      return handleKeyRaw(flags)
+    // mutate browser/page emulation state (viewport/offline/media/geo/tz/locale).
+    case 'set':
+      return handleSet(flags)
     case 'scrollintoview':
     case 'scrollinto':
       return handleScrollIntoView(flags)
@@ -2005,6 +2015,217 @@ async function handleKeyboard(flags: ParsedFlags): Promise<Envelope<unknown>> {
         return badRequest('usage: silver keyboard <type|press|down|up> ...')
     }
   })
+}
+
+// ---------------------------------------------------------------------------
+// keydown / keyup — raw single-key hold / release (actor). Completes the
+// keyboard surface alongside `press` (down+up) and `keyboard down|up`. The key
+// is dispatched to the page's focused element via page.keyboard.
+//   keydown <key>   ->  page.keyboard.down(key)
+//   keyup   <key>   ->  page.keyboard.up(key)
+// ---------------------------------------------------------------------------
+
+async function handleKeyRaw(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const key = flags.args[0]
+  if (!key) return badRequest(`usage: silver ${flags.verb} <key>`)
+  return withConnection(flags, async ({ page }) => {
+    if (flags.verb === 'keydown') await page.keyboard.down(key)
+    else await page.keyboard.up(key)
+    return ok({ [flags.verb]: key })
+  })
+}
+
+// ---------------------------------------------------------------------------
+// download <@ref|selector> <path> — trigger a download by clicking the target
+// and capture it via Playwright's `download` event, saving to a CONTAINED path
+// (assertContainedPath, like screenshot/pdf/state). Actor verb.
+//   download <@ref|selector> <path>   click the target, save the download
+//   download --wait [path]            await the NEXT download without a click
+// The saved-file path is NOT echoed (no-leak invariant); the server/page-supplied
+// suggested filename is neutralized + capped before it reaches the host.
+// ---------------------------------------------------------------------------
+
+async function handleDownload(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const timeout = flags.timeout ?? 30000
+
+  // --wait mode: await the next download WITHOUT a click (no target arg).
+  if (flags.wait) {
+    const outPath = flags.args[0]
+    let resolvedOut: string | undefined
+    if (outPath !== undefined) {
+      const c = assertContainedPath(outPath)
+      if (!c.ok) return fail('path_denied')
+      resolvedOut = c.resolved
+    }
+    return withConnection(flags, async ({ page }) => {
+      try {
+        const download = await page.waitForEvent('download', { timeout })
+        if (resolvedOut !== undefined) await download.saveAs(resolvedOut)
+        else await download.delete().catch(() => {})
+        return ok({
+          saved: resolvedOut !== undefined,
+          filename: presentPageText(download.suggestedFilename(), flags),
+        })
+      } catch (err) {
+        if (err instanceof Error && err.name === 'TimeoutError') return fail('timeout')
+        throw err
+      }
+    })
+  }
+
+  // click-to-download mode: <@ref|selector> <path>.
+  const target = flags.args[0]
+  const outPath = flags.args[1]
+  if (!target || !outPath) {
+    return badRequest('usage: silver download <@ref|selector> <path>  (or: download --wait [path])')
+  }
+  // Path containment BEFORE we touch the browser (fix P1-SEC4).
+  const c = assertContainedPath(outPath)
+  if (!c.ok) return fail('path_denied')
+  const resolvedOut = c.resolved
+
+  const refBody = parseRef(target)
+  return withConnection(flags, async ({ page }) => {
+    let cdp: CDPSession | null = null
+    try {
+      let locator: Locator
+      if (refBody) {
+        // A grounded ref → the SAME groundRef→toLocator bridge every actor verb
+        // runs; a stale ref fails LOUD before any click (R4 no-misclick).
+        const refmap = await loadRefMap(flags.session)
+        if (!refmap) return fail('element_not_found')
+        const g = groundRef(refmap, target)
+        if (!g.ok) return fail(g.code)
+        cdp = await page.context().newCDPSession(page)
+        locator = await toLocator(page, cdp, g.entry, g.ref)
+      } else {
+        // Anything else is a CSS selector, scoped to the active frame.
+        const frame = await resolveActiveFrame(page, flags.session)
+        locator = frame.locator(target).first()
+      }
+      // Arm the download listener BEFORE the click so the event is never missed.
+      const downloadPromise = page.waitForEvent('download', { timeout })
+      await locator.click({ timeout })
+      const download = await downloadPromise
+      await download.saveAs(resolvedOut)
+      return ok({ saved: true, filename: presentPageText(download.suggestedFilename(), flags) })
+    } catch (err) {
+      if (err instanceof ResolveError) return fail('element_not_found')
+      if (err instanceof Error && err.name === 'TimeoutError') return fail('timeout')
+      throw err
+    } finally {
+      await cleanupStamp(page).catch(() => {})
+      if (cdp) await cdp.detach().catch(() => {})
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// set <subcommand> … — mutate browser/page emulation state (actor). The keyless,
+// useful subset of the Rust oracle's `set`:
+//   set viewport <w> <h>                page.setViewportSize
+//   set offline <true|false>            context.setOffline
+//   set color-scheme <dark|light|no-preference>   page.emulateMedia (alias: media)
+//   set geolocation <lat> <lng>         context.setGeolocation (+ grant permission) (alias: geo)
+//   set timezone <IANA-tz>              CDP Emulation.setTimezoneOverride (alias: tz)
+//   set locale <BCP47>                  CDP Emulation.setLocaleOverride
+// Any other subcommand returns a clean typed error listing the valid ones.
+// ---------------------------------------------------------------------------
+
+const SET_SUBCOMMANDS = 'viewport, offline, color-scheme, geolocation, timezone, locale'
+
+async function handleSet(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const sub = flags.args[0]
+  switch (sub) {
+    case 'viewport': {
+      const w = Number(flags.args[1])
+      const h = Number(flags.args[2])
+      if (!Number.isInteger(w) || !Number.isInteger(h) || w <= 0 || h <= 0) {
+        return badRequest('usage: silver set viewport <width> <height> (positive integers)')
+      }
+      return withConnection(flags, async ({ page }) => {
+        await page.setViewportSize({ width: w, height: h })
+        // Read back the ACTUAL applied inner size within THIS connection as proof
+        // the resize landed. NOTE (reconnect model): emulation overrides live only
+        // for the current CDP connection, so a LATER command sees the default
+        // viewport again — set it in the same session/command flow that needs it.
+        const applied = (await page
+          .evaluate('({ width: window.innerWidth, height: window.innerHeight })')
+          .catch(() => ({ width: w, height: h }))) as { width: number; height: number }
+        return ok({ viewport: { width: w, height: h }, applied })
+      })
+    }
+    case 'offline': {
+      // Default true (matching the Rust oracle); `false`/`off`/`0` turns it off.
+      const arg = (flags.args[1] ?? 'true').toLowerCase()
+      const offline = arg !== 'false' && arg !== 'off' && arg !== '0'
+      return withConnection(flags, async ({ context }) => {
+        await context.setOffline(offline)
+        return ok({ offline })
+      })
+    }
+    case 'color-scheme':
+    case 'colorscheme':
+    case 'media': {
+      const raw = (flags.args[1] ?? 'no-preference').toLowerCase()
+      const colorScheme: 'dark' | 'light' | 'no-preference' =
+        raw === 'dark' ? 'dark' : raw === 'light' ? 'light' : 'no-preference'
+      return withConnection(flags, async ({ page }) => {
+        await page.emulateMedia({ colorScheme })
+        return ok({ colorScheme })
+      })
+    }
+    case 'geo':
+    case 'geolocation': {
+      const lat = Number(flags.args[1])
+      const lng = Number(flags.args[2])
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        return badRequest('usage: silver set geolocation <latitude> <longitude>')
+      }
+      return withConnection(flags, async ({ context, page }) => {
+        // Grant geolocation on the current origin so the page's Geolocation API
+        // actually resolves to the emulated position (else it prompts/denies).
+        await context
+          .grantPermissions(['geolocation'], { origin: safeOrigin(page.url()) })
+          .catch(() => {})
+        await context.setGeolocation({ latitude: lat, longitude: lng })
+        return ok({ geolocation: { latitude: lat, longitude: lng } })
+      })
+    }
+    case 'timezone':
+    case 'tz': {
+      const tz = flags.args[1]
+      if (!tz) return badRequest('usage: silver set timezone <IANA-timezone>')
+      return withConnection(flags, async ({ page }) => {
+        const cdp = await page.context().newCDPSession(page)
+        try {
+          await cdp.send('Emulation.setTimezoneOverride', { timezoneId: tz })
+          return ok({ timezone: tz })
+        } catch {
+          return badRequest('invalid timezone; use an IANA name like America/New_York')
+        } finally {
+          await cdp.detach().catch(() => {})
+        }
+      })
+    }
+    case 'locale': {
+      const locale = flags.args[1]
+      if (!locale) return badRequest('usage: silver set locale <BCP47-locale>')
+      return withConnection(flags, async ({ page }) => {
+        const cdp = await page.context().newCDPSession(page)
+        try {
+          await cdp.send('Emulation.setLocaleOverride', { locale })
+          return ok({ locale })
+        } catch {
+          return badRequest('invalid locale; use a BCP47 name like en-US')
+        } finally {
+          await cdp.detach().catch(() => {})
+        }
+      })
+    }
+    default:
+      return badRequest(`usage: silver set <${SET_SUBCOMMANDS}> [args…]`)
+  }
 }
 
 // ---------------------------------------------------------------------------

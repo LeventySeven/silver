@@ -1,70 +1,83 @@
-# moxxie
+# Silver
 
-**The ultimate keyless browser for AI agents.** A single CLI a sub-agent installs and drives over the
-shell to *perceive and act on live web pages* — `open → snapshot → act → re-snapshot → done` with stable
-`@ref` grounding, ID-grounded extraction, diff-as-observation, and lethal-trifecta security **on by
-default**. The host model is the brain; moxxie is the eyes and hands. **100% keyless** — no model call
-anywhere in the tool, installable into any sandbox with zero configuration.
+**One keyless browser for AI agents — so you never switch tools again.** Silver is a single CLI a
+sub-agent installs and drives over the shell to *perceive and act on live web pages*:
+`open → snapshot → act → re-snapshot → done`, with stable `@ref` grounding, ID-grounded extraction,
+diff-as-observation, long-running task artifacts, parallel multi-browser orchestration, and
+lethal-trifecta security **on by default**. The host model is the brain; Silver is grounded eyes + hands.
+**100% keyless** — no model call anywhere in the tool, installable into any sandbox with zero config.
 
-Synthesized from the best patterns across the field — **Aside**, **Vercel `agent-browser`**,
-**`microsoft/webwright`**, **Browser Use**, **Stagehand / Browserbase**, **AgentQL**, and **Perplexity
-Computer** — built on **Playwright** (the actuation engine; we reimplement none of it).
+Silver exists because switching between Vercel `agent-browser`, Webwright, and Aside when one breaks is
+painful. So it **synthesizes the best of each into one** — not a monster that bolts them together, but the
+top capabilities of every tool, distilled and made better.
 
-## Why moxxie beats the tools it synthesizes
+## What it takes from each (and improves)
 
-Every serious browser-agent system converges on the same loop (snapshot → pick a stable ref → act →
-re-snapshot; `done` is a tool; vision only to disambiguate; extract must be ID-grounded). moxxie ships
-that convergent spine **plus the four things none of them ship together**, keyless:
+- **Vercel `agent-browser`** — the fast, agent-ergonomic CLI shape + the compact `@eN` accessibility-tree
+  snapshot (token-efficient perception). Silver ships a **compatible superset** of its verb surface.
+- **Webwright** (Microsoft) — long-running tasks as a **replayable run-folder artifact** (plan + action
+  log + checkpoints), so a task survives a crashed agent.
+- **Aside** — parallel **subagents**, grep-first **memory**, generation-stamped `@ref` grounding, and the
+  "harness > model" philosophy.
+- **Stagehand / AgentQL / Browser Use** — ID-grounded `extract` (fabricated URLs are *structurally*
+  impossible), the interactive-element heuristic cascade, the page-change guard.
 
-1. **A runnable eval gate (`pass_k`)** — the moat. Vercel's `agent-browser` has *no* task-completion
-   benchmark; moxxie's runs the real binary end-to-end (pass_k 1.000). The honest A/B vs Vercel: both
-   pass the shared read/act tasks, but moxxie has **capabilities Vercel cannot express** — `extract`
-   (ID-grounded) and injection-neutralization — plus trifecta-by-default and the stale-`@ref` grounding
-   gate (proven by the unit + trifecta suites).
-2. **Keyless, host-delegated, ID-grounded `extract`** — the schema's URL fields are swapped for element-ID
-   fields *before the model sees them*, so a fabricated URL/price is **structurally impossible**.
-3. **Hardened-by-default security** — egress denylist (`file:`/`data:`/`blob:` denied, suffix-match host
-   allowlisting), redaction at the serializer choke point, forged-role-tag neutralization of page output,
-   and **phase quarantine** (a disabled verb literally isn't dispatchable — no prompt can bypass it).
-4. **Diff-as-observation** — every snapshot returns `min(tree, diff)`, keeping the observation cheap.
+**Beyond all of them, by default:** a runnable `pass_k` **eval gate** (Vercel has none), keyless
+**ID-grounded extract**, **DNS-rebinding SSRF** defense, forged-tag + boundary-glyph **injection
+neutralization**, **phase-quarantine** (a disabled verb literally isn't dispatchable), a **paid/destructive
+confirm gate**, and **encrypted session state at rest**.
 
 ## Install
 
 ```bash
-cd skill/agent-browser
+cd silver
 pnpm install && pnpm build
 npx playwright install chromium   # first time only
 node dist/cli.js version
 ```
 
+## How it runs
+
+Silver spawns a **real, detached, headless-by-default Chromium on your machine** (Playwright's bundled
+build) and each command reconnects to it over CDP — so state (tabs, cookies, page) persists across
+commands. `--headed` shows the window. `--session <name>` gives each agent its own browser; `--namespace`
+isolates whole agent groups; `connect <endpoint>` attaches to a browser someone else launched.
+
 ## Quick start
 
 ```bash
-moxxie open https://example.com
-moxxie snapshot -i                 # compact a11y tree with @e1, @e2 … refs
-moxxie get text @e1                # read grounded text
-moxxie --enable-actions click @e3  # actor verbs are gated off by default (read-only is safe)
-moxxie extract --schema '{"links":[{"title":"string","url":"string"}]}'   # host runs inference on the bundle
-moxxie close
+silver open https://example.com
+silver snapshot -i                     # compact a11y tree: @e1, @e2 … refs
+silver get text @e1
+silver --enable-actions click @e3      # actor verbs are gated off by default (read-only is safe)
+silver extract --schema '{"links":[{"title":"string","url":"string"}]}'   # host runs inference on the bundle
+# long task:  silver task start "research X" ; silver task exec <id> -- snapshot -i ; silver task resume <id>
+# parallel:   silver --session a open … & silver --session b open …   (own browser each)
+silver skill --full                    # the complete agent-facing guide
 ```
-
-`moxxie` is a **compatible superset** of Vercel's `agent-browser` surface — the same verbs and `@ref`
-grounding, plus `extract`, diff-observation, and the security defaults.
 
 ## Layout
 
-- `skill/agent-browser/` — the moxxie CLI (TypeScript + Playwright) and its skill doc.
-- `evals/` — the `pass_k` harness, the lethal-trifecta suite, and the Vercel A/B (the gate).
-- `docs/specs/`, `docs/plans/` — the committed design spec and implementation plan.
-- `research/` — the deep multi-agent investigation corpus + synthesis + red-team that drove the design.
-- `reference/` — cloned OSS sources (gitignored): Vercel `agent-browser`, browser-use, stagehand, webwright.
+- `silver/` — the product (TypeScript + Playwright). `silver/skill-data/core/SKILL.md` is the agent guide
+  (served by `silver skill --full`).
+- `evals/` — the `pass_k` harness, lethal-trifecta suite, and A/B vs the real Vercel binary (the moat).
+- `research/` — the deep multi-agent investigation + synthesis + red-team + the base/language decision.
+- `rust-oracle/` — an earlier Rust fork of Vercel `agent-browser`, kept as a buildable differential oracle.
+- `docs/` — the design spec, plan, and decision record. `reference/` — cloned OSS sources (gitignored).
+
+## Why TypeScript (not Rust)
+
+Decided by an **unbiased 18-agent workflow** (evidence → advocates → 5 independent judges → red-team),
+5/5 for TypeScript, on the one durable fact: **Playwright is TS-native** (auto-wait, selector engine,
+network interception maintained upstream) while Rust hand-rolls CDP and owns protocol maintenance forever.
+Token-efficiency is a property of the *snapshot format* (which Silver matches), not the language; the one
+real Rust edge — per-command latency from a persistent connection — is closeable in TS and tracked.
 
 ## Status
 
-Core engine + security + extract + CLI + eval gate are green (103 tests; pass_k 1.000; trifecta 3/3).
-Under active cross-source alignment and hardening.
+Prod-grade: **230 tests · eval pass_k 1.000 · lethal-trifecta 3/3**, all committed. Keyless. No MCP.
 
 ## License
 
-MIT (our code). See `NOTICE` for patterns adapted from vercel-labs/agent-browser (Apache-2.0),
-browserbase/stagehand (MIT), browser-use/browser-use (MIT), and microsoft/webwright (MIT).
+MIT. See `NOTICE` for patterns adapted from vercel-labs/agent-browser (Apache-2.0), browserbase/stagehand
+(MIT), browser-use/browser-use (MIT), and microsoft/webwright (MIT).
