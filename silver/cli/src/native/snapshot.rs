@@ -491,7 +491,13 @@ pub async fn take_snapshot(
 
             for (idx, href) in hrefs {
                 if let Some(url) = href {
-                    tree_nodes[idx].url = Some(url);
+                    tree_nodes[idx].url = Some(url.clone());
+                    // Mirror the href onto the ref entry so the keyless
+                    // `extract` bundle can build its id→url value map without
+                    // re-resolving, while the model-facing snapshot omits it.
+                    if let Some(ref_id) = tree_nodes[idx].ref_id.clone() {
+                        ref_map.set_url(&ref_id, url);
+                    }
                 }
             }
         }

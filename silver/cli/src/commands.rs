@@ -105,6 +105,7 @@ pub fn is_top_level_command(value: &str) -> bool {
             | "screenshot"
             | "pdf"
             | "snapshot"
+            | "extract"
             | "eval"
             | "close"
             | "quit"
@@ -306,6 +307,23 @@ fn parse_cookie_header(header: &str) -> Result<Vec<Value>, String> {
         return Err("no cookies found in input".to_string());
     }
     Ok(out)
+}
+
+/// Load a JSON argument that is either an inline JSON string or `@path` to a
+/// file containing JSON. Used by `extract --schema` / `extract resolve --ids`.
+fn load_json_arg(raw: &str, usage: &'static str) -> Result<Value, ParseError> {
+    let content = if let Some(path) = raw.strip_prefix('@') {
+        std::fs::read_to_string(path).map_err(|e| ParseError::InvalidValue {
+            message: format!("cannot read '{}': {}", path, e),
+            usage,
+        })?
+    } else {
+        raw.to_string()
+    };
+    serde_json::from_str(&content).map_err(|e| ParseError::InvalidValue {
+        message: format!("invalid JSON: {}", e),
+        usage,
+    })
 }
 
 pub fn parse_command(args: &[String], flags: &Flags) -> Result<Value, ParseError> {
@@ -886,6 +904,81 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     _ => {}
                 }
                 i += 1;
+            }
+            Ok(cmd)
+        }
+
+        // === Extract (keyless ID-grounded bundle) ===
+        "extract" => {
+            // extract resolve --ids <json|@file>
+            if rest.first().copied() == Some("resolve") {
+                const RESOLVE_USAGE: &str = "extract resolve --ids <json|@file>";
+                let mut ids_raw: Option<&str> = None;
+                let mut j = 1;
+                while j < rest.len() {
+                    match rest[j] {
+                        "--ids" => {
+                            ids_raw = rest.get(j + 1).copied();
+                            j += 1;
+                        }
+                        other => {
+                            return Err(ParseError::InvalidValue {
+                                message: format!("unknown flag '{}' for extract resolve", other),
+                                usage: RESOLVE_USAGE,
+                            });
+                        }
+                    }
+                    j += 1;
+                }
+                let ids_raw = ids_raw.ok_or_else(|| ParseError::MissingArguments {
+                    context: "extract resolve".to_string(),
+                    usage: RESOLVE_USAGE,
+                })?;
+                let ids = load_json_arg(ids_raw, RESOLVE_USAGE)?;
+                return Ok(json!({ "id": id, "action": "extract_resolve", "ids": ids }));
+            }
+
+            // extract --schema <json|@file> [--instruction <text>] [--selector <sel>]
+            const EXTRACT_USAGE: &str =
+                "extract --schema <json|@file> [--instruction <text>] [--selector <sel>]";
+            let mut schema_raw: Option<&str> = None;
+            let mut instruction: Option<&str> = None;
+            let mut selector: Option<&str> = None;
+            let mut j = 0;
+            while j < rest.len() {
+                match rest[j] {
+                    "--schema" => {
+                        schema_raw = rest.get(j + 1).copied();
+                        j += 1;
+                    }
+                    "--instruction" => {
+                        instruction = rest.get(j + 1).copied();
+                        j += 1;
+                    }
+                    "-s" | "--selector" => {
+                        selector = rest.get(j + 1).copied();
+                        j += 1;
+                    }
+                    other => {
+                        return Err(ParseError::InvalidValue {
+                            message: format!("unknown flag '{}' for extract", other),
+                            usage: EXTRACT_USAGE,
+                        });
+                    }
+                }
+                j += 1;
+            }
+            let schema_raw = schema_raw.ok_or_else(|| ParseError::MissingArguments {
+                context: "extract".to_string(),
+                usage: EXTRACT_USAGE,
+            })?;
+            let schema = load_json_arg(schema_raw, EXTRACT_USAGE)?;
+            let mut cmd = json!({ "id": id, "action": "extract", "schema": schema });
+            if let Some(instr) = instruction {
+                cmd["instruction"] = json!(instr);
+            }
+            if let Some(sel) = selector {
+                cmd["selector"] = json!(sel);
             }
             Ok(cmd)
         }

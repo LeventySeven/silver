@@ -23,7 +23,9 @@ use super::cdp::types::{
 };
 use super::cookies;
 use super::diff;
+use super::egress;
 use super::element::RefMap;
+use super::extract;
 use super::inspect_server::InspectServer;
 use super::interaction;
 use super::network::{self, DomainFilter, EventTracker};
@@ -257,6 +259,20 @@ fn launch_connection_is_external(
     launch_connection_identity(cdp_url, cdp_port, auto_connect, provider_name).0 != "local"
 }
 
+/// Persisted state for the keyless ID-grounded `extract` (Silver Delta 1).
+/// Captured by `extract` and consumed by `extract resolve`, keyed to the page
+/// generation so a resolve against a page that has since navigated is refused
+/// as stale rather than resolved against a value map that no longer describes
+/// the page.
+pub struct ExtractState {
+    /// id (`<frameOrdinal>-<backendNodeId>`) → real value (href, or node text).
+    pub value_map: HashMap<String, String>,
+    /// Page generation the value map was captured at.
+    pub generation: u64,
+    /// Dot-joined schema paths of the ID-transformed URL fields (informational).
+    pub url_field_paths: Vec<String>,
+}
+
 pub struct DaemonState {
     pub browser: Option<BrowserManager>,
     pub appium: Option<AppiumManager>,
@@ -345,6 +361,12 @@ pub struct DaemonState {
     active_provider_session: Option<ActiveProviderSession>,
     /// Actions already approved while replaying a confirmed command.
     confirmed_policy_actions: HashSet<String>,
+    /// Monotonic page generation, bumped on every navigate/back/forward/reload.
+    /// The keyless `extract` value map is keyed to this so `extract resolve`
+    /// can refuse a resolve after the page has changed underneath it.
+    pub page_generation: u64,
+    /// Persisted keyless-extract state from the most recent `extract` call.
+    pub extract_state: Option<ExtractState>,
 }
 
 impl DaemonState {
@@ -421,6 +443,8 @@ impl DaemonState {
             plugin_init_scripts: Vec::new(),
             active_provider_session: None,
             confirmed_policy_actions: HashSet::new(),
+            page_generation: 0,
+            extract_state: None,
         }
     }
 
@@ -1515,6 +1539,7 @@ fn skip_launch_action(action: &str) -> bool {
         "" | "launch"
             | "close"
             | "read"
+            | "extract_resolve"
             | "har_stop"
             | "credentials_set"
             | "credentials_get"
@@ -1834,6 +1859,8 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "evaluate" => handle_evaluate(cmd, state).await,
         "close" => handle_close(state).await,
         "snapshot" => handle_snapshot(cmd, state).await,
+        "extract" => handle_extract(cmd, state).await,
+        "extract_resolve" => handle_extract_resolve(cmd, state).await,
         "screenshot" => handle_screenshot(cmd, state).await,
         "click" => handle_click(cmd, state).await,
         "dblclick" => handle_dblclick(cmd, state).await,
@@ -3208,6 +3235,25 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         }
     }
 
+    // DNS-resolution SSRF egress guard (Silver Delta 2). Reject a public
+    // hostname that resolves to a loopback/link-local/private/reserved address
+    // (the `169.254.169.254.nip.io` / `127.0.0.1.nip.io` metadata SSRF).
+    // `localhost`/`*.localhost` and `--allowed-domains` are exempt. Residual:
+    // Chromium resolves again at connect time (TOCTOU) — see egress.rs.
+    {
+        let allowed = {
+            let df = state.domain_filter.read().await;
+            df.as_ref()
+                .map(|f| f.allowed_domains.clone())
+                .unwrap_or_default()
+        };
+        egress::assert_navigable_resolved(url, &allowed).await?;
+    }
+
+    // A committed navigation changes the page underneath any prior `extract`
+    // value map, so bump the generation to mark that map stale.
+    state.page_generation = state.page_generation.wrapping_add(1);
+
     // WebDriver backend path
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
@@ -3532,6 +3578,152 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         .collect();
 
     Ok(json!({ "snapshot": tree, "origin": url, "refs": refs }))
+}
+
+/// Keyless ID-grounded `extract` (Silver Delta 1). Takes an accessibility
+/// snapshot, rewrites it so each ref-bearing node cites a stable numeric
+/// element ID and raw hrefs are stripped, builds and PERSISTS the id→value map
+/// (keyed to the page generation), ID-transforms the caller's schema, and
+/// returns the host-facing bundle `{ id_transformed_schema, prompt,
+/// snapshot_with_ids, url_field_paths, generation }`. The daemon NEVER calls a
+/// model — the host runs inference over the bundle, then `extract resolve`
+/// reverse-maps the cited IDs back to real values.
+async fn handle_extract(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let schema = cmd
+        .get("schema")
+        .cloned()
+        .ok_or("Missing 'schema' parameter")?;
+    let instruction = cmd.get("instruction").and_then(|v| v.as_str());
+
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+
+    // Full-content snapshot with URLs so links resolve their hrefs into the
+    // ref map. `interactive:false` keeps content text for text extraction.
+    let options = SnapshotOptions {
+        selector: cmd
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        interactive: false,
+        compact: false,
+        depth: None,
+        urls: true,
+    };
+
+    state.ref_map.clear();
+    let tree = snapshot::take_snapshot(
+        &mgr.client,
+        &session_id,
+        &options,
+        &mut state.ref_map,
+        state.active_frame_id.as_deref(),
+        &state.iframe_sessions,
+    )
+    .await?;
+
+    // Build the id→value map and the eN→numericId lookup. IDs are
+    // `<frameOrdinal>-<backendNodeId>`: main frame is ordinal 0, each distinct
+    // iframe frame_id gets the next ordinal in ref order. Stable within this
+    // extract and reverse-mappable.
+    let mut frame_ordinals: HashMap<String, usize> = HashMap::new();
+    let mut next_ordinal: usize = 1;
+    let mut ref_to_id: HashMap<String, String> = HashMap::new();
+    let mut value_map: HashMap<String, String> = HashMap::new();
+
+    for (ref_id, entry) in state.ref_map.entries_sorted() {
+        let Some(backend_node_id) = entry.backend_node_id else {
+            continue;
+        };
+        let ordinal = match &entry.frame_id {
+            None => 0,
+            Some(fid) => *frame_ordinals.entry(fid.clone()).or_insert_with(|| {
+                let ordinal = next_ordinal;
+                next_ordinal += 1;
+                ordinal
+            }),
+        };
+        let numeric_id = format!("{}-{}", ordinal, backend_node_id);
+        // A cited ID must resolve to a real value: prefer the resolved href
+        // (links), else the node's accessible name (content).
+        let value = entry.url.clone().unwrap_or_else(|| entry.name.clone());
+        ref_to_id.insert(ref_id, numeric_id.clone());
+        value_map.insert(numeric_id, value);
+    }
+
+    // Model-facing snapshot: numeric IDs instead of @eN refs, raw hrefs removed.
+    let snapshot_with_ids = extract::to_id_snapshot(&tree, &ref_to_id);
+    let ref_count = value_map.len();
+
+    let bundle = extract::build_bundle(
+        &schema,
+        &snapshot_with_ids,
+        instruction,
+        state.page_generation,
+        ref_count,
+    );
+
+    // Persist the value map keyed to the current generation for `extract
+    // resolve`. Overwrites any prior extract for this session.
+    let url_field_paths = bundle
+        .get("url_field_paths")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| p.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    state.extract_state = Some(ExtractState {
+        value_map,
+        generation: state.page_generation,
+        url_field_paths,
+    });
+
+    Ok(bundle)
+}
+
+/// Keyless reverse map for `extract resolve` (Silver Delta 1). Walks the host's
+/// extraction output and replaces every `^\d+-\d+$` element ID with the real
+/// value from the persisted map. An unknown ID becomes `null` plus a loud
+/// warning (never `""`); a stale generation (the page navigated since
+/// `extract`) is refused as an error. No model, no network.
+async fn handle_extract_resolve(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let ids = cmd.get("ids").ok_or("Missing 'ids' parameter")?;
+
+    let extract_state = state
+        .extract_state
+        .as_ref()
+        .ok_or("no extract bundle in this session — run `silver extract --schema <json>` first")?;
+
+    // Stale-generation gate: the value map only describes the page it was
+    // captured on. A navigation since then invalidates it.
+    if extract_state.generation != state.page_generation {
+        return Err(format!(
+            "extract result is stale: the page changed since `extract` was run (snapshot \
+             generation {} → {}). Re-run `silver extract` to obtain fresh element IDs.",
+            extract_state.generation, state.page_generation
+        ));
+    }
+
+    let (resolved, unknown) = extract::resolve_ids(ids, &extract_state.value_map);
+
+    let mut data = json!({
+        "resolved": resolved,
+        "generation": extract_state.generation,
+    });
+    if !unknown.is_empty() {
+        // Loud null: name every ID we could not resolve.
+        let warning = format!(
+            "unresolved element IDs set to null: {} — these IDs are not in the current \
+             snapshot's value map (the element may no longer exist); re-snapshot and re-run \
+             `silver extract` to obtain fresh IDs",
+            unknown.join(", ")
+        );
+        data["warning"] = json!(warning);
+        data["unresolved_ids"] = json!(unknown);
+    }
+    Ok(data)
 }
 
 async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -4154,6 +4346,7 @@ async fn handle_ischecked(cmd: &Value, state: &mut DaemonState) -> Result<Value,
 }
 
 async fn handle_back(state: &mut DaemonState) -> Result<Value, String> {
+    state.page_generation = state.page_generation.wrapping_add(1);
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
             wb.back().await?;
@@ -4172,6 +4365,7 @@ async fn handle_back(state: &mut DaemonState) -> Result<Value, String> {
 }
 
 async fn handle_forward(state: &mut DaemonState) -> Result<Value, String> {
+    state.page_generation = state.page_generation.wrapping_add(1);
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
             wb.forward().await?;
@@ -4190,6 +4384,7 @@ async fn handle_forward(state: &mut DaemonState) -> Result<Value, String> {
 }
 
 async fn handle_reload(state: &mut DaemonState) -> Result<Value, String> {
+    state.page_generation = state.page_generation.wrapping_add(1);
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
             wb.reload().await?;

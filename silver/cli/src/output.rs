@@ -389,6 +389,20 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
             }
             return;
         }
+        // Keyless extract bundle / resolve output: print the JSON payload so the
+        // host can run inference over it (or parse the resolved result). Any
+        // loud-null warning is surfaced on stderr.
+        if action == Some("extract") || action == Some("extract_resolve") {
+            if let Some(warning) = data.get("warning").and_then(|v| v.as_str()) {
+                eprintln!("{} {}", color::warning_indicator(), warning);
+            }
+            let printable = data.get("resolved").unwrap_or(data);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(printable).unwrap_or_else(|_| printable.to_string())
+            );
+            return;
+        }
         // Navigation response
         if let Some(url) = data.get("url").and_then(|v| v.as_str()) {
             if let Some(title) = data.get("title").and_then(|v| v.as_str()) {

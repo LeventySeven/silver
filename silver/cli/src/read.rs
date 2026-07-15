@@ -189,6 +189,23 @@ struct LlmsLink {
 pub async fn run_read(raw_url: &str, options: ReadOptions) -> Result<Value, String> {
     let target = normalize_url(raw_url)?;
     check_allowed_url_for_options(&target, &options)?;
+
+    // DNS-resolution SSRF egress guard (Silver Delta 2). The Rust-side `read`
+    // fetch shares the OS resolver with reqwest, so a host resolving to a
+    // loopback/link-local/private/reserved address is rejected before any
+    // request goes out. Operator `--allowed-domains` (the union of the
+    // per-command and daemon-enforced allowlists) and localhost are exempt.
+    // Residual: reqwest resolves redirect targets itself; the sync redirect
+    // policy can only re-check lexically, so a redirect to a rebinding host is
+    // not DNS-vetted (documented).
+    {
+        let mut allowed: Vec<String> = options.allowed_domains.clone();
+        for set in &options.enforced_allowed_domains {
+            allowed.extend(set.iter().cloned());
+        }
+        crate::native::egress::assert_navigable_resolved(target.as_str(), &allowed).await?;
+    }
+
     let redirect_allowed_domain_sets = allowed_domain_sets_for_options(&options);
     let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() > 10 {

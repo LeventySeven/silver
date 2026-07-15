@@ -13,6 +13,10 @@ pub struct RefEntry {
     pub nth: Option<usize>,
     pub selector: Option<String>,
     pub frame_id: Option<String>,
+    /// Resolved href for link nodes, populated by a `snapshot -u`/extract pass.
+    /// Used by the keyless `extract` bundle to build the id→url value map while
+    /// keeping raw hrefs out of the model-facing snapshot.
+    pub url: Option<String>,
 }
 
 pub struct RefMap {
@@ -57,8 +61,16 @@ impl RefMap {
                 nth,
                 selector: None,
                 frame_id: frame_id.map(|s| s.to_string()),
+                url: None,
             },
         );
+    }
+
+    /// Attach a resolved href to an existing ref entry (extract/`snapshot -u`).
+    pub fn set_url(&mut self, ref_id: &str, url: String) {
+        if let Some(entry) = self.map.get_mut(ref_id) {
+            entry.url = Some(url);
+        }
     }
 
     pub fn add_selector(
@@ -78,6 +90,7 @@ impl RefMap {
                 nth,
                 selector: Some(selector),
                 frame_id: None,
+                url: None,
             },
         );
     }
