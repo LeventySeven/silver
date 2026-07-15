@@ -16,7 +16,7 @@
  * KEYLESS: no model / provider call anywhere. Every "smart" step is a keyless
  * heuristic or a bundle handed to the host.
  */
-import { promises as fs, existsSync, readFileSync, readdirSync } from 'node:fs'
+import { promises as fs, existsSync, readFileSync, readdirSync, mkdirSync, copyFileSync } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -2189,6 +2189,11 @@ async function handleDoctor(): Promise<Envelope<unknown>> {
 }
 
 function handleSkill(flags: ParsedFlags): Envelope<unknown> {
+  // `skill install [target-dir]` drops the on-disk skill payload into a project
+  // (so `npx github:LeventySeven/silver skill install` works). Intercepted BEFORE
+  // the `<ref>` catalog path so `install` is never mistaken for a reference name.
+  if (flags.args[0] === 'install') return handleSkillInstall(flags)
+
   // G5: reference-topic catalog served from skill-data/core/reference/<ref>.md
   // (the SKILL sibling authors those files). `skill --list` / `skill list`
   // enumerates the topics; `skill <ref>` serves one. Keyless, readFileSync-served.
@@ -2253,6 +2258,78 @@ function handleSkill(flags: ParsedFlags): Envelope<unknown> {
     )
   }
   return ok(short)
+}
+
+/**
+ * Relative paths (under PACKAGE_ROOT) of the skill payload `skill install`
+ * copies: the SKILL.md discovery stub, the core guide + its `reference/*.md` +
+ * `examples.md`, and `commands/*.md`. Only paths that actually exist in this
+ * build are returned (a bundle that ships without one directory just skips it).
+ */
+function collectSkillSources(): string[] {
+  const rels = ['SKILL.md', 'skill-data/core/SKILL.md', 'skill-data/core/examples.md']
+  for (const dir of ['skill-data/core/reference', 'commands']) {
+    try {
+      for (const f of readdirSync(path.join(PACKAGE_ROOT, dir)).sort()) {
+        if (f.endsWith('.md')) rels.push(`${dir}/${f}`)
+      }
+    } catch {
+      /* directory absent in this build — skip it */
+    }
+  }
+  return rels.filter((r) => existsSync(path.join(PACKAGE_ROOT, r)))
+}
+
+/**
+ * `silver skill install [target-dir]` — copy the on-disk skill payload into
+ * `<target-dir>/silver/` so a user can drop the skill into a project with a
+ * single `npx github:LeventySeven/silver skill install`.
+ *
+ * Target resolution: an explicit positional wins; otherwise default to
+ * `./.claude/skills` when that dir already exists, else the cwd. Every file lands
+ * under `<target>/silver/`, and EACH destination is re-checked with
+ * `assertContainedPath` against that install root — so a bundled relative path
+ * can never traverse outside the target (path-containment, defense-in-depth).
+ * Keyless, synchronous fs — no model, no network. Returns `{installed, target}`.
+ */
+function handleSkillInstall(flags: ParsedFlags): Envelope<unknown> {
+  // 1. Resolve the target dir: explicit arg → it; else `.claude/skills` if it
+  // exists (drop straight into a Claude project) → else the cwd.
+  const explicit = flags.args[1]
+  let targetDir: string
+  if (explicit !== undefined && explicit.trim().length > 0) {
+    targetDir = explicit
+  } else {
+    const claudeSkills = path.join(process.cwd(), '.claude', 'skills')
+    targetDir = existsSync(claudeSkills) ? claudeSkills : process.cwd()
+  }
+  const installRoot = path.resolve(targetDir, 'silver')
+
+  // 2. Collect the payload (relative paths under the package root).
+  const rels = collectSkillSources()
+  if (rels.length === 0) {
+    return badRequest('no skill files are bundled with this build; reinstall silver')
+  }
+
+  // 3. Resolve + contain EVERY destination before writing anything (so a
+  // containment failure aborts cleanly, never mid-copy). A bundled name can't
+  // escape `<target>/silver` — this is belt-and-suspenders over a fixed source set.
+  const plan: { src: string; dest: string }[] = []
+  for (const rel of rels) {
+    const c = assertContainedPath(rel, installRoot)
+    if (!c.ok) return fail('path_denied')
+    plan.push({ src: path.join(PACKAGE_ROOT, rel), dest: c.resolved })
+  }
+
+  // 4. Copy, creating parent dirs as needed. Any fs error propagates to the CLI's
+  // throw→envelope mapping (a clean, path-free failure — no leak).
+  const installed: string[] = []
+  for (const { src, dest } of plan) {
+    mkdirSync(path.dirname(dest), { recursive: true })
+    copyFileSync(src, dest)
+    installed.push(dest)
+  }
+  return ok({ installed, target: installRoot })
 }
 
 /** Compact head of a long SKILL.md: leading content to a line boundary. */

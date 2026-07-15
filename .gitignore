@@ -1,18 +1,25 @@
+# ── Silver public repo: keep ONLY the skill + CLI (silver/) + evals + top-level docs.
+# Everything below is local-only research/scaffolding, not shipped.
 node_modules/
 dist/
 .venv/
 __pycache__/
 *.pyc
 .DS_Store
-.agent-browser-state/
-profiles/
+target/
+**/target/
 *.local
 .env
 test-results/
 playwright-report/
 .browser-cache/
+.silver/
+.agent-browser-state/
+profiles/
 
+# Local-only resources + scaffolding (NOT in the public repo)
 reference/
-
-target/
-**/target/
+research/
+rust-oracle/
+plan/
+docs/

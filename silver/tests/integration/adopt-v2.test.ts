@@ -2,6 +2,7 @@ import { describe, it, expect, afterAll, beforeAll } from 'vitest'
 import { createServer, type Server } from 'node:http'
 import { AddressInfo } from 'node:net'
 import { promises as fs, existsSync } from 'node:fs'
+import * as os from 'node:os'
 import * as path from 'node:path'
 import { run } from '../../src/cli.js'
 import { closeSession, sessionDir } from '../../src/core/session.js'
@@ -152,6 +153,30 @@ describe('adopt-list-v2 (F2 doctor · G5 skill · B1 coord · E4 download)', () 
     const res = await run(['skill', '../../etc/passwd'])
     expect(res.env.success).toBe(false)
     expect(res.env.error).toContain('invalid skill reference')
+  })
+
+  it('skill install copies the payload into <target>/silver and reports it', async () => {
+    const dest = path.join(os.tmpdir(), `silver-skill-install-${process.pid}-${Date.now()}`)
+    try {
+      const res = await run(['skill', 'install', dest])
+      expect(res.env.success).toBe(true)
+      const data = res.env.data as { installed: string[]; target: string }
+      // Files land under <target>/silver, and the report names that install root.
+      expect(data.target).toBe(path.join(dest, 'silver'))
+      expect(Array.isArray(data.installed)).toBe(true)
+      expect(data.installed.length).toBeGreaterThan(0)
+      // The discovery stub + the core guide are on disk under <target>/silver.
+      expect(existsSync(path.join(dest, 'silver', 'SKILL.md'))).toBe(true)
+      expect(existsSync(path.join(dest, 'silver', 'skill-data', 'core', 'SKILL.md'))).toBe(true)
+      // Every reported path is a real, contained file inside the install root.
+      const installRoot = path.join(dest, 'silver')
+      for (const p of data.installed) {
+        expect(existsSync(p)).toBe(true)
+        expect(p.startsWith(installRoot + path.sep)).toBe(true)
+      }
+    } finally {
+      await fs.rm(dest, { recursive: true, force: true }).catch(() => {})
+    }
   })
 
   // ---- B1: coordinate-verb dispatch (canvas fallback) ----

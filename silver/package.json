@@ -1,10 +1,9 @@
 {
   "name": "silver",
   "version": "0.1.0",
-  "private": true,
-  "description": "uab — keyless browser-automation CLI for AI sub-agents, built on Playwright. An agent-browser-compatible superset that never calls a model.",
+  "description": "Silver — the keyless browser for AI agents. One CLI to perceive + act on live web pages (grounded @refs, ID-grounded extract, long-running tasks, parallel sessions/subagents), synthesized from Vercel agent-browser, Aside, Webwright, Browser Use, Stagehand, AgentQL. Keyless: never calls a model.",
+  "author": "LeventySeven",
   "license": "MIT",
-  "author": "silver",
   "type": "module",
   "bin": {
     "silver": "./dist/cli.js"
@@ -14,12 +13,38 @@
   },
   "files": [
     "dist",
+    "skill-data",
+    "commands",
     "SKILL.md",
     "NOTICE",
     "LICENSE"
   ],
+  "keywords": [
+    "browser",
+    "agent",
+    "ai",
+    "playwright",
+    "cli",
+    "automation",
+    "keyless",
+    "web-agent",
+    "skill"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LeventySeven/silver.git",
+    "directory": "silver"
+  },
+  "homepage": "https://github.com/LeventySeven/silver#readme",
+  "bugs": {
+    "url": "https://github.com/LeventySeven/silver/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc -p .",
+    "prepare": "tsc -p .",
     "test": "vitest run",
     "dev": "tsx src/cli.ts"
   },

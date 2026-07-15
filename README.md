@@ -29,12 +29,37 @@ confirm gate**, and **encrypted session state at rest**.
 
 ## Install
 
+The npm name `silver` is taken, so Silver installs straight from GitHub (no npm publish needed).
+
 ```bash
-cd silver
-pnpm install && pnpm build
+# Run once, no install (prints the full agent-facing guide):
+npx github:LeventySeven/silver skill --full
+
+# Install the CLI globally, then use `silver <verb>` anywhere:
+npm i -g github:LeventySeven/silver
+silver version
+
+# Drop the skill files into your project (writes ./.claude/skills/silver/ or ./silver/):
+npx github:LeventySeven/silver skill install
+
+# First-time browser download (Playwright's own postinstall usually handles this):
+npx playwright install chromium
+```
+
+From source (for development):
+
+```bash
+git clone https://github.com/LeventySeven/silver.git
+cd silver/silver          # the product package lives in the silver/ subdir
+pnpm i && pnpm build
+npm link                  # puts `silver` on your PATH
 npx playwright install chromium   # first time only
 node dist/cli.js version
 ```
+
+> A GitHub install runs `prepare`, which compiles `silver/dist` on the fly — so
+> `npx github:LeventySeven/silver <verb>` and the global bin both work without a
+> published tarball.
 
 ## How it runs
 
@@ -58,24 +83,30 @@ silver skill --full                    # the complete agent-facing guide
 
 ## Layout
 
-- `silver/` — the product (TypeScript + Playwright). `silver/skill-data/core/SKILL.md` is the agent guide
-  (served by `silver skill --full`).
+- `silver/` — the product (TypeScript + Playwright). This is the CLI **and** the skill:
+  `silver/src` (code), `silver/skill-data/core/SKILL.md` + `reference/*` (the agent guide, served by
+  `silver skill --full`), `silver/commands/*` (mode dispatchers), `silver/tests`.
 - `evals/` — the `pass_k` harness, lethal-trifecta suite, and A/B vs the real Vercel binary (the moat).
-- `research/` — the deep multi-agent investigation + synthesis + red-team + the base/language decision.
-- `rust-oracle/` — an earlier Rust fork of Vercel `agent-browser`, kept as a buildable differential oracle.
-- `docs/` — the design spec, plan, and decision record. `reference/` — cloned OSS sources (gitignored).
+
+The deep multi-agent investigation, synthesis, red-teams, the base/language decision, and the Rust
+differential oracle are kept **local-only** (gitignored) — this repo ships just the skill + CLI.
 
 ## Why TypeScript (not Rust)
 
 Decided by an **unbiased 18-agent workflow** (evidence → advocates → 5 independent judges → red-team),
 5/5 for TypeScript, on the one durable fact: **Playwright is TS-native** (auto-wait, selector engine,
 network interception maintained upstream) while Rust hand-rolls CDP and owns protocol maintenance forever.
-Token-efficiency is a property of the *snapshot format* (which Silver matches), not the language; the one
-real Rust edge — per-command latency from a persistent connection — is closeable in TS and tracked.
+Token-efficiency is a property of the *snapshot format* (which Silver matches), not the language — and the
+one real Rust edge (per-command latency) was measured, traced to a *dead network-idle settle on read
+verbs*, and fixed in TS: **warm snapshot dropped 1.45s → 0.23s (6×)**, `version` 190ms → ~55ms.
 
 ## Status
 
-Prod-grade: **230 tests · eval pass_k 1.000 · lethal-trifecta 3/3**, all committed. Keyless. No MCP.
+Prod-grade: **328 tests · eval pass_k 1.000 · lethal-trifecta 3/3**, all committed. Keyless. No MCP.
+Full Vercel-parity verbs + Webwright long-tasks (`task compile`/manifest/replay) + Aside subagents/memory/
+parallel; cross-origin iframe (OOPIF) perception; keyless auth (`--engine firefox`, `--profile`, TOTP,
+cookie-fetch, `<secret>` write-path); an `expect` trust primitive + captcha/auth detection; subresource
+egress + DNS-rebinding SSRF defense; an Anthropic-grade SKILL (3-tier progressive disclosure).
 
 ## License
 

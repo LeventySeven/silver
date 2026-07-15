@@ -263,6 +263,8 @@ list `silver` in its `AGENT.md` (see `reference/agents-memory.md §3`).
 | `cookies set --curl <file> [--url <origin>]` | Load cookies from a JSON array, a `Cookie:` header, or a pasted curl command. |
 | `version` · `doctor` | `{name, version}` / install check `{playwright, chromium, uab_writable}`. |
 | `skill [--full]` | This guide (compact head, or the whole doc). |
+| `skill --list` · `skill <topic>` | List reference topics / print one (`reference/<topic>.md`). |
+| `skill install [dir]` | Copy the skill files into `<dir>/silver/` (default `./.claude/skills` if it exists, else `.`) — drop the skill into a project. Reports `{installed, target}`. |
 
 ---
 

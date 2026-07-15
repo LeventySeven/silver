@@ -19,6 +19,7 @@ your harness supports; they are byte-identical per build.
 ```bash
 silver skill --full        # complete guide: lean loop, full command tables, hard rules, recipes
 silver skill               # a compact head of the same guide
+silver skill install [dir] # copy these skill files into <dir>/silver/ (default ./.claude/skills or .)
 ```
 
 Deep references, one level down from the guide:
