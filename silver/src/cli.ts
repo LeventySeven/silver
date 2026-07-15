@@ -43,7 +43,7 @@ import { WaitError } from './actuation/wait.js'
  * modify), so it is dispatched here directly; the others are read-only-safe and
  * bypass the gate for clarity. None can mutate page state.
  */
-const META_VERBS = new Set(['version', 'doctor', 'skill', 'session', 'batch', 'mcp'])
+const META_VERBS = new Set(['version', 'doctor', 'skill', 'session', 'batch'])
 
 /**
  * Verbs owned by the task-artifact / memory / subagent layers. Registered
@@ -104,16 +104,6 @@ export async function run(argv: string[]): Promise<RunResult> {
   }
 
   try {
-    // `mcp` is a META verb: it starts silver's stdio MCP server (the second host
-    // interface) rather than driving a browser. Dispatched HERE (not in
-    // handlers.ts, which a sibling owns) via a dynamic import that keeps the
-    // module graph acyclic. The server routes each MCP tool call back through
-    // this same run() path, so every security gate still applies. KEYLESS.
-    if (flags.verb === 'mcp') {
-      const { runMcp } = await import('./mcp/index.js')
-      const env = await runMcp(flags)
-      return { env, code: env.success ? 0 : 1, json }
-    }
     const env = LAYER_VERBS.has(flags.verb) ? await dispatchLayer(flags) : await handle(flags)
     return { env, code: env.success ? 0 : 1, json }
   } catch (err) {
