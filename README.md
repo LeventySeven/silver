@@ -17,7 +17,10 @@ re-snapshot; `done` is a tool; vision only to disambiguate; extract must be ID-g
 that convergent spine **plus the four things none of them ship together**, keyless:
 
 1. **A runnable eval gate (`pass_k`)** — the moat. Vercel's `agent-browser` has *no* task-completion
-   benchmark; moxxie's runs the real binary end-to-end. Current A/B: **moxxie 1.000 vs Vercel 0.833**.
+   benchmark; moxxie's runs the real binary end-to-end (pass_k 1.000). The honest A/B vs Vercel: both
+   pass the shared read/act tasks, but moxxie has **capabilities Vercel cannot express** — `extract`
+   (ID-grounded) and injection-neutralization — plus trifecta-by-default and the stale-`@ref` grounding
+   gate (proven by the unit + trifecta suites).
 2. **Keyless, host-delegated, ID-grounded `extract`** — the schema's URL fields are swapped for element-ID
    fields *before the model sees them*, so a fabricated URL/price is **structurally impossible**.
 3. **Hardened-by-default security** — egress denylist (`file:`/`data:`/`blob:` denied, suffix-match host
