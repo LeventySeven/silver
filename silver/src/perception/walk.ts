@@ -53,6 +53,16 @@ export type SnapNode = {
   isPassword: boolean
   /** Cleaned href for links; absent otherwise. */
   url?: string
+  // ---- C1 format hints (DOM metadata → serialize.ts renders them) ----
+  /** Normalized control type for a hint: an `<input type>` (date/time/range/
+   * number/email/…) or `'select'`. Absent when the node needs no format hint. */
+  inputType?: string
+  /** `min` attribute for range/number inputs. */
+  min?: string
+  /** `max` attribute for range/number inputs. */
+  max?: string
+  /** First few `<select>` option labels, for a "pick one of" hint. */
+  options?: string[]
 }
 
 export type SnapshotOptions = {
@@ -122,6 +132,15 @@ type FrameTreeNode = {
   childFrames?: FrameTreeNode[]
 }
 
+/** C1: a form-control's format metadata, captured in the in-page scan. */
+type FormHint = {
+  /** Normalized control type: an `<input type>` or `'select'`. */
+  type: string
+  min: string | null
+  max: string | null
+  /** First few `<select>` option labels; null for non-selects. */
+  options: string[] | null
+}
 type ScanRecord = {
   cur: boolean
   kind: string
@@ -130,6 +149,8 @@ type ScanRecord = {
   hiddenInputType: string | null
   hiddenInputChecked: string | null
   prune: boolean
+  /** C1: present iff this element is a hint-bearing form control (select / typed input). */
+  formHint: FormHint | null
 }
 type CursorInfo = {
   kind: string
@@ -180,9 +201,10 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
     // Best-effort cleanup of the tags we injected.
     await page.evaluate(CLEANUP_JS).catch(() => {})
 
-    // Build cursor + prune maps keyed by backendNodeId.
+    // Build cursor + prune + form-hint maps keyed by backendNodeId.
     const cursorByBackend = new Map<number, CursorInfo>()
     const pruneSet = new Set<number>()
+    const hintByBackend = new Map<number, FormHint>()
     if (!scan.bail) {
       scan.records.forEach((rec, idx) => {
         const backend = idxToBackend.get(idx)
@@ -197,6 +219,7 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
           })
         }
         if (rec.prune) pruneSet.add(backend)
+        if (rec.formHint) hintByBackend.set(backend, rec.formHint)
       })
     }
 
@@ -325,6 +348,16 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
         }
         const href = attrs['href']
         if (href) snap.url = cleanUrl(href, baseUrl)
+
+        // C1: attach captured format metadata (main frame only — the scan runs on
+        // the main frame). Options/min/max/type help the serializer emit hints.
+        const hint = isMain && backend >= 0 ? hintByBackend.get(backend) : undefined
+        if (hint) {
+          if (hint.type) snap.inputType = hint.type
+          if (hint.min !== null) snap.min = hint.min
+          if (hint.max !== null) snap.max = hint.max
+          if (hint.options && hint.options.length > 0) snap.options = hint.options
+        }
 
         result.push(snap)
 
@@ -546,9 +579,28 @@ const SCAN_JS = `(function () {
       }
     })();
 
-    if (cur || prune) {
+    // C1 format hints: capture select options + typed-input metadata so the
+    // serializer can tell the agent the shape to fill. Runs for EVERY element
+    // (many are interactive tags the cursor scan skips) — cheap attribute reads.
+    var fh = null;
+    if (tag === 'select') {
+      var opts = [];
+      var os = el.options || el.querySelectorAll('option');
+      for (var oi = 0; oi < os.length && opts.length < 6; oi++) {
+        var ot = ((os[oi].label || os[oi].textContent || os[oi].value) || '').replace(/\\s+/g, ' ').trim();
+        if (ot) opts.push(ot.slice(0, 40));
+      }
+      fh = { type: 'select', min: null, max: null, options: opts };
+    } else if (tag === 'input') {
+      var hintTypes = { date: 1, 'datetime-local': 1, time: 1, month: 1, week: 1, range: 1, number: 1, email: 1 };
+      if (hintTypes[type]) {
+        fh = { type: type, min: el.getAttribute('min'), max: el.getAttribute('max'), options: null };
+      }
+    }
+
+    if (cur || prune || fh) {
       el.setAttribute('data-__uab-idx', String(out.length));
-      out.push({ cur: cur, kind: kind, hints: hints, text: text, hiddenInputType: hiddenInputType, hiddenInputChecked: hiddenInputChecked, prune: prune });
+      out.push({ cur: cur, kind: kind, hints: hints, text: text, hiddenInputType: hiddenInputType, hiddenInputChecked: hiddenInputChecked, prune: prune, formHint: fh });
     }
   }
   return { bail: false, records: out };

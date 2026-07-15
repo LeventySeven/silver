@@ -15,7 +15,6 @@ import { spawn } from 'node:child_process'
 import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import { chromium } from 'playwright'
 import type { Browser, BrowserContext, Page } from 'playwright'
 import type { RefMap } from '../perception/refmap.js'
 import { decodeStateBuffer, encryptJson, isStateEncryptionEnabled } from './state-crypto.js'
@@ -63,6 +62,19 @@ const READY_BUDGET_MS = 8_000
 const VIEWPORT = { width: 1280, height: 900 } as const
 
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+/**
+ * Lazily import Playwright's `chromium`, reached ONLY inside an actual browser
+ * branch (openSession / connect / connectExternalSession / closeSession). Keeping
+ * this a DYNAMIC import (not a module-top `import`) means meta / read / flag-parse
+ * verbs (`version`, `doctor`, `session list`, …) never pay Playwright's ~150ms
+ * module load — it is off the fast path entirely (engine-plan P2). The `Browser`
+ * etc. types above are `import type` (erased at compile), so they add no runtime
+ * dependency.
+ */
+async function loadChromium(): Promise<typeof import('playwright').chromium> {
+  return (await import('playwright')).chromium
+}
 
 /**
  * True while `pid` is a live process (EPERM = alive-but-not-ours; ESRCH = gone).
@@ -207,6 +219,7 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
   await fs.mkdir(userDataDir, { recursive: true })
 
   const requestedPort = opts.port ?? 0
+  const chromium = await loadChromium()
   const execPath = chromium.executablePath()
   if (!execPath) {
     throw new Error('no Chromium executable is available')
@@ -335,6 +348,7 @@ export async function connect(name: string): Promise<Connection> {
   if (!info.external && !isPidAlive(info.pid)) {
     throw new Error('the previous browser process is gone (reopen the session)')
   }
+  const chromium = await loadChromium()
   const browser = await chromium.connectOverCDP(info.wsEndpoint)
   const context = browser.contexts()[0]
   if (!context) {
@@ -361,6 +375,7 @@ export async function connectExternalSession(name: string, endpoint: string): Pr
   const resolved = await resolveCdpEndpoint(endpoint)
   // Verify connectability up front so `connect` fails loudly rather than
   // leaving a dangling sidecar that every later command trips over.
+  const chromium = await loadChromium()
   const probe = await chromium.connectOverCDP(resolved.wsEndpoint, { timeout: 5_000 })
   try {
     if (!probe.contexts()[0]) throw new Error('the target browser exposes no context')
@@ -445,6 +460,7 @@ export async function closeSession(name: string): Promise<void> {
 
   if (info) {
     try {
+      const chromium = await loadChromium()
       const browser = await chromium.connectOverCDP(info.wsEndpoint, { timeout: 3_000 })
       await browser.close()
     } catch {

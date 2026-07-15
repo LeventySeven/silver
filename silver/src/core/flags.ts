@@ -52,6 +52,9 @@ export type ParsedFlags = {
   // ---- perception ----
   compact: boolean
   interactive: boolean
+  /** `--urls`/`-u`: emit inline `url=<href>` on link nodes in the snapshot. OFF
+   * by default (token-lean); pass it when the host needs raw hrefs (engine-plan T1). */
+  urls: boolean
   depth?: number
   selector?: string
   full: boolean
@@ -105,6 +108,9 @@ export type ParsedFlags = {
   bail: boolean
   /** `download --wait [path]`: await the NEXT download without a click. */
   wait: boolean
+  /** `--wait networkidle`: on a mutating verb (open/click/…), opt into the full
+   * network-idle wait instead of the lowered default budget (engine-plan P1b). */
+  waitNetworkidle: boolean
   // ---- positionals ----
   verb: string
   args: string[]
@@ -161,6 +167,7 @@ const BOOL_FLAGS: Record<string, keyof ParsedFlags> = {
   'no-encrypt-state': 'noEncryptState',
   compact: 'compact',
   interactive: 'interactive',
+  urls: 'urls',
   full: 'full',
   all: 'all',
   stdin: 'stdin',
@@ -172,8 +179,9 @@ const BOOL_FLAGS: Record<string, keyof ParsedFlags> = {
   abort: 'abort',
   clear: 'clear',
   bail: 'bail',
-  // download verb boolean flag (await the next download without a click).
-  wait: 'wait',
+  // NOTE: `--wait` is handled explicitly in the parse loop (it is dual-purpose:
+  // a bare boolean for `download --wait`, and `--wait networkidle` for the
+  // mutating-verb full-settle opt-in), so it is intentionally NOT listed here.
 }
 
 /** `--load` (and `--load networkidle`): optional-value flag. */
@@ -183,6 +191,7 @@ const SHORT_BOOL: Record<string, keyof ParsedFlags> = {
   i: 'interactive',
   c: 'compact',
   f: 'full',
+  u: 'urls',
 }
 const SHORT_VALUE: Record<string, 'depth' | 'selector'> = {
   d: 'depth',
@@ -206,6 +215,7 @@ function defaults(): ParsedFlags {
     noEncryptState: false,
     compact: false,
     interactive: false,
+    urls: false,
     full: false,
     all: false,
     stdin: false,
@@ -217,6 +227,7 @@ function defaults(): ParsedFlags {
     clear: false,
     bail: false,
     wait: false,
+    waitNetworkidle: false,
     verb: '',
     args: [],
   }
@@ -251,6 +262,17 @@ export function parseFlags(argv: string[]): ParsedFlags {
       }
       if (name === 'no-content-boundaries') {
         f.contentBoundaries = false
+        continue
+      }
+      // `--wait` is dual-purpose. As a bare boolean it drives `download --wait`.
+      // As `--wait networkidle` (or `--wait=networkidle`) it opts a mutating verb
+      // into the full network-idle settle (engine-plan P1b). We ONLY consume the
+      // following token when it is literally `networkidle`, so `download --wait
+      // <path>` keeps `<path>` as a positional.
+      if (name === 'wait') {
+        f.wait = true
+        const val = inlineValue ?? (argv[i + 1] === 'networkidle' ? argv[++i] : undefined)
+        if (val === 'networkidle') f.waitNetworkidle = true
         continue
       }
       if (name in CSV_FLAGS) {

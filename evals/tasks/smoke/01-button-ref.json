@@ -8,7 +8,7 @@
   "expectedPatterns": [
     "button \"Activate\" \\[ref=e\\d+",
     "Counter Panel",
-    "generation=\\d+"
+    "\\[url=http"
   ],
   "forbiddenPatterns": [
     "\\bref=e0\\b"

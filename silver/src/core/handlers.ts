@@ -21,7 +21,6 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
-import { chromium } from 'playwright'
 import type { Page, Locator, CDPSession, Frame } from 'playwright'
 
 import { ok, fail, type Envelope } from './envelope.js'
@@ -90,7 +89,7 @@ import {
   type FindKind,
 } from '../actuation/actions.js'
 import { toLocator, ResolveError } from '../actuation/resolve.js'
-import { settleAndFingerprint } from '../actuation/pagechange.js'
+import { settleAndFingerprint, fingerprintOnly, type SettleMode } from '../actuation/pagechange.js'
 import { waitFor, WaitError, type WaitSpec, type WaitState } from '../actuation/wait.js'
 import { buildBundle, type JsonSchema } from '../extract/transform.js'
 import { resolveIds } from '../extract/resolve.js'
@@ -167,6 +166,12 @@ async function patchState(name: string, patch: Partial<UabState>): Promise<UabSt
 
 function openOpts(flags: ParsedFlags): OpenOptions {
   return { headed: flags.headed }
+}
+
+/** Settle policy for MUTATING verbs: `--wait networkidle` opts into the full
+ * idle wait (engine-plan P1b); the common case uses the lowered default budget. */
+function settleModeFor(flags: ParsedFlags): SettleMode {
+  return flags.waitNetworkidle ? 'full' : 'default'
 }
 
 /** Connect to the session, auto-spawning the detached browser if none is live.
@@ -469,7 +474,7 @@ async function handleOpen(flags: ParsedFlags): Promise<Envelope<unknown>> {
     // the diff baseline, and drop any extract bundle.
     const gen = newGeneration(prev?.generation ?? 0)
     await saveRefMap(flags.session, { generation: gen, entries: {} })
-    const fp = await settleAndFingerprint(page, prev?.fingerprint, gen)
+    const fp = await settleAndFingerprint(page, prev?.fingerprint, gen, settleModeFor(flags))
     await saveState(flags.session, {
       generation: gen,
       prevTree: null,
@@ -511,7 +516,7 @@ async function handleHistory(flags: ParsedFlags): Promise<Envelope<unknown>> {
     const prev = await loadState(flags.session)
     const gen = newGeneration(prev?.generation ?? 0)
     await saveRefMap(flags.session, { generation: gen, entries: {} })
-    const fp = await settleAndFingerprint(page, prev?.fingerprint, gen)
+    const fp = await settleAndFingerprint(page, prev?.fingerprint, gen, settleModeFor(flags))
     await saveState(flags.session, {
       generation: gen,
       prevTree: null,
@@ -759,6 +764,7 @@ async function handleSnapshot(flags: ParsedFlags): Promise<Envelope<unknown>> {
         url: page.url(),
         compact: flags.compact,
         filtered: flags.interactive,
+        emitUrls: flags.urls,
         prevRefmap,
         ...(flags.maxOutput !== undefined ? { maxChars: flags.maxOutput } : {}),
       },
@@ -766,7 +772,9 @@ async function handleSnapshot(flags: ParsedFlags): Promise<Envelope<unknown>> {
     await saveRefMap(flags.session, refmap)
 
     const obsv = observe(prev?.prevTree ?? null, text)
-    const fp = await settleAndFingerprint(page, prev?.fingerprint, gen)
+    // Read-only observe: NO networkidle settle race (engine-plan P1). The cheap
+    // fingerprint still emits the page_changed/stale_refs flag.
+    const fp = await fingerprintOnly(page, prev?.fingerprint, gen)
     await saveState(flags.session, {
       generation: gen,
       prevTree: text,
@@ -926,7 +934,12 @@ async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
 
       // Stamp the page-change contract onto every action response (spec §6).
       const prev = await loadState(flags.session)
-      const fp = await settleAndFingerprint(page, prev?.fingerprint, refmap.generation)
+      const fp = await settleAndFingerprint(
+        page,
+        prev?.fingerprint,
+        refmap.generation,
+        settleModeFor(flags),
+      )
       await patchState(flags.session, { fingerprint: fp.fingerprint })
 
       if (!env.success) return env
@@ -1481,9 +1494,15 @@ async function handleDoctor(): Promise<Envelope<unknown>> {
     uab_writable: false,
   }
   try {
+    // Lazy-load Playwright ONLY here (doctor), so it stays off the fast path of
+    // meta verbs like `version` (engine-plan P2). `report.playwright` reflects a
+    // successful module import; `report.chromium` a present executable.
+    const { chromium } = await import('playwright')
+    report.playwright = true
     const exec = chromium.executablePath()
     report.chromium = Boolean(exec) && existsSync(exec)
   } catch {
+    report.playwright = false
     report.chromium = false
   }
   try {
