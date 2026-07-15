@@ -51,6 +51,30 @@ const READ_ONLY_VERBS: readonly string[] = [
   'skill',
   'doctor',
   'version',
+  // Long-task artifact / grep-first memory / subagent orchestration layers.
+  // Read-only-dispatchable at the VERB level so `task list|status|resume`,
+  // `memory add|search|list`, and `subagent wait|list|status` never require an
+  // actions grant. The ACTOR sub-ops — `task exec` and `subagent spawn` — check
+  // `--enable-actions` INSIDE their handlers (mirrors how `wait --fn` is gated),
+  // because the registry gate is verb-level and cannot split by subcommand.
+  'task',
+  'memory',
+  'subagent',
+  // Vercel-parity observation/introspection verbs. Read-only-dispatchable at the
+  // VERB level; their ACTOR sub-ops gate on `--enable-actions` INSIDE the handler
+  // (the registry gate is verb-level and cannot split by subcommand — the same
+  // pattern as `wait --fn`, `task exec`, `subagent spawn`):
+  //   network  — `requests` / `har` read; `route` / `unroute` gated in-handler.
+  //   storage  — `get` reads; `set` / `clear` gated in-handler.
+  //   clipboard— `read` reads; `write` gated in-handler.
+  //   console / errors — captured page-derived logs (read-only).
+  //   pdf      — a render of the current page (no page mutation).
+  'network',
+  'storage',
+  'console',
+  'errors',
+  'clipboard',
+  'pdf',
 ]
 
 /**
@@ -82,6 +106,9 @@ const ACTOR_VERBS: readonly string[] = [
   'set',
   'mouse',
   'dialog',
+  // `scrollinto` is the Rust oracle's alias for `scrollintoview` (both scroll a
+  // grounded ref into view) — quarantined as an actor for parity.
+  'scrollinto',
 ]
 
 /**

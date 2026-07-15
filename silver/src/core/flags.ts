@@ -69,6 +69,36 @@ export type ParsedFlags = {
   index?: number
   /** `tab new --label <L>`: durable human-facing name for a tab. */
   label?: string
+  // ---- task / memory / subagent layer flags (silver task/memory/subagent) ----
+  /** `task start --id <id>` / `task <sub> --id` — explicit task id. */
+  id?: string
+  /** `memory add --tag <t>` — comma-separated note tags. */
+  tag?: string
+  /** `task checkpoint --note <t>` — free-text checkpoint note. */
+  note?: string
+  /** `subagent spawn --background` — non-blocking child (host collects later). */
+  background: boolean
+  /** `subagent spawn --tab` — child runs on its own tab in a shared browser. */
+  tab: boolean
+  // ---- network / storage verb sub-flags (Vercel-parity) ----
+  /** `network requests --filter <url-substr>`. */
+  filter?: string
+  /** `network requests --type <resourceType>`. */
+  type?: string
+  /** `network requests --method <M>`. */
+  method?: string
+  /** `network requests --status <code>`. */
+  status?: string
+  /** `network route --body <json>` fulfillment body. */
+  body?: string
+  /** `network route --resource-types <csv>`. */
+  resourceTypes: string[]
+  /** `network route --abort`. */
+  abort: boolean
+  /** `network requests|console|errors --clear`. */
+  clear: boolean
+  /** `batch --bail`: stop on the first failing sub-command. */
+  bail: boolean
   // ---- positionals ----
   verb: string
   args: string[]
@@ -95,12 +125,24 @@ const VALUE_FLAGS: Record<string, keyof ParsedFlags> = {
   label: 'label',
   depth: 'depth',
   selector: 'selector',
+  // task / memory / subagent layer value flags.
+  id: 'id',
+  tag: 'tag',
+  note: 'note',
+  // network / storage verb sub-flags.
+  filter: 'filter',
+  type: 'type',
+  method: 'method',
+  status: 'status',
+  body: 'body',
 }
 
 /** CSV value flags → string[]. */
-const CSV_FLAGS: Record<string, 'allowedDomains' | 'confirmActions'> = {
+const CSV_FLAGS: Record<string, 'allowedDomains' | 'confirmActions' | 'resourceTypes'> = {
   'allowed-domains': 'allowedDomains',
   'confirm-actions': 'confirmActions',
+  'resource-types': 'resourceTypes',
+  'resource-type': 'resourceTypes',
 }
 
 /** Boolean flags. */
@@ -118,6 +160,13 @@ const BOOL_FLAGS: Record<string, keyof ParsedFlags> = {
   all: 'all',
   stdin: 'stdin',
   force: 'force',
+  // subagent spawn boolean flags.
+  background: 'background',
+  tab: 'tab',
+  // network / batch verb boolean flags.
+  abort: 'abort',
+  clear: 'clear',
+  bail: 'bail',
 }
 
 /** `--load` (and `--load networkidle`): optional-value flag. */
@@ -156,6 +205,12 @@ function defaults(): ParsedFlags {
     all: false,
     stdin: false,
     force: false,
+    background: false,
+    tab: false,
+    resourceTypes: [],
+    abort: false,
+    clear: false,
+    bail: false,
     verb: '',
     args: [],
   }

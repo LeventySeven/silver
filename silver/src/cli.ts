@@ -27,6 +27,11 @@ import { parseFlags, type ParsedFlags } from './core/flags.js'
 import { buildRegistry } from './security/registry.js'
 import { handle } from './core/handlers.js'
 import { setNamespace } from './core/session.js'
+// Task-artifact / memory / subagent layers — dispatched here (NOT in
+// handlers.ts) so their modules stay decoupled from the browser-verb handlers.
+import { handleTask } from './task/index.js'
+import { handleMemory } from './memory/index.js'
+import { handleSubagent } from './orchestration/subagent.js'
 import { OutputOverflowError } from './perception/serialize.js'
 import { ResolveError } from './actuation/resolve.js'
 import { WaitError } from './actuation/wait.js'
@@ -37,7 +42,29 @@ import { WaitError } from './actuation/wait.js'
  * modify), so it is dispatched here directly; the others are read-only-safe and
  * bypass the gate for clarity. None can mutate page state.
  */
-const META_VERBS = new Set(['version', 'doctor', 'skill', 'session'])
+const META_VERBS = new Set(['version', 'doctor', 'skill', 'session', 'batch'])
+
+/**
+ * Verbs owned by the task-artifact / memory / subagent layers. Registered
+ * read-only in the phase-quarantine registry (so `list`/`status`/`search` need
+ * no actions grant); the ACTOR sub-ops (`task exec`, `subagent spawn`) enforce
+ * `--enable-actions` inside their own handlers. Dispatched via `dispatchLayer`
+ * so handlers.ts (owned by a sibling) is never touched.
+ */
+const LAYER_VERBS = new Set(['task', 'memory', 'subagent'])
+
+async function dispatchLayer(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  switch (flags.verb) {
+    case 'task':
+      return handleTask(flags)
+    case 'memory':
+      return handleMemory(flags)
+    case 'subagent':
+      return handleSubagent(flags)
+    default:
+      return fail('not_permitted')
+  }
+}
 
 export type RunResult = { env: Envelope<unknown>; code: number; json: boolean }
 
@@ -71,7 +98,7 @@ export async function run(argv: string[]): Promise<RunResult> {
   }
 
   try {
-    const env = await handle(flags)
+    const env = LAYER_VERBS.has(flags.verb) ? await dispatchLayer(flags) : await handle(flags)
     return { env, code: env.success ? 0 : 1, json }
   } catch (err) {
     return { env: mapThrow(err), code: 1, json }

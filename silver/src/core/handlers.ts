@@ -22,7 +22,7 @@ import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
 import { chromium } from 'playwright'
-import type { Page, Locator, CDPSession } from 'playwright'
+import type { Page, Locator, CDPSession, Frame } from 'playwright'
 
 import { ok, fail, type Envelope } from './envelope.js'
 import type { ParsedFlags } from './flags.js'
@@ -54,7 +54,23 @@ import {
   type TabRecord,
   type TabRegistry,
 } from './tabs.js'
-import { groundRef, newGeneration, type RefMap, type RefEntry } from '../perception/refmap.js'
+import { groundRef, parseRef, newGeneration, type RefMap, type RefEntry } from '../perception/refmap.js'
+import {
+  ensureCapture,
+  readCapture,
+  clearCapture,
+  applyRoutes,
+  addRoute,
+  removeRoute,
+  startHar,
+  stopHar,
+  buildHar,
+  saveActiveFrame,
+  clearActiveFrame,
+  resolveActiveFrame,
+  findFrame,
+  type RouteRule,
+} from './capture.js'
 import { snapshotNodes, type SnapNode } from '../perception/walk.js'
 import { render } from '../perception/serialize.js'
 import { observe } from '../perception/diff.js'
@@ -181,6 +197,12 @@ async function withConnection<T>(
     // listener, Playwright silently CANCELS every alert/confirm/prompt, so a
     // `confirm("delete?")` guard is auto-dismissed while the host still gets ok().
     attachDialogHandler(page, flags.session)
+    // Re-materialize any persisted `network route` rules on this connection.
+    // `page.route` handlers are client-side and vanish on our per-command CDP
+    // reconnect, so routing is kept "on by default" by re-applying it here. A
+    // single cheap sidecar read + early return when no rules exist — zero effect
+    // on the common (no-route) path. Never throws.
+    await applyRoutes(page, flags.session).catch(() => {})
     try {
       return await fn({ ...conn, page })
     } finally {
@@ -316,11 +338,32 @@ export async function handle(flags: ParsedFlags): Promise<Envelope<unknown>> {
       return handleSkill(flags)
     case 'dialog':
       return handleDialog(flags)
-    // nice-to-have — honestly unimplemented (never faked).
-    case 'frame':
+    // Vercel-parity verbs (real Playwright — no stubs).
     case 'network':
+      return handleNetwork(flags)
     case 'pdf':
-      return notImplemented()
+      return handlePdf(flags)
+    case 'frame':
+      return handleFrame(flags)
+    case 'storage':
+      return handleStorage(flags)
+    case 'console':
+      return handleConsole(flags)
+    case 'errors':
+      return handleErrors(flags)
+    case 'clipboard':
+      return handleClipboard(flags)
+    case 'mouse':
+      return handleMouse(flags)
+    case 'keyboard':
+      return handleKeyboard(flags)
+    case 'scrollintoview':
+    case 'scrollinto':
+      return handleScrollIntoView(flags)
+    case 'eval':
+      return handleEval(flags)
+    case 'batch':
+      return handleBatch(flags)
     default:
       return notImplemented()
   }
@@ -345,7 +388,13 @@ async function handleOpen(flags: ParsedFlags): Promise<Envelope<unknown>> {
   if (!nav.ok) return fail('navigation_blocked')
 
   return withConnection(flags, async ({ page }) => {
+    // Install the capture instrumentation BEFORE navigating so console/network
+    // that fires during page load is hooked from document-start (see capture.ts).
+    await ensureCapture(page, flags.session).catch(() => {})
     await page.goto(url, gotoOpts(flags))
+    // Re-install on the freshly-loaded document so the page-side wrappers persist
+    // into later commands (they live in the doc's JS, surviving our disconnect).
+    await ensureCapture(page, flags.session).catch(() => {})
     const prev = await loadState(flags.session)
     // Navigation invalidates prior refs: bump the generation, write an EMPTY
     // refmap at that generation (so a stale `eN` fails element_not_found), reset
@@ -389,6 +438,8 @@ async function handleHistory(flags: ParsedFlags): Promise<Envelope<unknown>> {
     else if (flags.verb === 'forward') await page.goForward(gotoOpts(flags))
     else await page.reload(gotoOpts(flags))
 
+    // Re-hook capture on the new document after a history navigation / reload.
+    await ensureCapture(page, flags.session).catch(() => {})
     const prev = await loadState(flags.session)
     const gen = newGeneration(prev?.generation ?? 0)
     await saveRefMap(flags.session, { generation: gen, entries: {} })
@@ -488,7 +539,9 @@ async function handleTabNew(flags: ParsedFlags): Promise<Envelope<unknown>> {
     const page = await context.newPage()
     // Deterministic viewport (P0-8) for the new tab too.
     await page.setViewportSize({ width: 1280, height: 900 }).catch(() => {})
+    await ensureCapture(page, flags.session).catch(() => {})
     if (url !== undefined) await page.goto(url, gotoOpts(flags))
+    await ensureCapture(page, flags.session).catch(() => {})
 
     const targetId = await pageTargetId(page)
     const id = `t${synced.reg.nextId}`
@@ -906,7 +959,10 @@ async function handleGet(flags: ParsedFlags): Promise<Envelope<unknown>> {
       case 'count': {
         const target = rest[0]
         if (!target) return badRequest('usage: silver get count <selector>')
-        const n = await page.locator(target).count()
+        // Scope selector counting to the active frame (set via `frame <sel>`),
+        // defaulting to the main frame when none is active.
+        const frame = await resolveActiveFrame(page, flags.session)
+        const n = await frame.locator(target).count()
         return ok({ count: n })
       }
       case 'text': {
@@ -1446,6 +1502,595 @@ async function handleDialog(flags: ParsedFlags): Promise<Envelope<unknown>> {
     return ok({ mode: sub, note: 'dialogs are auto-accepted when they appear' })
   }
   return badRequest('usage: silver dialog status')
+}
+
+// ---------------------------------------------------------------------------
+// network — captured requests, routing, and HAR export (real Playwright/CDP).
+//   network requests [--filter|--type|--method|--status] [--clear]   (read)
+//   network route <url> [--abort|--body <json>] [--resource-types <csv>] (actor)
+//   network unroute [url]                                            (actor)
+//   network har start | stop [path]                                  (read)
+// ---------------------------------------------------------------------------
+
+async function handleNetwork(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const sub = flags.args[0]
+  switch (sub) {
+    case 'requests':
+      return handleNetworkRequests(flags)
+    case 'route':
+      return handleNetworkRoute(flags)
+    case 'unroute':
+      return handleNetworkUnroute(flags)
+    case 'har':
+      return handleNetworkHar(flags)
+    default:
+      return badRequest('usage: silver network <requests|route|unroute|har> [args]')
+  }
+}
+
+async function handleNetworkRequests(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  return withConnection(flags, async ({ page }) => {
+    await ensureCapture(page, flags.session)
+    let list = await readCapture(page, 'net')
+    if (flags.filter !== undefined) {
+      list = list.filter((r) => String(r.url ?? '').includes(flags.filter as string))
+    }
+    if (flags.type !== undefined) {
+      list = list.filter((r) => String(r.resourceType ?? '') === flags.type)
+    }
+    if (flags.method !== undefined) {
+      const m = flags.method.toUpperCase()
+      list = list.filter((r) => String(r.method ?? '').toUpperCase() === m)
+    }
+    if (flags.status !== undefined) {
+      const s = flags.status
+      list = list.filter((r) => {
+        const st = String(r.status ?? '')
+        return st === s || st.startsWith(s)
+      })
+    }
+    const total = list.length
+    // Bound the returned array (the page-side ring buffer is already capped).
+    const CAP = 200
+    const requests = list.slice(-CAP)
+    if (flags.clear) await clearCapture(page, 'net')
+    return ok({ total, requests })
+  })
+}
+
+async function handleNetworkRoute(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  // Interception mutates network behaviour → an ACTOR sub-op (verb-level registry
+  // gate cannot split by subcommand, so gate here — mirrors `wait --fn`).
+  if (!flags.enableActions) return fail('not_permitted')
+  const url = flags.args[1]
+  if (!url) {
+    return badRequest(
+      'usage: silver network route <url> [--abort] [--body <json>] [--resource-types <csv>]',
+    )
+  }
+  const rule: RouteRule = { url, abort: flags.abort }
+  if (flags.body !== undefined) rule.body = flags.body
+  if (flags.resourceTypes.length > 0) rule.resourceTypes = flags.resourceTypes
+  // Persist the rule; withConnection re-applies all rules on every connection so
+  // routing is effectively persistent across the stateless per-command reconnect.
+  await addRoute(flags.session, rule)
+  return ok({
+    routed: url,
+    abort: rule.abort,
+    ...(rule.body !== undefined ? { fulfilled: true } : {}),
+    ...(rule.resourceTypes ? { resourceTypes: rule.resourceTypes } : {}),
+  })
+}
+
+async function handleNetworkUnroute(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  if (!flags.enableActions) return fail('not_permitted')
+  const url = flags.args[1]
+  await removeRoute(flags.session, url)
+  return ok({ unrouted: url ?? 'all' })
+}
+
+async function handleNetworkHar(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const op = flags.args[1]
+  if (op === 'start') {
+    await startHar(flags.session)
+    // Ensure capture is live so the buffer accumulates for the HAR export.
+    return withConnection(flags, async ({ page }) => {
+      await ensureCapture(page, flags.session)
+      return ok({ har: 'recording' })
+    })
+  }
+  if (op === 'stop') {
+    const outPath = flags.args[2]
+    let resolvedOut: string | undefined
+    if (outPath) {
+      const c = assertContainedPath(outPath)
+      if (!c.ok) return fail('path_denied')
+      resolvedOut = c.resolved
+    }
+    return withConnection(flags, async ({ page }) => {
+      await ensureCapture(page, flags.session)
+      const list = await readCapture(page, 'net')
+      const har = buildHar(list)
+      await stopHar(flags.session)
+      if (resolvedOut) {
+        await fs.writeFile(resolvedOut, JSON.stringify(har, null, 2), 'utf8')
+        return ok({ saved: true, entries: list.length })
+      }
+      return ok({ entries: list.length, har })
+    })
+  }
+  return badRequest('usage: silver network har <start|stop> [path]')
+}
+
+// ---------------------------------------------------------------------------
+// pdf — render the current page to PDF (Chromium headless only). Read-only.
+// ---------------------------------------------------------------------------
+
+async function handlePdf(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const outPath = flags.args[0]
+  // Path containment (fix P1-SEC4): only write inside the working directory.
+  let resolvedOut: string | undefined
+  if (outPath) {
+    const c = assertContainedPath(outPath)
+    if (!c.ok) return fail('path_denied')
+    resolvedOut = c.resolved
+  }
+  return withConnection(flags, async ({ page }) => {
+    try {
+      const pdfOpts: { path?: string } = {}
+      if (resolvedOut) pdfOpts.path = resolvedOut
+      const buf = await page.pdf(pdfOpts)
+      if (resolvedOut) return ok({ saved: true })
+      return ok({ encoding: 'base64', pdf: buf.toString('base64') })
+    } catch {
+      // page.pdf throws in headed Chromium; the default is headless so this is rare.
+      return badRequest('pdf generation requires headless Chromium (the default runs headless)')
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// frame — switch subsequent selector/eval commands into an iframe's context.
+//   frame <@ref|selector|name>  -> store + validate the active frame
+//   frame main                  -> reset to the main frame
+// (ref-based verbs are ALREADY frame-aware via the RefEntry.frameId plumbing; this
+// makes SELECTOR/eval commands target a frame explicitly — see get-count / eval.)
+// ---------------------------------------------------------------------------
+
+async function handleFrame(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const arg = flags.args[0]
+  if (!arg) return badRequest('usage: silver frame <@ref|selector|name|main>')
+  if (arg === 'main') {
+    await clearActiveFrame(flags.session)
+    return ok({ frame: 'main' })
+  }
+  return withConnection(flags, async ({ page }) => {
+    let key = arg
+    // A grounded `@ref` is resolved NOW to a durable key (the frame's name or
+    // url) so later re-resolution survives DOM re-renders / reconnects.
+    if (parseRef(arg)) {
+      const refmap = await loadRefMap(flags.session)
+      if (!refmap) return fail('element_not_found')
+      const g = groundRef(refmap, arg)
+      if (!g.ok) return fail(g.code)
+      const cdp = await page.context().newCDPSession(page)
+      try {
+        const loc = await toLocator(page, cdp, g.entry, g.ref)
+        const handle = await loc.elementHandle()
+        const cf = handle ? await handle.contentFrame() : null
+        if (!cf) return fail('element_not_found')
+        key = cf.name() || cf.url()
+      } catch {
+        return fail('element_not_found')
+      } finally {
+        await cleanupStamp(page).catch(() => {})
+        await cdp.detach().catch(() => {})
+      }
+    }
+    const frame = await findFrame(page, key)
+    if (!frame) return fail('element_not_found')
+    await saveActiveFrame(flags.session, key)
+    return ok({ frame: { name: frame.name() || null, url: frame.url() } })
+  })
+}
+
+// ---------------------------------------------------------------------------
+// storage — localStorage / sessionStorage. get=read, set/clear=actor.
+// ---------------------------------------------------------------------------
+
+async function handleStorage(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const kind = flags.args[0]
+  if (kind !== 'local' && kind !== 'session') {
+    return badRequest('usage: silver storage <local|session> [get|set|clear] [key] [value]')
+  }
+  const store = kind === 'local' ? 'localStorage' : 'sessionStorage'
+
+  // Sub-op + positional resolution mirrors the Rust oracle: an explicit
+  // get/set/clear takes key/value after it; a bare `storage local <key>` is a get.
+  let op = flags.args[1]
+  let key: string | undefined
+  let value: string | undefined
+  if (op === 'get' || op === 'set' || op === 'clear') {
+    key = flags.args[2]
+    value = flags.args[3]
+  } else {
+    key = flags.args[1]
+    value = flags.args[2]
+    op = 'get'
+  }
+
+  // set/clear mutate storage → ACTOR sub-ops (gate here; verb is read-only-listed).
+  if ((op === 'set' || op === 'clear') && !flags.enableActions) return fail('not_permitted')
+
+  return withConnection(flags, async ({ page }) => {
+    if (op === 'set') {
+      if (key === undefined || value === undefined) {
+        return badRequest('usage: silver storage <local|session> set <key> <value>')
+      }
+      await page.evaluate(
+        (a: string[]) => {
+          ;(globalThis as unknown as Record<string, Storage>)[a[0]].setItem(a[1], a[2])
+        },
+        [store, key, value],
+      )
+      return ok({ set: key })
+    }
+    if (op === 'clear') {
+      await page.evaluate((s: string) => {
+        ;(globalThis as unknown as Record<string, Storage>)[s].clear()
+      }, store)
+      return ok({ cleared: true, type: kind })
+    }
+    // get
+    if (key !== undefined) {
+      const v = (await page.evaluate(
+        (a: string[]) => (globalThis as unknown as Record<string, Storage>)[a[0]].getItem(a[1]),
+        [store, key],
+      )) as string | null
+      return ok({ key, value: v === null ? null : presentPageText(v, flags) })
+    }
+    // whole-store dump (constant script — store name is a validated literal).
+    const all = (await page.evaluate(
+      `(function(){var s=window.${store};var o={};for(var i=0;i<s.length;i++){var k=s.key(i);if(k!==null)o[k]=s.getItem(k);}return o;})()`,
+    )) as Record<string, string>
+    return ok({ type: kind, storage: all })
+  })
+}
+
+// ---------------------------------------------------------------------------
+// console / errors — page-derived captured logs (read-only). Routed through
+// presentPageText (neutralize + cap) since the content is untrusted page output.
+// ---------------------------------------------------------------------------
+
+async function handleConsole(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  return withConnection(flags, async ({ page }) => {
+    await ensureCapture(page, flags.session)
+    const msgs = await readCapture(page, 'console')
+    if (flags.clear) await clearCapture(page, 'console')
+    const text = msgs.map((m) => `[${String(m.level ?? 'log')}] ${String(m.text ?? '')}`).join('\n')
+    return ok(
+      presentPageText(text, flags),
+      msgs.length === 0 ? 'no console messages captured yet on this page' : undefined,
+    )
+  })
+}
+
+async function handleErrors(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  return withConnection(flags, async ({ page }) => {
+    await ensureCapture(page, flags.session)
+    const errs = await readCapture(page, 'errors')
+    if (flags.clear) await clearCapture(page, 'errors')
+    const text = errs.map((e) => String(e.message ?? '')).join('\n')
+    return ok(
+      presentPageText(text, flags),
+      errs.length === 0 ? 'no page errors captured yet on this page' : undefined,
+    )
+  })
+}
+
+// ---------------------------------------------------------------------------
+// clipboard — read (read-only) / write (actor). Uses the async Clipboard API
+// after granting clipboard permission on the connected context.
+// ---------------------------------------------------------------------------
+
+async function handleClipboard(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const sub = flags.args[0] ?? 'read'
+  if (sub !== 'read' && sub !== 'write') {
+    return badRequest('usage: silver clipboard <read|write> [text]')
+  }
+  if (sub === 'write' && !flags.enableActions) return fail('not_permitted')
+
+  return withConnection(flags, async ({ page, context }) => {
+    await context
+      .grantPermissions(['clipboard-read', 'clipboard-write'], { origin: safeOrigin(page.url()) })
+      .catch(() => {})
+    // `navigator.clipboard` lives in the BROWSER (tsconfig `lib` has no DOM, and
+    // Node's Navigator type lacks `clipboard`) — reach it through the page global.
+    type ClipGlobal = {
+      navigator: { clipboard: { writeText(v: string): Promise<void>; readText(): Promise<string> } }
+    }
+    if (sub === 'write') {
+      const text = flags.stdin ? await readStdin() : flags.args.slice(1).join(' ')
+      try {
+        await page.evaluate(
+          (t: string) => (globalThis as unknown as ClipGlobal).navigator.clipboard.writeText(t),
+          text,
+        )
+      } catch {
+        return badRequest('clipboard write failed (the page may lack clipboard permission/focus)')
+      }
+      return ok({ written: text.length })
+    }
+    // read
+    try {
+      const text = (await page.evaluate(() =>
+        (globalThis as unknown as ClipGlobal).navigator.clipboard.readText(),
+      )) as string
+      return ok(presentPageText(text ?? '', flags))
+    } catch {
+      return badRequest('clipboard read failed (the page may lack clipboard permission/focus)')
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// mouse — raw pointer input at page coordinates (actor).
+//   mouse move|click <x> <y> [button] | mouse down|up [button] | mouse wheel <dy> [dx]
+// ---------------------------------------------------------------------------
+
+const MOUSE_BUTTONS: ReadonlySet<string> = new Set(['left', 'right', 'middle'])
+
+function mouseButton(arg: string | undefined): 'left' | 'right' | 'middle' {
+  return arg && MOUSE_BUTTONS.has(arg) ? (arg as 'left' | 'right' | 'middle') : 'left'
+}
+
+async function handleMouse(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const sub = flags.args[0]
+  return withConnection(flags, async ({ page }) => {
+    switch (sub) {
+      case 'move':
+      case 'click': {
+        const x = Number(flags.args[1])
+        const y = Number(flags.args[2])
+        if (!Number.isFinite(x) || !Number.isFinite(y)) {
+          return badRequest(`usage: silver mouse ${sub} <x> <y> [button]`)
+        }
+        if (sub === 'move') {
+          await page.mouse.move(x, y)
+          return ok({ moved: { x, y } })
+        }
+        const button = mouseButton(flags.args[3])
+        await page.mouse.click(x, y, { button })
+        return ok({ clicked: { x, y, button } })
+      }
+      case 'down': {
+        const button = mouseButton(flags.args[1])
+        await page.mouse.down({ button })
+        return ok({ down: button })
+      }
+      case 'up': {
+        const button = mouseButton(flags.args[1])
+        await page.mouse.up({ button })
+        return ok({ up: button })
+      }
+      case 'wheel': {
+        const dy = Number(flags.args[1] ?? 100)
+        const dx = Number(flags.args[2] ?? 0)
+        await page.mouse.wheel(Number.isFinite(dx) ? dx : 0, Number.isFinite(dy) ? dy : 0)
+        return ok({ wheel: { dx: Number.isFinite(dx) ? dx : 0, dy: Number.isFinite(dy) ? dy : 0 } })
+      }
+      default:
+        return badRequest('usage: silver mouse <move|click|down|up|wheel> [args]')
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// keyboard — raw keyboard input (actor). Typed text length is reported (never
+// the text itself — it may be a password).
+//   keyboard type <text> | keyboard press|down|up <key>
+// ---------------------------------------------------------------------------
+
+async function handleKeyboard(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const sub = flags.args[0]
+  return withConnection(flags, async ({ page }) => {
+    switch (sub) {
+      case 'type': {
+        const text = flags.stdin ? await readStdin() : flags.args.slice(1).join(' ')
+        await page.keyboard.type(text)
+        return ok({ typed: text.length })
+      }
+      case 'press':
+      case 'down':
+      case 'up': {
+        const key = flags.args[1]
+        if (!key) return badRequest(`usage: silver keyboard ${sub} <key>`)
+        if (sub === 'press') await page.keyboard.press(key)
+        else if (sub === 'down') await page.keyboard.down(key)
+        else await page.keyboard.up(key)
+        return ok({ [sub]: key })
+      }
+      default:
+        return badRequest('usage: silver keyboard <type|press|down|up> ...')
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// scrollintoview <@ref> — scroll a grounded ref into view (actor).
+// ---------------------------------------------------------------------------
+
+async function handleScrollIntoView(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const ref = flags.args[0]
+  if (!ref) return badRequest('usage: silver scrollintoview @eN')
+  return withConnection(flags, async ({ page }) =>
+    withLocator(page, flags.session, ref, async (loc) => {
+      await loc.scrollIntoViewIfNeeded({ timeout: flags.timeout })
+      return ok({ scrolled: true, ref })
+    }),
+  )
+}
+
+// ---------------------------------------------------------------------------
+// eval <js> | eval --stdin — run host-authored JS in the page (or active frame).
+// KEYLESS (the host's own code, not a model call). Gated behind --enable-actions
+// via the ACTOR registry (arbitrary in-page JS is a mutating verb). Result is
+// neutralized + capped before it reaches the host.
+// ---------------------------------------------------------------------------
+
+async function handleEval(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const script = flags.stdin ? await readStdin() : flags.args.join(' ')
+  if (script.trim().length === 0) return badRequest('usage: silver eval <js> | eval --stdin')
+  return withConnection(flags, async ({ page }) => {
+    // Run in the active frame's context (set via `frame <sel>`), else main frame.
+    const frame = await resolveActiveFrame(page, flags.session)
+    let result: unknown
+    try {
+      result = await frame.evaluate(script)
+    } catch {
+      // A page/script exception — no path/secret leak; the host adjusts its JS.
+      return badRequest('eval raised an exception in the page')
+    }
+    const asText =
+      typeof result === 'string'
+        ? result
+        : result === undefined
+          ? 'undefined'
+          : safeJson(result)
+    return ok(presentPageText(asText, flags))
+  })
+}
+
+/** JSON.stringify that never throws (circular / BigInt → a bounded fallback). */
+function safeJson(v: unknown): string {
+  try {
+    return JSON.stringify(v) ?? String(v)
+  } catch {
+    return String(v)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// batch — run multiple `silver` commands in ONE process, sharing the session.
+//   batch "<cmd>" "<cmd>" ... [--bail]
+//   batch --stdin      (JSON array of command strings OR arg-arrays)
+// Each sub-command is re-dispatched through run() so the phase-quarantine gate is
+// applied PER sub-command; batch itself holds no session lock (each sub-run takes
+// and releases it), so the shared session serializes cleanly with no deadlock.
+// ---------------------------------------------------------------------------
+
+async function handleBatch(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  let commands: string[][]
+  try {
+    commands = await collectBatchCommands(flags)
+  } catch {
+    return badRequest('batch --stdin expects a JSON array of command strings or arg-arrays')
+  }
+  if (commands.length === 0) {
+    return badRequest('usage: silver batch "<cmd>" "<cmd>" ... [--bail]  |  batch --stdin')
+  }
+
+  // Re-enter the CLI dispatcher. Dynamic import avoids a static cli<->handlers
+  // import cycle; `run` is only referenced at call time.
+  const { run } = await import('../cli.js')
+  const shared = sharedGlobals(flags)
+
+  const results: Array<{ command: string; success: boolean; error: string | null }> = []
+  let failed = false
+  for (const argv of commands) {
+    if (argv.length === 0) continue
+    const res = await run([...argv, ...shared])
+    results.push({ command: argv.join(' '), success: res.env.success, error: res.env.error })
+    if (!res.env.success) {
+      failed = true
+      if (flags.bail) break
+    }
+  }
+  return {
+    success: !failed,
+    data: { count: results.length, results },
+    error: failed ? 'one or more batch commands failed' : null,
+  }
+}
+
+/** Collect the batch command list from positional args or a `--stdin` JSON array. */
+async function collectBatchCommands(flags: ParsedFlags): Promise<string[][]> {
+  if (flags.stdin) {
+    const parsed = JSON.parse(await readStdin()) as unknown
+    if (!Array.isArray(parsed)) throw new Error('not an array')
+    return parsed.map((item) => {
+      if (typeof item === 'string') return shellSplit(item)
+      if (Array.isArray(item)) return item.map((x) => String(x))
+      throw new Error('bad item')
+    })
+  }
+  return flags.args.map((a) => shellSplit(a))
+}
+
+/**
+ * The session-scoping + permission globals to append to every batch sub-command
+ * so they share ONE session and inherit the batch's grant. Appended AFTER the
+ * sub-command's own tokens so the shared session/namespace always win.
+ */
+function sharedGlobals(flags: ParsedFlags): string[] {
+  const g: string[] = ['--session', flags.session]
+  if (flags.namespace) g.push('--namespace', flags.namespace)
+  if (flags.enableActions) g.push('--enable-actions')
+  if (flags.confirmActionsProvided) g.push('--confirm-actions', flags.confirmActions.join(','))
+  if (flags.allowFileAccess) g.push('--allow-file-access')
+  if (flags.allowedDomains.length > 0) g.push('--allowed-domains', flags.allowedDomains.join(','))
+  if (flags.timeout !== undefined) g.push('--timeout', String(flags.timeout))
+  if (flags.maxOutput !== undefined) g.push('--max-output', String(flags.maxOutput))
+  if (flags.headed) g.push('--headed')
+  if (!flags.contentBoundaries) g.push('--no-content-boundaries')
+  return g
+}
+
+/**
+ * Minimal shell-word splitter (mirrors the Rust oracle's shell_words_split):
+ * respects single/double quotes and backslash escapes. Used to turn a batch
+ * command STRING into an argv array. Pure string parsing — no shell invoked.
+ */
+function shellSplit(s: string): string[] {
+  const out: string[] = []
+  let cur = ''
+  let inSingle = false
+  let inDouble = false
+  let hasToken = false
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]
+    if (c === '\\' && !inSingle) {
+      const next = s[i + 1]
+      if (next !== undefined) {
+        cur += next
+        hasToken = true
+        i++
+      }
+      continue
+    }
+    if (c === '"' && !inSingle) {
+      inDouble = !inDouble
+      hasToken = true
+      continue
+    }
+    if (c === "'" && !inDouble) {
+      inSingle = !inSingle
+      hasToken = true
+      continue
+    }
+    if (c === ' ' && !inSingle && !inDouble) {
+      if (hasToken) {
+        out.push(cur)
+        cur = ''
+        hasToken = false
+      }
+      continue
+    }
+    cur += c
+    hasToken = true
+  }
+  if (hasToken) out.push(cur)
+  return out
 }
 
 // ---------------------------------------------------------------------------
