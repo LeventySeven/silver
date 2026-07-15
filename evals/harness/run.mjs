@@ -32,7 +32,7 @@ import { startServer, runUab } from './server.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(HERE, '..', '..')
-const DEFAULT_UAB = path.join(REPO_ROOT, 'skill', 'agent-browser', 'dist', 'cli.js')
+const DEFAULT_UAB = path.join(REPO_ROOT, 'silver', 'dist', 'cli.js')
 
 /** Actor verbs (mirrors src/security/registry.ts ACTOR_VERBS): these need
  * --enable-actions to be dispatchable. We add the flag automatically. */

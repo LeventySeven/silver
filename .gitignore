@@ -13,3 +13,6 @@ playwright-report/
 .browser-cache/
 
 reference/
+
+target/
+**/target/

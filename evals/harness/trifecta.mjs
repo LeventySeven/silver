@@ -24,7 +24,7 @@ import { startServer, runUab } from './server.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(HERE, '..', '..')
-const UAB = path.join(REPO_ROOT, 'skill', 'agent-browser', 'dist', 'cli.js')
+const UAB = path.join(REPO_ROOT, 'silver', 'dist', 'cli.js')
 const TIMEOUT = 30000
 
 /** Parse a uab --json envelope out of captured output; null if unparseable. */
