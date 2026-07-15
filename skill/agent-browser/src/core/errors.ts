@@ -53,6 +53,20 @@ export const ERRORS = {
     message:
       'that action is not enabled in the current phase; the session is read-only (pass --enable-actions to allow acting)',
   },
+  // A paid/destructive control (Buy/Pay/Delete/…) reached without explicit
+  // approval on a non-interactive session. Static reason only (no target leak).
+  confirm_required: {
+    retryableByHost: false,
+    message:
+      'this looks like a paid/destructive action; re-run with --confirm-actions to approve',
+  },
+  // A filesystem path (screenshot output / upload input / state file) resolved
+  // outside the working directory. Fail-closed; the path itself is never echoed.
+  path_denied: {
+    retryableByHost: false,
+    message:
+      'that file path is outside the allowed directory; use a path inside the current working directory',
+  },
   // Added for the serializer's never-truncate contract (spec §5): when output
   // exceeds the cap we fail loudly with the escape hatches, never silently cut.
   output_overflow: {

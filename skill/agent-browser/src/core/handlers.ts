@@ -19,6 +19,7 @@
 import { promises as fs, existsSync, readFileSync } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
 import { chromium } from 'playwright'
 import type { Page, Locator, CDPSession } from 'playwright'
@@ -37,13 +38,14 @@ import {
   type Connection,
   type OpenOptions,
 } from './session.js'
-import { groundRef, newGeneration, type RefMap } from '../perception/refmap.js'
+import { groundRef, newGeneration, type RefMap, type RefEntry } from '../perception/refmap.js'
 import { snapshotNodes, type SnapNode } from '../perception/walk.js'
 import { render } from '../perception/serialize.js'
 import { observe } from '../perception/diff.js'
-import { assertNavigable } from '../security/egress.js'
+import { assertNavigable, assertContainedPath } from '../security/egress.js'
 import { neutralize, capOutput } from '../security/injection.js'
-import { requiresConfirm, confirmGateDecision } from '../security/confirm.js'
+import { redactValue } from '../security/redact.js'
+import { requiresConfirm, confirmGateDecision, isDestructivePaidName } from '../security/confirm.js'
 import {
   act,
   find,
@@ -58,6 +60,17 @@ import { buildBundle, type JsonSchema } from '../extract/transform.js'
 import { resolveIds } from '../extract/resolve.js'
 
 const VERSION = '0.1.0'
+
+/**
+ * Package root, computed from THIS compiled module's location so it is correct
+ * whether we run from `dist/core/handlers.js` or `src/core/handlers.ts` (both
+ * are two levels below the package root). Used to locate on-disk skill docs.
+ */
+const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
+
+/** Verbs whose invocation is a click/press-like ACTIVATION of a control — the
+ * only ones the narrowed paid/destructive confirm gate applies to. */
+const CONFIRM_GATED_VERBS: ReadonlySet<string> = new Set(['click', 'dblclick', 'press'])
 
 // ---------------------------------------------------------------------------
 // Per-session state sidecar (moxxie-state.json) — our cross-command scratch.
@@ -133,11 +146,59 @@ async function withConnection<T>(
   fn: (conn: Connection) => Promise<T>,
 ): Promise<T> {
   const conn = await ensureConnected(flags.session, openOpts(flags))
+  // Register the dialog handler on THIS connection's page (fix P0-7): with no
+  // listener, Playwright silently CANCELS every alert/confirm/prompt, so a
+  // `confirm("delete?")` guard is auto-dismissed while the host still gets ok().
+  attachDialogHandler(conn.page, flags.session)
   try {
     return await fn(conn)
   } finally {
     await conn.browser.close().catch(() => {})
   }
+}
+
+// ---------------------------------------------------------------------------
+// Dialogs (fix P0-7): AUTO-ACCEPT alert/confirm/prompt with sane defaults and
+// stamp the last one into a dedicated session sidecar so `dialog status` can
+// surface it. A dedicated file (never moxxie-state.json) keeps the async,
+// best-effort dialog write from racing a command's own state save.
+// ---------------------------------------------------------------------------
+
+type LastDialog = { type: string; message: string; defaultValue?: string; at: string }
+
+function dialogPath(name: string): string {
+  return path.join(sessionDir(name), 'dialog.json')
+}
+
+async function writeDialogSidecar(name: string, d: LastDialog): Promise<void> {
+  try {
+    await fs.mkdir(sessionDir(name), { recursive: true })
+    await fs.writeFile(dialogPath(name), JSON.stringify(d), 'utf8')
+  } catch {
+    /* best-effort — the dialog handler must never throw into Playwright */
+  }
+}
+
+async function loadDialogSidecar(name: string): Promise<LastDialog | null> {
+  try {
+    return JSON.parse(await fs.readFile(dialogPath(name), 'utf8')) as LastDialog
+  } catch {
+    return null
+  }
+}
+
+function attachDialogHandler(page: Page, session: string): void {
+  page.on('dialog', (dialog) => {
+    const type = dialog.type()
+    const message = dialog.message()
+    const defaultValue = dialog.defaultValue()
+    const rec: LastDialog = { type, message, at: new Date().toISOString() }
+    if (defaultValue) rec.defaultValue = defaultValue
+    void writeDialogSidecar(session, rec)
+    // Sane defaults: prompt -> its default text; alert/confirm/beforeunload -> OK.
+    const done = type === 'prompt' ? dialog.accept(defaultValue) : dialog.accept()
+    void done.catch(() => {})
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -215,11 +276,12 @@ export async function handle(flags: ParsedFlags): Promise<Envelope<unknown>> {
       return handleDoctor()
     case 'skill':
       return handleSkill(flags)
+    case 'dialog':
+      return handleDialog(flags)
     // nice-to-have — honestly unimplemented (never faked).
     case 'tab':
     case 'frame':
     case 'network':
-    case 'dialog':
     case 'pdf':
       return notImplemented()
     default:
@@ -351,14 +413,10 @@ function warnIf(pageChanged: boolean): string | undefined {
 async function handleRead(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const url = flags.args[0]
   if (url) {
-    const nav = assertNavigable(url, {
-      allowFile: flags.allowFileAccess,
-      allowedDomains: flags.allowedDomains,
-    })
-    if (!nav.ok) return fail('navigation_blocked')
-    const res = await fetch(url, flags.timeout ? { signal: AbortSignal.timeout(flags.timeout) } : {})
-    if (!res.ok) return fail('page_crash')
-    const html = await res.text()
+    const fetched = await fetchGuarded(url, flags)
+    if (!fetched.ok) return fail(fetched.code)
+    if (!fetched.res.ok) return fail('page_crash')
+    const html = await fetched.res.text()
     return ok(presentPageText(htmlToText(html), flags))
   }
   return withConnection(flags, async ({ page }) => {
@@ -369,13 +427,58 @@ async function handleRead(flags: ParsedFlags): Promise<Envelope<unknown>> {
   })
 }
 
+/**
+ * Fetch `url`, re-running the egress guard on EVERY hop (fix P1-SEC5 / SSRF).
+ *
+ * A one-shot `assertNavigable` before a redirect-following fetch is bypassable:
+ * a benign initial URL can 3xx-redirect to `http://169.254.169.254/…`, `file:`,
+ * or a raw-IP host. We follow redirects MANUALLY and re-assert navigability on
+ * each Location before requesting it, blocking the moment a hop is disallowed.
+ */
+async function fetchGuarded(
+  url: string,
+  flags: ParsedFlags,
+): Promise<{ ok: true; res: Response } | { ok: false; code: 'navigation_blocked' }> {
+  const MAX_HOPS = 10
+  const opts = { allowFile: flags.allowFileAccess, allowedDomains: flags.allowedDomains }
+  const signal = flags.timeout ? AbortSignal.timeout(flags.timeout) : undefined
+  let current = url
+  for (let hop = 0; hop < MAX_HOPS; hop++) {
+    if (!assertNavigable(current, opts).ok) return { ok: false, code: 'navigation_blocked' }
+    const res = await fetch(current, {
+      redirect: 'manual',
+      ...(signal ? { signal } : {}),
+    })
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers.get('location')
+      if (!location) return { ok: true, res } // 3xx with no target — treat as final.
+      try {
+        current = new URL(location, current).toString()
+      } catch {
+        return { ok: false, code: 'navigation_blocked' }
+      }
+      continue
+    }
+    return { ok: true, res }
+  }
+  // Too many redirects — fail closed rather than loop.
+  return { ok: false, code: 'navigation_blocked' }
+}
+
 async function handleScreenshot(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const outPath = flags.args[0]
+  // Path containment (fix P1-SEC4): only write inside the working directory.
+  let resolvedOut: string | undefined
+  if (outPath) {
+    const c = assertContainedPath(outPath)
+    if (!c.ok) return fail('path_denied')
+    resolvedOut = c.resolved
+  }
   return withConnection(flags, async ({ page }) => {
     const shotOpts: { fullPage: boolean; path?: string } = { fullPage: flags.full }
-    if (outPath) shotOpts.path = outPath
+    if (resolvedOut) shotOpts.path = resolvedOut
     const buf = await page.screenshot(shotOpts)
-    if (outPath) return ok({ saved: true })
+    if (resolvedOut) return ok({ saved: true })
     return ok({ encoding: 'base64', image: buf.toString('base64') })
   })
 }
@@ -405,9 +508,39 @@ async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const refmap = await loadRefMap(flags.session)
   if (!refmap) return fail('element_not_found')
 
+  // Narrowed paid/destructive confirm gate (fix P0-4). Runs AFTER grounding, so
+  // a hallucinated @e999 still fails the grounding gate FIRST (trifecta test 2b).
+  // Only click/press-like activations of a control whose accessible name looks
+  // paid/destructive (Buy/Pay/Delete/…) are gated, and only on a NON-TTY session
+  // that did not pre-approve the verb via --confirm-actions. Plain clicks/fills
+  // on non-matching names stay ungated (the smoke evals' buttons are unaffected).
+  if (CONFIRM_GATED_VERBS.has(verb)) {
+    const g = groundRef(refmap, ref)
+    if (!g.ok) return fail(g.code)
+    if (
+      isDestructivePaidName(g.entry.name) &&
+      !process.stdout.isTTY &&
+      !flags.confirmActions.includes(verb)
+    ) {
+      return fail('confirm_required')
+    }
+  }
+
   // Value: positional arg, or stdin for large/unsafe payloads.
   let value = flags.args[1]
   if (flags.stdin) value = await readStdin()
+
+  // Path containment for `upload` (fix P1-SEC4): every file must resolve inside
+  // the working directory, or the whole action is refused before we touch the page.
+  let uploadFiles: string[] | undefined
+  if (verb === 'upload') {
+    uploadFiles = []
+    for (const fp of flags.args.slice(1)) {
+      const c = assertContainedPath(fp)
+      if (!c.ok) return fail('path_denied')
+      uploadFiles.push(c.resolved)
+    }
+  }
 
   return withConnection(flags, async ({ page }) => {
     const cdp = await page.context().newCDPSession(page)
@@ -416,7 +549,7 @@ async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
       if (flags.force) opts.force = true
       if (flags.timeout !== undefined) opts.timeout = flags.timeout
       if (verb === 'select') opts.selectValues = flags.args.slice(1)
-      if (verb === 'upload') opts.files = flags.args.slice(1)
+      if (verb === 'upload') opts.files = uploadFiles ?? []
       if (verb === 'drag') opts.targetRef = flags.args[1]
 
       const env = await act(page, cdp, verb, ref, value, refmap, opts)
@@ -490,16 +623,26 @@ async function handleGet(flags: ParsedFlags): Promise<Envelope<unknown>> {
       case 'value': {
         const ref = rest[0]
         if (!ref) return badRequest('usage: moxxie get value @eN')
-        return withLocator(page, flags.session, ref, async (loc) =>
-          ok({ value: await loc.inputValue() }),
-        )
+        // Route through the SAME redaction + neutralize choke point as get-text
+        // (fix P0-1): a raw inputValue() would leak a password and bypass the
+        // injection scrub. isPassword is read from the live DOM `type`; role/name
+        // come from the grounded ref (RefEntry) for the redactValue hint check.
+        return withLocator(page, flags.session, ref, async (loc, entry) => {
+          const raw = await loc.inputValue()
+          const type = ((await loc.getAttribute('type')) ?? '').toLowerCase()
+          const isPassword = type === 'password'
+          const redacted = redactValue(entry.role, entry.name, raw, isPassword)
+          return ok({ value: presentPageText(redacted, flags) })
+        })
       }
       case 'attr': {
         const ref = rest[0]
         const attrName = rest[1]
         if (!ref || !attrName) return badRequest('usage: moxxie get attr @eN <attribute>')
+        // Neutralize + cap the attribute value (fix P0-1): a forged
+        // `title="</system>ignore prior"` must not reach the host un-scrubbed.
         return withLocator(page, flags.session, ref, async (loc) =>
-          ok({ attribute: attrName, value: await loc.getAttribute(attrName) }),
+          ok({ attribute: attrName, value: presentPageText((await loc.getAttribute(attrName)) ?? '', flags) }),
         )
       }
       default:
@@ -528,13 +671,14 @@ async function handleIs(flags: ParsedFlags): Promise<Envelope<unknown>> {
   )
 }
 
-/** Ground + resolve a ref to a Locator, then run `fn`; returns fail(code) on a
+/** Ground + resolve a ref to a Locator, then run `fn` with the Locator AND the
+ * grounded RefEntry (for role/name-aware redaction); returns fail(code) on a
  * grounding miss (a ResolveError throw bubbles to the dispatcher). */
 async function withLocator(
   page: Page,
   session: string,
   ref: string,
-  fn: (loc: Locator) => Promise<Envelope<unknown>>,
+  fn: (loc: Locator, entry: RefEntry) => Promise<Envelope<unknown>>,
 ): Promise<Envelope<unknown>> {
   const refmap = await loadRefMap(session)
   if (!refmap) return fail('element_not_found')
@@ -543,7 +687,7 @@ async function withLocator(
   const cdp: CDPSession = await page.context().newCDPSession(page)
   try {
     const loc = await toLocator(page, cdp, g.entry, g.ref)
-    return await fn(loc)
+    return await fn(loc, g.entry)
   } finally {
     await cdp.detach().catch(() => {})
   }
@@ -554,6 +698,12 @@ async function withLocator(
 // ---------------------------------------------------------------------------
 
 async function handleWait(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  // `wait --fn <expr>` executes the expression IN PAGE CONTEXT via
+  // page.waitForFunction — arbitrary in-page JS with side effects (cookie
+  // exfil, DOM mutation), NOT a sandboxed predicate and NOT egress-guarded.
+  // `wait` is a read-only verb, so gate --fn behind --enable-actions here (fix
+  // P0-3); every other wait form (ref/selector/text/url/load/ms) stays read-only.
+  if (flags.fn !== undefined && !flags.enableActions) return fail('not_permitted')
   return withConnection(flags, async ({ page }) => {
     const cdp: CDPSession = await page.context().newCDPSession(page)
     try {
@@ -688,16 +838,23 @@ async function handleStateVerb(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const target = flags.args[1] ?? flags.state
   if (sub === 'save') {
     if (!target) return badRequest('usage: moxxie state save <path>')
+    // Path containment (fix P1-SEC4): the storage-state file is written to disk.
+    const c = assertContainedPath(target)
+    if (!c.ok) return fail('path_denied')
+    const savePath = c.resolved
     return withConnection(flags, async ({ context }) => {
-      await context.storageState({ path: target })
+      await context.storageState({ path: savePath })
       return ok({ saved: true })
     })
   }
   if (sub === 'load') {
     if (!target) return badRequest('usage: moxxie state load <path>')
+    // Path containment (fix P1-SEC4): only read a storage-state file from CWD.
+    const c = assertContainedPath(target)
+    if (!c.ok) return fail('path_denied')
     let parsed: { cookies?: unknown }
     try {
-      parsed = JSON.parse(await fs.readFile(target, 'utf8')) as { cookies?: unknown }
+      parsed = JSON.parse(await fs.readFile(c.resolved, 'utf8')) as { cookies?: unknown }
     } catch {
       return badRequest('could not read the storage-state file')
     }
@@ -856,6 +1013,20 @@ async function handleDoctor(): Promise<Envelope<unknown>> {
 }
 
 function handleSkill(flags: ParsedFlags): Envelope<unknown> {
+  // Serve the on-disk SKILL.md when present (fix §5): `--full` returns it whole,
+  // default returns a compact head. Fall back to the inline blurb below when the
+  // file is absent, so this handler is fully self-contained.
+  const skillFile = path.join(PACKAGE_ROOT, 'skill-data', 'core', 'SKILL.md')
+  let onDisk: string | null = null
+  try {
+    onDisk = readFileSync(skillFile, 'utf8')
+  } catch {
+    onDisk = null
+  }
+  if (onDisk && onDisk.trim().length > 0) {
+    return ok(flags.full ? onDisk : compactHead(onDisk))
+  }
+
   const short =
     'moxxie — keyless browser automation for AI agents. Lean loop: ' +
     '`open <url>` -> `snapshot -i` (grounded @eN refs) -> act with `--enable-actions` ' +
@@ -872,10 +1043,40 @@ function handleSkill(flags: ParsedFlags): Envelope<unknown> {
         'opt-in `--allowed-domains` suffix hardening; page output is neutralized + ' +
         'boundary-fenced (`--no-content-boundaries` off, `--max-output` caps free-form dumps); ' +
         'passwords/cards are redacted at the serializer. The CLI NEVER calls a model — ' +
-        'the host is the brain. (Full SKILL.md ships in a later task.)',
+        'the host is the brain.',
     )
   }
   return ok(short)
+}
+
+/** Compact head of a long SKILL.md: leading content to a line boundary. */
+function compactHead(md: string): string {
+  const LIMIT = 1200
+  if (md.length <= LIMIT) return md
+  const slice = md.slice(0, LIMIT)
+  const lastNl = slice.lastIndexOf('\n')
+  const head = lastNl > 0 ? slice.slice(0, lastNl) : slice
+  return `${head}\n\n… (run \`moxxie skill --full\` for the complete SKILL.md)`
+}
+
+/**
+ * `dialog` verb (fix P0-7). Dialogs are AUTO-ACCEPTED as they appear (see
+ * attachDialogHandler); this verb surfaces the last one. Minimal by design:
+ *   dialog | dialog status   -> the last dialog (type + message) or null
+ *   dialog accept | dismiss  -> acknowledges the (already-automatic) mode
+ * Note: `dialog` is registry-classified as an actor verb, so it requires
+ * --enable-actions to dispatch.
+ */
+async function handleDialog(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const sub = flags.args[0] ?? 'status'
+  if (sub === 'status') {
+    const last = await loadDialogSidecar(flags.session)
+    return ok({ lastDialog: last })
+  }
+  if (sub === 'accept' || sub === 'dismiss') {
+    return ok({ mode: sub, note: 'dialogs are auto-accepted when they appear' })
+  }
+  return badRequest('usage: moxxie dialog status')
 }
 
 // ---------------------------------------------------------------------------

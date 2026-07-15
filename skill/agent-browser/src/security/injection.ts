@@ -35,11 +35,21 @@ const FORGED_ROLE_RE = /<\/?(?:system|user|tool|assistant)>/gi
 const FORGED_UNTRUSTED_RE = /<\/?untrusted[^>]*>/gi
 
 /**
+ * The fence glyphs themselves (U+27E6 `⟦` / U+27E7 `⟧`). A hostile page that
+ * embeds a literal `⟦/page-content⟧` in its text/aria-labels would otherwise
+ * FORGE the fence close and inject "trusted" content after it. We de-fang any
+ * such glyph in the BODY (replacing `⟦`/`⟧` with the safe `[`/`]`) BEFORE
+ * wrapping, so the only real fence markers in the output are the ones we add.
+ */
+const FENCE_GLYPH_RE = /[⟦⟧]/g
+
+/**
  * Strip forged role/boundary tags from page-derived output and wrap the result
  * in stable untrusted-content boundary markers.
  */
 export function neutralize(pageOutput: string): string {
   const body = String(pageOutput ?? '')
+    .replace(FENCE_GLYPH_RE, (g) => (g === '⟦' ? '[' : ']'))
     .replace(FORGED_ROLE_RE, NEUTRALIZED)
     .replace(FORGED_UNTRUSTED_RE, NEUTRALIZED)
   return `${BOUNDARY_OPEN}\n${body}\n${BOUNDARY_CLOSE}`

@@ -49,6 +49,23 @@ export type ConfirmContext = {
 }
 
 /**
+ * NARROW paid/destructive accessible-name lexicon (spec §7, red-team P0-4).
+ *
+ * Deliberately limited to genuinely irreversible or money-moving controls. It
+ * MUST NOT match ordinary form controls — `submit`, `send`, `post`, `confirm`,
+ * `subscribe`, `cancel` are excluded on purpose, because a keyless regex cannot
+ * tell "Submit expense report" from "Submit payment", and gating those would
+ * brick ordinary agent flows. Used AFTER grounding to gate a click/press-like
+ * activation of a control whose accessible name looks paid/destructive.
+ */
+const DESTRUCTIVE_PAID_RE = /(buy|purchase|checkout|pay\b|payment|order|delete|remove)/i
+
+/** True iff a grounded control's accessible name looks paid/destructive. */
+export function isDestructivePaidName(name: string): boolean {
+  return DESTRUCTIVE_PAID_RE.test(String(name ?? ''))
+}
+
+/**
  * Whether `verb` requires confirmation. True when the verb is a mutating verb,
  * or the caller has flagged this specific invocation as destructive or paid
  * (e.g. an otherwise-benign verb landing on a "Buy" / "Delete" control).

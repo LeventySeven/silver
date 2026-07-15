@@ -20,10 +20,12 @@
  * navigation primitive it controls so a compromised/injected agent loop cannot
  * route around it (red-team aside-05 #8: put the hard deny at the lowest layer).
  */
+import * as path from 'node:path'
 import type { ErrorCode } from '../core/errors.js'
 
 /** Guaranteed to be a real member of the error taxonomy. */
 type NavBlocked = Extract<ErrorCode, 'navigation_blocked'>
+type PathDenied = Extract<ErrorCode, 'path_denied'>
 
 export type NavigableResult = { ok: true } | { ok: false; code: NavBlocked }
 
@@ -132,4 +134,41 @@ function matchesAnySuffix(host: string, domains: readonly string[]): boolean {
     if (host === d || host.endsWith('.' + d)) return true
   }
   return false
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem path containment (spec §7, red-team P1-SEC4).
+//
+// Any path moxxie WRITES (screenshot output) or READS (upload input, storage
+// state) must resolve INSIDE the working directory. This blocks the mirror of
+// the egress hole on the local FS: a `screenshot ../../etc/anything`, an
+// absolute `/etc/passwd`, or a traversal `../../.ssh/id_rsa` upload. Same
+// fail-closed shape as `assertNavigable`; the path is never echoed into errors.
+// ---------------------------------------------------------------------------
+
+export type ContainedPathResult =
+  | { ok: true; resolved: string }
+  | { ok: false; code: PathDenied }
+
+const PATH_DENY: ContainedPathResult = { ok: false, code: 'path_denied' }
+
+/**
+ * Resolve `target` against `root` (default: the process CWD) and permit it only
+ * when the resolved path is `root` itself or a descendant of it. Absolute
+ * escapes and `..` traversal that leaves `root` are denied. Never throws.
+ */
+export function assertContainedPath(target: string, root: string = process.cwd()): ContainedPathResult {
+  if (typeof target !== 'string' || target.trim().length === 0) return PATH_DENY
+  let base: string
+  let resolved: string
+  try {
+    base = path.resolve(root)
+    resolved = path.resolve(base, target)
+  } catch {
+    return PATH_DENY
+  }
+  if (resolved === base || resolved.startsWith(base + path.sep)) {
+    return { ok: true, resolved }
+  }
+  return PATH_DENY
 }
