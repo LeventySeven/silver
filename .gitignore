@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.agent-browser-state/
+profiles/
+*.local
+.env
+test-results/
+playwright-report/
+.browser-cache/
