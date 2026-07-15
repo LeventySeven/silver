@@ -47,7 +47,40 @@ const SIDECAR = 'session.json'
 const REFMAP = 'refmap.json'
 const READY_BUDGET_MS = 8_000
 
+/**
+ * Deterministic viewport (P0-8): a fixed window size makes snapshots/screenshots
+ * and concurrent eval runs reproducible instead of inheriting a version-dependent
+ * headless default. Applied both as a launch arg and (best-effort) per connect.
+ */
+const VIEWPORT = { width: 1280, height: 900 } as const
+
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+/** True while `pid` is a live process (EPERM = alive-but-not-ours; ESRCH = gone). */
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+/**
+ * Write a sidecar ATOMICALLY (P1-S5): write to a unique temp file then rename
+ * into place. `rename(2)` is atomic within a directory, so a concurrent reader
+ * never observes a half-written (torn) JSON grounding file.
+ */
+async function atomicWrite(filePath: string, data: string): Promise<void> {
+  const tmp = `${filePath}.tmp.${process.pid}.${Date.now()}`
+  await fs.writeFile(tmp, data, 'utf8')
+  try {
+    await fs.rename(tmp, filePath)
+  } catch (err) {
+    await fs.rm(tmp, { force: true }).catch(() => {})
+    throw err
+  }
+}
 
 /** Root dir for all sessions: `~/.moxxie/sessions`. */
 export function sessionsRoot(): string {
@@ -99,7 +132,9 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
     '--no-first-run',
     '--no-default-browser-check',
     '--disable-session-crashed-bubble',
-    // stealth: never advertise automation (spec §7)
+    // deterministic viewport for reproducible snapshots/screenshots (P0-8)
+    `--window-size=${VIEWPORT.width},${VIEWPORT.height}`,
+    // stealth: never advertise automation (spec §7) — note: NO --enable-automation
     ...(opts.headed ? [] : ['--headless=new']),
     'about:blank',
   ]
@@ -130,7 +165,7 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
       createdAt: new Date().toISOString(),
     }
     await fs.mkdir(dir, { recursive: true })
-    await fs.writeFile(sidecarPath(name), JSON.stringify(info, null, 2), 'utf8')
+    await atomicWrite(sidecarPath(name), JSON.stringify(info, null, 2))
     return info
   } catch (err) {
     // Readiness failed — do not leave a zombie browser behind.
@@ -201,6 +236,12 @@ export async function readSidecar(name: string): Promise<SessionInfo> {
  */
 export async function connect(name: string): Promise<Connection> {
   const info = await readSidecar(name)
+  // PID-liveness (P1-S1): a stale sidecar whose browser died would otherwise
+  // hang on a dead CDP endpoint. Treat a dead pid as "no live session" so the
+  // caller (ensureConnected) re-spawns instead.
+  if (!isPidAlive(info.pid)) {
+    throw new Error('the previous browser process is gone (reopen the session)')
+  }
   const browser = await chromium.connectOverCDP(info.wsEndpoint)
   const context = browser.contexts()[0]
   if (!context) {
@@ -208,13 +249,15 @@ export async function connect(name: string): Promise<Connection> {
     throw new Error('the browser has no available context')
   }
   const page = context.pages()[0] ?? (await context.newPage())
+  // Deterministic viewport (P0-8); best-effort over a CDP-connected page.
+  await page.setViewportSize({ width: VIEWPORT.width, height: VIEWPORT.height }).catch(() => {})
   return { browser, context, page }
 }
 
 /** Persist the RefMap sidecar for cross-command grounding. */
 export async function saveRefMap(name: string, map: RefMap): Promise<void> {
   await fs.mkdir(sessionDir(name), { recursive: true })
-  await fs.writeFile(refmapPath(name), JSON.stringify(map), 'utf8')
+  await atomicWrite(refmapPath(name), JSON.stringify(map))
 }
 
 /** Load the RefMap sidecar, or null if none has been saved yet. */

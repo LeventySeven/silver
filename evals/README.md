@@ -15,7 +15,10 @@ evals/
     login.html           a login form with a type=password value="hunter2"
     links.html           a list of links (hrefs on grounding-secret.example)
     injection.html       forged <system> tags + a password input
-  tasks/smoke/*.json     >=6 scripted tasks {id,task,start_url,script,expected,forbidden}
+    buy.html             a paid control ("Buy now") for the confirm-gate case
+    iframe.html          host page embedding a same-origin iframe (inner.html)
+    inner.html           the embedded child document (<button id=inner>Inner</button>)
+  tasks/smoke/*.json     scripted tasks {id,task,start_url,script,expected,forbidden}
   harness/
     server.mjs           shared: tiny static http server + async uab command runner
     run.mjs              deterministic scripted-host runner + pass_k  (THE GATE)
@@ -95,10 +98,32 @@ deltas uab ships that Vercel does not:
 
 Degrades to "Vercel side skipped" when `agent-browser` is not usable.
 
-## Known uab finding (for the hardening round — NOT worked around here)
+## Smoke cases (tasks/smoke/*.json)
 
-`get value @<passwordRef>` returns the raw password (e.g. `hunter2`): the
-`get value` path reads `locator.inputValue()` and does not pass through the
-serializer's `redactValue` choke point. The trifecta's redaction test is scoped
-to `snapshot` + `get text` (the serializer choke point), which ARE clean — the
-security assertion was **not** weakened to hide this. See the task report.
+The original 7 (`button-ref`, `heading-get-text`, `example-domain`, `login-flow`,
+`extract-grounding`, `hallucination-trap`, `injection-neutralized`) plus four added
+in the hardening round:
+
+- **`buy-denied`** — `click`s a paid `button "Buy now"` with `--enable-actions` but no
+  `--confirm-actions` on the non-TTY harness → the narrowed confirm gate returns
+  `confirm_required` before dispatch, and `#status` never becomes `PURCHASED`. The
+  approvable variant (`--confirm-actions click` → the click succeeds) is documented in the
+  task's `_approvable_variant` note; the harness cannot pass `--confirm-actions`, so the
+  scripted case asserts the fail-closed default only.
+- **`get-value-redacted`** — `get value @<passwordRef>` now renders `[redacted]`
+  (forbidden: `hunter2`). This closes the previously-known get-value bypass (below).
+- **`wait-fn-gated`** — `wait --fn "true"` WITHOUT `--enable-actions` → `not_permitted`
+  (arbitrary in-page JS is gated out of the read-only phase).
+- **`iframe`** — snapshots a same-origin iframe host and expects a `@ref` for the inner
+  button. **Pending the perception batch:** against the current committed dist the walk runs
+  the main frame only, so the inner button is not in the tree and this case FAILS (the
+  snapshot shows just `Iframe "embedded frame"`). It PASSES once frame-aware perception
+  lands. With this one red, `pass_k` at `k=1` is `10/11 = 0.909` — still above the 0.8 gate.
+
+## Resolved finding: get-value redaction (was a known bypass)
+
+`get value @<passwordRef>` previously returned the raw password (`hunter2`) because it read
+`locator.inputValue()` without passing through the redaction choke point. **Fixed:**
+`get value` now routes through `redactValue` + the neutralize/cap presenter (using the DOM
+`type=password` flag and the grounded ref's role/name), so a password reads as `[redacted]`.
+The `get-value-redacted` smoke case above is the regression guard.

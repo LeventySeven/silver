@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { render, OutputOverflowError } from '../../src/perception/serialize.js'
-import type { SnapNode } from '../../src/perception/walk.js'
+import { cleanUrl, type SnapNode } from '../../src/perception/walk.js'
 import type { RefMap } from '../../src/perception/refmap.js'
 
 /** Build a SnapNode with sensible defaults; override what a test cares about. */
@@ -248,5 +248,71 @@ describe('render — filtered note', () => {
       url: 'https://example.com',
     })
     expect(text.split('\n')[1]).toBe('# note: interactive elements only')
+  })
+})
+
+describe('render — text-leaf merge (P1-P1)', () => {
+  it('drops a StaticText child that merely echoes its parent name (dedup)', () => {
+    const nodes = [
+      mk({ backendNodeId: 1, role: 'button', name: 'Save', level: 0, refEligible: true }),
+      mk({ backendNodeId: 2, role: 'StaticText', name: 'Save', level: 1 }),
+    ]
+    const { text } = render(nodes, emptyMap, { generation: 1, title: '', url: '' })
+    expect(text).toContain('- button "Save" [ref=e1, level=0]')
+    // the redundant text leaf is folded away, not re-emitted as its own line
+    expect(text).not.toContain('StaticText "Save"')
+  })
+
+  it('keeps a DISTINCT StaticText child under a named parent (no info loss)', () => {
+    const nodes = [
+      mk({ backendNodeId: 1, role: 'button', name: 'Toolbar', level: 0, refEligible: true }),
+      mk({ backendNodeId: 2, role: 'StaticText', name: 'Toolbar', level: 1 }),
+      mk({ backendNodeId: 3, role: 'StaticText', name: 'Beta', level: 1 }),
+    ]
+    const { text } = render(nodes, emptyMap, { generation: 1, title: '', url: '' })
+    expect(text).toContain('- button "Toolbar" [ref=e1, level=0]')
+    expect(text).not.toContain('StaticText "Toolbar"') // duplicate dropped
+    expect(text).toContain('StaticText "Beta"') // distinct text preserved
+  })
+
+  it('folds text-leaf children into an UNNAMED ref node display name', () => {
+    const nodes = [
+      // a cursor-interactive div: ref-eligible but no accessible name of its own
+      mk({
+        backendNodeId: 1,
+        role: 'generic',
+        name: '',
+        level: 0,
+        refEligible: true,
+        cursorInteractive: true,
+      }),
+      mk({ backendNodeId: 2, role: 'StaticText', name: 'Click me', level: 1 }),
+    ]
+    const { refmap, text } = render(nodes, emptyMap, { generation: 1, title: '', url: '' })
+    // the folded text appears on the ref node's own line …
+    expect(text).toContain('- generic "Click me" [ref=e1, level=0]')
+    // … and is NOT also emitted as a separate StaticText line
+    expect(text).not.toContain('StaticText "Click me"')
+    // display-only: the minted RefEntry keeps the node's REAL (empty) name so the
+    // resolver's (role,name,nth) shape match still lines up with a fresh walk.
+    expect(refmap.entries.e1.name).toBe('')
+  })
+})
+
+describe('cleanUrl — base resolution (P1-P2)', () => {
+  it('resolves a root-relative href against the page base', () => {
+    expect(cleanUrl('/login', 'https://example.com/app/page')).toBe('https://example.com/login')
+  })
+
+  it('resolves a dot-relative href against the page base', () => {
+    expect(cleanUrl('../rel', 'https://example.com/a/b/')).toBe('https://example.com/a/rel')
+  })
+
+  it('still strips tracking params on an absolute href', () => {
+    expect(cleanUrl('https://ex.com/x?utm_source=n&keep=1')).toBe('https://ex.com/x?keep=1')
+  })
+
+  it('leaves a relative href untouched when no base is given (back-compat)', () => {
+    expect(cleanUrl('/login')).toBe('/login')
   })
 })

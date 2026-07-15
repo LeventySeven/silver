@@ -1,0 +1,13 @@
+<!doctype html>
+<html>
+  <body>
+    <h1>Host Page</h1>
+    <button id="outer">Outer</button>
+    <iframe
+      id="child"
+      width="400"
+      height="200"
+      srcdoc="<!doctype html><html><body><button id=inner onclick=&quot;window.__innerClicked = true&quot;>Inner Button</button><input aria-label=&quot;inner field&quot;></body></html>"
+    ></iframe>
+  </body>
+</html>

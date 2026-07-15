@@ -27,7 +27,7 @@
  */
 import type { Page, Locator, CDPSession } from 'playwright'
 import type { RefEntry } from '../perception/refmap.js'
-import { snapshotNodes } from '../perception/walk.js'
+import { snapshotNodes, MAIN_FRAME_ID } from '../perception/walk.js'
 
 /** The attribute we stamp on a node to bridge backendNodeId -> a CSS selector. */
 export const REF_ATTR = 'data-moxxie-ref'
@@ -80,15 +80,50 @@ async function rematchByShape(page: Page, entry: RefEntry): Promise<number | nul
   const nodes = await snapshotNodes(page, { interactive: true })
   const bounded = nodes.length > REMATCH_LIMIT ? nodes.slice(0, REMATCH_LIMIT) : nodes
   // Recompute `nth` the SAME way serialize.ts mints it: only over ref-eligible
-  // nodes, in document order, keyed by `${role} ${name}`.
+  // nodes, in document order, keyed by `${role} ${name}` (globally, across all
+  // spliced frames). The `frameId` equality is a safety belt so a same-shaped
+  // node in a DIFFERENT frame can never be the match.
   const nthCounts = new Map<string, number>()
   for (const snap of bounded) {
     if (!snap.refEligible) continue
     const key = `${snap.role} ${snap.name}`
     const nth = nthCounts.get(key) ?? 0
     nthCounts.set(key, nth + 1)
-    if (snap.role === entry.role && snap.name === entry.name && nth === entry.nth) {
+    if (
+      snap.role === entry.role &&
+      snap.name === entry.name &&
+      nth === entry.nth &&
+      snap.frameId === entry.frameId
+    ) {
       return snap.backendNodeId
+    }
+  }
+  return null
+}
+
+/**
+ * Locate the just-stamped node. For a main-frame ref this is a plain page
+ * locator; for a frame-scoped ref the stamped `data-moxxie-ref` attribute is
+ * globally unique, so we find whichever child frame now holds it (Playwright
+ * locators do not pierce frame boundaries, so we must scope to the owning frame).
+ */
+async function locateStamped(
+  page: Page,
+  entry: RefEntry,
+  ref: string,
+): Promise<Locator | null> {
+  const sel = refSelector(ref)
+  if (entry.frameId === MAIN_FRAME_ID) {
+    const loc = page.locator(sel).first()
+    return (await loc.count()) > 0 ? loc : null
+  }
+  for (const frame of page.frames()) {
+    if (frame === page.mainFrame()) continue
+    try {
+      const loc = frame.locator(sel).first()
+      if ((await loc.count()) > 0) return loc
+    } catch {
+      /* frame detached mid-resolve — try the next */
     }
   }
   return null
@@ -100,10 +135,10 @@ async function stampAndLocate(
   cdp: CDPSession,
   backendNodeId: number,
   ref: string,
+  entry: RefEntry,
 ): Promise<Locator | null> {
   if (!(await stampByBackendNode(cdp, backendNodeId, ref))) return null
-  const loc = page.locator(refSelector(ref)).first()
-  return (await loc.count()) > 0 ? loc : null
+  return locateStamped(page, entry, ref)
 }
 
 /**
@@ -120,19 +155,21 @@ export async function toLocator(
   entry: RefEntry,
   ref: string,
 ): Promise<Locator> {
-  // FAST PATH: the backendNodeId is still live in the current document.
+  // FAST PATH: the backendNodeId is still live in the current document. For a
+  // same-process iframe the child node is reachable from the page's CDP session,
+  // so the stamp lands; we then locate it inside its owning frame.
   try {
-    const fast = await stampAndLocate(page, cdp, entry.backendNodeId, ref)
+    const fast = await stampAndLocate(page, cdp, entry.backendNodeId, ref, entry)
     if (fast) return fast
   } catch {
     // detached / stale backendNodeId — fall through to the slow path.
   }
 
-  // SLOW PATH: re-snapshot and re-match by (role, name, nth).
+  // SLOW PATH: re-snapshot and re-match by (role, name, nth, frameId).
   const backendNodeId = await rematchByShape(page, entry)
   if (backendNodeId === null) throw new ResolveError()
   try {
-    const slow = await stampAndLocate(page, cdp, backendNodeId, ref)
+    const slow = await stampAndLocate(page, cdp, backendNodeId, ref, entry)
     if (slow) return slow
   } catch {
     throw new ResolveError()

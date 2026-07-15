@@ -68,6 +68,25 @@ export type SnapshotOptions = {
 const MAX_LEVELS = 50
 /** Bail out of the cursor scan on very large pages to stay responsive. */
 const SCAN_ELEMENT_LIMIT = 10_000
+/** The frameId sentinel for the top-level document (kept for RefEntry back-compat). */
+export const MAIN_FRAME_ID = 'main'
+/** Max iframe nesting we splice into the tree (bounds recursion; skip deeper). */
+const MAX_FRAME_DEPTH = 5
+
+/**
+ * Thrown when `selectorScope` (`-s <css>`) is supplied but matches NO element
+ * (or is an invalid selector). Without this, a zero-match scope would silently
+ * return an empty tree — a scope typo would read as "the page is empty". The
+ * `.code` is a real taxonomy member so cli.ts's `mapThrow` surfaces the loud
+ * `element_not_found` recovery text ("no element matches that ref/selector").
+ */
+export class SelectorScopeError extends Error {
+  readonly code = 'element_not_found' as const
+  constructor(message = 'the selector matched no elements') {
+    super(message)
+    this.name = 'SelectorScopeError'
+  }
+}
 
 // ---- CDP response shapes (minimal; Playwright types send() loosely here) ----
 
@@ -93,6 +112,14 @@ type DomNode = {
   contentDocument?: DomNode
   shadowRoots?: DomNode[]
   nodeId?: number
+  /** For an <iframe> DOM node: the CDP frameId of its content document. */
+  frameId?: string
+}
+
+/** CDP Page.getFrameTree node (minimal). */
+type FrameTreeNode = {
+  frame: { id: string; url?: string }
+  childFrames?: FrameTreeNode[]
 }
 
 type ScanRecord = {
@@ -114,6 +141,15 @@ type CursorInfo = {
 
 /**
  * Build the flat SnapNode list for the given page.
+ *
+ * The main frame is walked first; then each child `iframe` node has its OWN
+ * accessibility subtree fetched (via `Accessibility.getFullAXTree({frameId})`
+ * over the SAME CDP session — same-process iframes share the page's target) and
+ * SPLICED inline directly under the host `Iframe` node, one semantic level
+ * deeper, so a `<button>` inside an iframe becomes ref-eligible and clickable.
+ * Each spliced node carries the child frame's real CDP `frameId` so the resolver
+ * can act inside the owning frame. Recursion is bounded (`MAX_FRAME_DEPTH`) and
+ * cross-origin / detached frames are skipped silently (they simply don't appear).
  */
 export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Promise<SnapNode[]> {
   const interactive = opts.interactive ?? false
@@ -123,11 +159,17 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
   try {
     await cdp.send('DOM.enable').catch(() => {})
     await cdp.send('Accessibility.enable').catch(() => {})
+    await cdp.send('Page.enable').catch(() => {})
 
-    // 1. Cursor + hidden scan (tags matched elements with data-__uab-idx).
+    // 1. Cursor + hidden scan (main frame only; tags matched elements with
+    //    data-__uab-idx). Child frames rely on the AX tree for ref-eligibility
+    //    (real controls: button/link/input/…), which the cursor cascade is not
+    //    needed for — keeping the scan single-frame avoids idx collisions.
     const scan = (await page.evaluate(SCAN_JS)) as { bail: boolean; records: ScanRecord[] }
 
-    // 2. DOM tree -> attribute map + idx->backendNodeId (tags live here now).
+    // 2. DOM tree (pierced) -> attribute map + idx->backendNodeId. `pierce:true`
+    //    already descends into every iframe's contentDocument, so child-frame
+    //    node attributes are indexed here too (one fetch covers all frames).
     const doc = (await cdp.send('DOM.getDocument', { depth: -1, pierce: true })) as {
       root: DomNode
     }
@@ -158,104 +200,175 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
       })
     }
 
-    // 3. AX tree.
-    const ax = (await cdp.send('Accessibility.getFullAXTree')) as { nodes: AXNode[] }
-    const axById = new Map<string, AXNode>()
-    for (const n of ax.nodes) axById.set(n.nodeId, n)
-
-    // Optional selector scoping.
-    const scopeSet = opts.selectorScope
-      ? await resolveSelectorScope(cdp, doc.root, opts.selectorScope)
-      : null
-
-    // 4. DFS.
-    const roots = findRoots(ax.nodes, axById, scopeSet)
-    const out: SnapNode[] = []
-    for (const rootId of roots) {
-      visit(rootId, 0)
+    // frameId -> document base URL, so relative hrefs resolve per frame (P1-P2).
+    const pageUrl = page.url()
+    const frameBaseUrl = new Map<string, string>()
+    try {
+      const ft = (await cdp.send('Page.getFrameTree')) as { frameTree: FrameTreeNode }
+      collectFrameUrls(ft.frameTree, frameBaseUrl)
+    } catch {
+      /* best-effort — falls back to the page URL */
     }
-    return out
 
-    function visit(nodeId: string, level: number): void {
-      if (level > cap) return
-      const node = axById.get(nodeId)
-      if (!node) return
-      const backend = node.backendDOMNodeId ?? -1
-      const role = asString(node.role?.value)
-
-      // Selector scope: skip out-of-scope nodes but keep traversing to reach
-      // in-scope descendants (should not happen if roots are chosen well, but
-      // defensive).
-      const inScope = scopeSet === null || (backend >= 0 && scopeSet.has(backend))
-
-      const cursorInfo = backend >= 0 ? cursorByBackend.get(backend) : undefined
-      const cursorInteractive = cursorInfo !== undefined
-      const keepException =
-        cursorInteractive || role === 'checkbox' || role === 'radio'
-      const ignored = node.ignored === true
-      const hiddenPruned = backend >= 0 && pruneSet.has(backend)
-      const prune = (ignored || hiddenPruned) && !keepException
-
-      if (prune || !inScope) {
-        for (const child of node.childIds ?? []) visit(child, level)
-        return
+    // Optional selector scoping (main frame). Fail LOUD on zero/invalid match
+    // (P1-P3) instead of silently returning an empty tree.
+    let scopeSet: Set<number> | null = null
+    if (opts.selectorScope !== undefined) {
+      scopeSet = await resolveSelectorScope(cdp, doc.root, opts.selectorScope)
+      if (scopeSet === null || scopeSet.size === 0) {
+        throw new SelectorScopeError()
       }
+    }
 
-      const dom = backend >= 0 ? domByBackend.get(backend) : undefined
-      const attrs = dom?.attrs ?? {}
-      const rawName = asString(node.name?.value)
-      const name = accessibleName(rawName, {
-        ariaLabel: attrs['aria-label'],
-        alt: attrs['alt'],
-        title: attrs['title'],
-        placeholder: attrs['placeholder'],
-        textContent: interactive ? cursorInfo?.text : undefined,
-      })
-      const value = asString(node.value?.value)
+    // Walk the main frame, then recursively splice child frames inline.
+    return await walkFrame(MAIN_FRAME_ID, 0, 0)
 
-      const props = new Map<string, unknown>()
-      for (const p of node.properties ?? []) props.set(p.name, p.value?.value)
-
-      const flags: SnapNode['flags'] = {}
-      if (props.has('checked')) {
-        const c = props.get('checked')
-        flags.checked = c === 'mixed' ? 'mixed' : c === true || c === 'true'
+    /**
+     * Walk ONE frame's accessibility subtree into a flat SnapNode list, splicing
+     * any nested iframe content inline under its host node.
+     */
+    async function walkFrame(
+      frameId: string,
+      baseLevel: number,
+      depth: number,
+    ): Promise<SnapNode[]> {
+      let axNodes: AXNode[]
+      try {
+        const resp = (await (frameId === MAIN_FRAME_ID
+          ? cdp.send('Accessibility.getFullAXTree')
+          : cdp.send('Accessibility.getFullAXTree', { frameId }))) as { nodes: AXNode[] }
+        axNodes = resp.nodes
+      } catch {
+        return [] // cross-origin / detached child frame — skip silently.
       }
-      if (props.has('expanded')) flags.expanded = truthy(props.get('expanded'))
-      if (props.has('selected')) flags.selected = truthy(props.get('selected'))
-      if (props.has('disabled')) flags.disabled = truthy(props.get('disabled'))
-      if (props.has('required')) flags.required = truthy(props.get('required'))
-      if (props.has('focused')) flags.focused = truthy(props.get('focused'))
-      if (attrs['placeholder']) flags.placeholder = attrs['placeholder']
+      const axById = new Map<string, AXNode>()
+      for (const n of axNodes) axById.set(n.nodeId, n)
 
-      const nodeName = (dom?.nodeName ?? '').toLowerCase()
-      const isPassword = nodeName === 'input' && (attrs['type'] ?? '').toLowerCase() === 'password'
+      const isMain = frameId === MAIN_FRAME_ID
+      const useScope = isMain ? scopeSet : null
+      const baseUrl = isMain ? pageUrl : (frameBaseUrl.get(frameId) ?? pageUrl)
 
-      const isInteractive = INTERACTIVE_ROLES.has(role)
-      const isContent = CONTENT_ROLES.has(role)
-      const refEligible = isInteractive || (isContent && name !== '') || cursorInteractive
+      const result: SnapNode[] = []
+      const roots = findRoots(axNodes, axById, useScope)
+      for (const rootId of roots) await visit(rootId, baseLevel)
+      return result
 
-      const snap: SnapNode = {
-        backendNodeId: backend,
-        role,
-        name,
-        value,
-        level,
-        flags,
-        frameId: 'main',
-        cursorInteractive,
-        refEligible,
-        isPassword,
+      async function visit(nodeId: string, level: number): Promise<void> {
+        if (level > cap) return
+        const node = axById.get(nodeId)
+        if (!node) return
+        const backend = node.backendDOMNodeId ?? -1
+        const role = asString(node.role?.value)
+
+        // Selector scope: skip out-of-scope nodes but keep traversing to reach
+        // in-scope descendants (defensive; roots are chosen in-scope).
+        const inScope = useScope === null || (backend >= 0 && useScope.has(backend))
+
+        const cursorInfo = isMain && backend >= 0 ? cursorByBackend.get(backend) : undefined
+        const cursorInteractive = cursorInfo !== undefined
+        const keepException = cursorInteractive || role === 'checkbox' || role === 'radio'
+        const ignored = node.ignored === true
+        const hiddenPruned = isMain && backend >= 0 && pruneSet.has(backend)
+        const prune = (ignored || hiddenPruned) && !keepException
+
+        if (prune || !inScope) {
+          for (const child of node.childIds ?? []) await visit(child, level)
+          return
+        }
+
+        const dom = backend >= 0 ? domByBackend.get(backend) : undefined
+        const attrs = dom?.attrs ?? {}
+        const rawName = asString(node.name?.value)
+        const name = accessibleName(rawName, {
+          ariaLabel: attrs['aria-label'],
+          alt: attrs['alt'],
+          title: attrs['title'],
+          placeholder: attrs['placeholder'],
+          textContent: interactive ? cursorInfo?.text : undefined,
+        })
+        const value = asString(node.value?.value)
+
+        const props = new Map<string, unknown>()
+        for (const p of node.properties ?? []) props.set(p.name, p.value?.value)
+
+        const flags: SnapNode['flags'] = {}
+        if (props.has('checked')) {
+          const c = props.get('checked')
+          flags.checked = c === 'mixed' ? 'mixed' : c === true || c === 'true'
+        }
+        if (props.has('expanded')) flags.expanded = truthy(props.get('expanded'))
+        if (props.has('selected')) flags.selected = truthy(props.get('selected'))
+        if (props.has('disabled')) flags.disabled = truthy(props.get('disabled'))
+        if (props.has('required')) flags.required = truthy(props.get('required'))
+        if (props.has('focused')) flags.focused = truthy(props.get('focused'))
+        if (attrs['placeholder']) flags.placeholder = attrs['placeholder']
+
+        const nodeName = (dom?.nodeName ?? '').toLowerCase()
+        const isPassword =
+          nodeName === 'input' && (attrs['type'] ?? '').toLowerCase() === 'password'
+
+        const isInteractive = INTERACTIVE_ROLES.has(role)
+        const isContent = CONTENT_ROLES.has(role)
+        const refEligible = isInteractive || (isContent && name !== '') || cursorInteractive
+
+        const snap: SnapNode = {
+          backendNodeId: backend,
+          role,
+          name,
+          value,
+          level,
+          flags,
+          frameId,
+          cursorInteractive,
+          refEligible,
+          isPassword,
+        }
+        const href = attrs['href']
+        if (href) snap.url = cleanUrl(href, baseUrl)
+
+        result.push(snap)
+
+        // Splice the child frame's subtree directly under this Iframe host node,
+        // one level deeper, so its contents nest correctly in the serializer.
+        if (role === 'Iframe' && backend >= 0 && depth < MAX_FRAME_DEPTH) {
+          const childFrameId = await resolveChildFrameId(cdp, backend)
+          if (childFrameId && childFrameId !== frameId) {
+            const childNodes = await walkFrame(childFrameId, level + 1, depth + 1)
+            for (const cn of childNodes) result.push(cn)
+          }
+        }
+
+        for (const child of node.childIds ?? []) await visit(child, level + 1)
       }
-      const href = attrs['href']
-      if (href) snap.url = cleanUrl(href)
-
-      out.push(snap)
-      for (const child of node.childIds ?? []) visit(child, level + 1)
     }
   } finally {
     await cdp.detach().catch(() => {})
   }
+}
+
+/**
+ * Resolve the CDP frameId of an <iframe> element's content document, given the
+ * iframe's backendNodeId. `depth:1` includes `contentDocument` in the response.
+ */
+async function resolveChildFrameId(
+  cdp: CDPSession,
+  backendNodeId: number,
+): Promise<string | null> {
+  try {
+    const d = (await cdp.send('DOM.describeNode', { backendNodeId, depth: 1 })) as {
+      node?: DomNode
+    }
+    const fid = d.node?.contentDocument?.frameId ?? d.node?.frameId
+    return typeof fid === 'string' && fid.length > 0 ? fid : null
+  } catch {
+    return null
+  }
+}
+
+/** Recursively index each frame's document URL by CDP frameId. */
+function collectFrameUrls(node: FrameTreeNode, out: Map<string, string>): void {
+  if (node.frame.url) out.set(node.frame.id, node.frame.url)
+  for (const child of node.childFrames ?? []) collectFrameUrls(child, out)
 }
 
 /** AX roots: nodes with no parent in the tree (or, when scoped, the top-of-scope nodes). */
@@ -357,11 +470,15 @@ function truthy(v: unknown): boolean {
   return v === true || v === 'true'
 }
 
-/** Strip common tracking params so URLs stay stable + noise-free. */
-export function cleanUrl(href: string): string {
+/**
+ * Strip common tracking params so URLs stay stable + noise-free. When `base` is
+ * supplied, RELATIVE hrefs (`/login`, `../x`) are resolved against it so the host
+ * sees an absolute URL (P1-P2) instead of the raw relative string.
+ */
+export function cleanUrl(href: string, base?: string): string {
   const trimmed = href.trim()
   try {
-    const u = new URL(trimmed)
+    const u = base !== undefined ? new URL(trimmed, base) : new URL(trimmed)
     const drop: string[] = []
     u.searchParams.forEach((_v, k) => {
       if (/^(utm_|fbclid$|gclid$|mc_eid$|_hs)/i.test(k)) drop.push(k)
@@ -369,7 +486,7 @@ export function cleanUrl(href: string): string {
     for (const k of drop) u.searchParams.delete(k)
     return u.toString()
   } catch {
-    // Relative / non-absolute href — return as-is (trimmed).
+    // Un-resolvable (e.g. relative href with no/opaque base) — return as-is.
     return trimmed
   }
 }

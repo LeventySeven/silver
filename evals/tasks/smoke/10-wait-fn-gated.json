@@ -1,0 +1,15 @@
+{
+  "id": "wait-fn-gated",
+  "task": "Open a page, then run `wait --fn \"true\"` WITHOUT --enable-actions. Because --fn executes arbitrary in-page JS (side effects, not a sandboxed predicate), the read-only phase must deny it (not_permitted) — the predicate never runs.",
+  "start_url": "{BASE}/buttons.html",
+  "script": [
+    ["wait", "--fn", "true"]
+  ],
+  "expectedPatterns": [
+    "not enabled in the current phase",
+    "read-only"
+  ],
+  "forbiddenPatterns": [
+    "\\bwaited\\b"
+  ]
+}

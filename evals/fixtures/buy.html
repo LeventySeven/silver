@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Store Fixture</title></head>
+<body>
+  <!--
+    A checkout page whose primary control has a PAID accessible name ("Buy now").
+    Deterministic snapshot -i refs:
+      e1 = heading "Store"
+      e2 = button "Buy now"
+    The narrowed paid/destructive confirm gate (confirm.ts DESTRUCTIVE_PAID_RE)
+    matches "Buy now" via /buy/. So `click @e2` with --enable-actions but WITHOUT
+    --confirm-actions, on a NON-TTY session (the eval harness), fails closed with
+    `confirm_required` before the click dispatches. An operator that passes
+    `--confirm-actions click` pre-approves it and the click goes through
+    (setting #status to PURCHASED). Plain (non-paid) buttons stay ungated.
+  -->
+  <h1>Store</h1>
+  <p>Status: <span id="status">idle</span></p>
+  <button type="button"
+          onclick="document.getElementById('status').textContent='PURCHASED'">Buy now</button>
+</body>
+</html>

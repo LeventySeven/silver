@@ -1,0 +1,12 @@
+{
+  "id": "iframe",
+  "task": "Open a host page embedding a SAME-ORIGIN iframe (inner.html) that contains <button id=inner>Inner</button>. An interactive snapshot must surface a grounded @ref for the inner button. DEPENDS ON the sibling perception batch (frame-aware walk.ts / resolve.ts) — it FAILS against the current committed dist, which runs getFullAXTree on the main frame only (snapshot shows just `Iframe \"embedded frame\"`, no inner button). Kept in the suite so iframe support is eval-earned when it lands.",
+  "start_url": "{BASE}/iframe.html",
+  "script": [
+    ["snapshot", "-i"]
+  ],
+  "expectedPatterns": [
+    "button \"Inner\" \\[ref=e\\d+"
+  ],
+  "forbiddenPatterns": []
+}

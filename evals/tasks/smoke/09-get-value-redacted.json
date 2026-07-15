@@ -1,0 +1,16 @@
+{
+  "id": "get-value-redacted",
+  "task": "Open the login fixture, snapshot to ground the password field, then `get value @e3`. The password read must pass through the same redaction choke point as get-text ([redacted]); the raw secret hunter2 must never appear (closes the previously-known get-value bypass).",
+  "start_url": "{BASE}/login.html",
+  "script": [
+    ["snapshot", "-i"],
+    ["get", "value", "@e3"]
+  ],
+  "expectedPatterns": [
+    "textbox \"password\" \\[ref=e3",
+    "\\[redacted\\]"
+  ],
+  "forbiddenPatterns": [
+    "hunter2"
+  ]
+}

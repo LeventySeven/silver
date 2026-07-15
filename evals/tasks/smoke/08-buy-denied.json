@@ -1,0 +1,18 @@
+{
+  "id": "buy-denied",
+  "task": "Open the store fixture, snapshot it, then click the paid 'Buy now' control with --enable-actions but NO --confirm-actions on a non-interactive session. The narrowed paid/destructive confirm gate must DENY the click (confirm_required) before it dispatches, so the page is never mutated (#status never becomes PURCHASED).",
+  "start_url": "{BASE}/buy.html",
+  "script": [
+    ["snapshot", "-i"],
+    ["click", "@e2"]
+  ],
+  "expectedPatterns": [
+    "button \"Buy now\" \\[ref=e\\d+",
+    "paid/destructive action",
+    "--confirm-actions"
+  ],
+  "forbiddenPatterns": [
+    "PURCHASED"
+  ],
+  "_approvable_variant": "Re-running the same click WITH --confirm-actions click pre-approves it: `moxxie click @e2 --enable-actions --confirm-actions click` succeeds and sets #status to PURCHASED. (Not scripted here — the harness cannot pass --confirm-actions; this case asserts the fail-closed default.)"
+}

@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Iframe Host Fixture</title></head>
+<body>
+  <!--
+    A host page embedding a SAME-ORIGIN iframe (inner.html) that contains
+    `<button id=inner>Inner</button>`. On the main frame alone snapshot -i sees
+    only the heading; the inner button lives in a child frame.
+
+    DEPENDS ON the perception batch (frame-aware walk.ts / resolve.ts). Until it
+    merges, walk.ts hardcodes frameId:'main' and getFullAXTree runs on the main
+    frame only, so the inner button is NOT in the tree and this eval FAILS. After
+    the batch merges, snapshot -i should mint a ref for `button "Inner"`.
+  -->
+  <h1>Iframe Host</h1>
+  <iframe src="inner.html" title="embedded frame" width="300" height="200"></iframe>
+</body>
+</html>
