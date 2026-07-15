@@ -9,8 +9,8 @@
  *
  * STRATEGY (attribute-stamping — spec-sanctioned; we never replace text nodes):
  *   - FAST PATH: `DOM.resolveNode({backendNodeId})` -> a RemoteObject, then
- *     `Runtime.callFunctionOn` to stamp a `data-uab-ref="<ref>"` attribute on
- *     that node, then `page.locator('[data-uab-ref="<ref>"]').first()`.
+ *     `Runtime.callFunctionOn` to stamp a `data-moxxie-ref="<ref>"` attribute on
+ *     that node, then `page.locator('[data-moxxie-ref="<ref>"]').first()`.
  *
  *     Caveat proven empirically: after an SPA re-render the OLD backendNodeId can
  *     still `resolveNode` to a DETACHED node — stamping it succeeds but the
@@ -30,7 +30,7 @@ import type { RefEntry } from '../perception/refmap.js'
 import { snapshotNodes } from '../perception/walk.js'
 
 /** The attribute we stamp on a node to bridge backendNodeId -> a CSS selector. */
-export const REF_ATTR = 'data-uab-ref'
+export const REF_ATTR = 'data-moxxie-ref'
 
 /** Bounded re-match ceiling for the slow path (spec §4: <=5000 nodes). */
 const REMATCH_LIMIT = 5000
@@ -54,7 +54,7 @@ function refSelector(ref: string): string {
 }
 
 /**
- * Stamp `data-uab-ref="<ref>"` onto the node with the given backendNodeId.
+ * Stamp `data-moxxie-ref="<ref>"` onto the node with the given backendNodeId.
  * Returns false if the node could not be resolved to a RemoteObject.
  */
 async function stampByBackendNode(

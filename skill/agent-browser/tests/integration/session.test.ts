@@ -11,7 +11,7 @@ import {
 import type { RefMap } from '../../src/perception/refmap.js'
 
 // Unique per run so parallel/retry invocations never collide.
-const NAME = `uab-it-${process.pid}-${Date.now()}`
+const NAME = `moxxie-it-${process.pid}-${Date.now()}`
 
 describe('session lifecycle (real Chromium, detached, CDP reconnect)', () => {
   afterAll(async () => {

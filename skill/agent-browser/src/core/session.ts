@@ -6,7 +6,7 @@
  * survives this CLI process exiting. Every later command `connect()`s over CDP,
  * does its work, and disconnects — the browser keeps running. Cross-command
  * state (endpoint / pid, RefMap + generation) lives in JSON sidecars under
- * `~/.uab/sessions/<name>/`.
+ * `~/.moxxie/sessions/<name>/`.
  *
  * NO model calls, ever. Errors thrown here are generic (no path / secret) to
  * honor the no-leak invariant.
@@ -49,12 +49,12 @@ const READY_BUDGET_MS = 8_000
 
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
-/** Root dir for all sessions: `~/.uab/sessions`. */
+/** Root dir for all sessions: `~/.moxxie/sessions`. */
 export function sessionsRoot(): string {
-  return path.join(os.homedir(), '.uab', 'sessions')
+  return path.join(os.homedir(), '.moxxie', 'sessions')
 }
 
-/** Per-session dir: `~/.uab/sessions/<name>`. */
+/** Per-session dir: `~/.moxxie/sessions/<name>`. */
 export function sessionDir(name: string): string {
   return path.join(sessionsRoot(), assertName(name))
 }

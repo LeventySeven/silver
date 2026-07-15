@@ -10,7 +10,7 @@
  * does its work, then closes the CDP transport (`browser.close()` on a
  * connectOverCDP browser only drops the transport — the detached browser keeps
  * running). Cross-command state (generation, previous snapshot text, page
- * fingerprint, extract value-map) lives in a per-session `uab-state.json` sidecar
+ * fingerprint, extract value-map) lives in a per-session `moxxie-state.json` sidecar
  * next to session.json / refmap.json.
  *
  * KEYLESS: no model / provider call anywhere. Every "smart" step is a keyless
@@ -60,7 +60,7 @@ import { resolveIds } from '../extract/resolve.js'
 const VERSION = '0.1.0'
 
 // ---------------------------------------------------------------------------
-// Per-session state sidecar (uab-state.json) — our cross-command scratch.
+// Per-session state sidecar (moxxie-state.json) — our cross-command scratch.
 // ---------------------------------------------------------------------------
 
 type ExtractState = {
@@ -81,7 +81,7 @@ type UabState = {
 }
 
 function statePath(name: string): string {
-  return path.join(sessionDir(name), 'uab-state.json')
+  return path.join(sessionDir(name), 'moxxie-state.json')
 }
 
 async function loadState(name: string): Promise<UabState | null> {
@@ -210,7 +210,7 @@ export async function handle(flags: ParsedFlags): Promise<Envelope<unknown>> {
       return handleSession(flags)
     // meta
     case 'version':
-      return ok({ name: 'uab', version: VERSION })
+      return ok({ name: 'moxxie', version: VERSION })
     case 'doctor':
       return handleDoctor()
     case 'skill':
@@ -233,7 +233,7 @@ export async function handle(flags: ParsedFlags): Promise<Envelope<unknown>> {
 
 async function handleOpen(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const url = flags.args[0]
-  if (!url) return badRequest('a URL is required (usage: uab open <url>)')
+  if (!url) return badRequest('a URL is required (usage: moxxie open <url>)')
 
   // Egress guard at the FIRST layer — before any browser is spawned/navigated.
   const nav = assertNavigable(url, {
@@ -387,7 +387,7 @@ async function handleScreenshot(flags: ParsedFlags): Promise<Envelope<unknown>> 
 async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const verb = flags.verb as ActVerb
   const ref = flags.args[0]
-  if (!ref) return badRequest('a ref is required (usage: uab <verb> @eN [value])')
+  if (!ref) return badRequest('a ref is required (usage: moxxie <verb> @eN [value])')
 
   // Confirm gate: engaged only when the operator supplies --confirm-actions
   // (an explicit allowlist of auto-approved mutating verbs). Without it,
@@ -442,7 +442,7 @@ async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
 async function handleFind(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const kind = flags.args[0] as FindKind
   const val = flags.args[1]
-  if (!kind || !val) return badRequest('usage: uab find <kind> <value> [action] [text]')
+  if (!kind || !val) return badRequest('usage: moxxie find <kind> <value> [action] [text]')
   const subaction = flags.args[2] as Exclude<ActVerb, 'drag'> | undefined
   const subValue = flags.args[3]
 
@@ -470,7 +470,7 @@ async function handleGet(flags: ParsedFlags): Promise<Envelope<unknown>> {
         return ok({ url: page.url() })
       case 'count': {
         const target = rest[0]
-        if (!target) return badRequest('usage: uab get count <selector>')
+        if (!target) return badRequest('usage: moxxie get count <selector>')
         const n = await page.locator(target).count()
         return ok({ count: n })
       }
@@ -489,7 +489,7 @@ async function handleGet(flags: ParsedFlags): Promise<Envelope<unknown>> {
       }
       case 'value': {
         const ref = rest[0]
-        if (!ref) return badRequest('usage: uab get value @eN')
+        if (!ref) return badRequest('usage: moxxie get value @eN')
         return withLocator(page, flags.session, ref, async (loc) =>
           ok({ value: await loc.inputValue() }),
         )
@@ -497,13 +497,13 @@ async function handleGet(flags: ParsedFlags): Promise<Envelope<unknown>> {
       case 'attr': {
         const ref = rest[0]
         const attrName = rest[1]
-        if (!ref || !attrName) return badRequest('usage: uab get attr @eN <attribute>')
+        if (!ref || !attrName) return badRequest('usage: moxxie get attr @eN <attribute>')
         return withLocator(page, flags.session, ref, async (loc) =>
           ok({ attribute: attrName, value: await loc.getAttribute(attrName) }),
         )
       }
       default:
-        return badRequest('usage: uab get text|value|attr|title|url|count [ref]')
+        return badRequest('usage: moxxie get text|value|attr|title|url|count [ref]')
     }
   })
 }
@@ -511,7 +511,7 @@ async function handleGet(flags: ParsedFlags): Promise<Envelope<unknown>> {
 async function handleIs(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const kind = flags.args[0]
   const ref = flags.args[1]
-  if (!kind || !ref) return badRequest('usage: uab is visible|enabled|checked @eN')
+  if (!kind || !ref) return badRequest('usage: moxxie is visible|enabled|checked @eN')
   return withConnection(flags, async ({ page }) =>
     withLocator(page, flags.session, ref, async (loc) => {
       switch (kind) {
@@ -522,7 +522,7 @@ async function handleIs(flags: ParsedFlags): Promise<Envelope<unknown>> {
         case 'checked':
           return ok({ checked: await loc.isChecked() })
         default:
-          return badRequest('usage: uab is visible|enabled|checked @eN')
+          return badRequest('usage: moxxie is visible|enabled|checked @eN')
       }
     }),
   )
@@ -585,7 +585,7 @@ async function buildWaitSpec(
     return { spec: { load, timeout } }
   }
   const arg = flags.args[0]
-  if (!arg) return { error: badRequest('usage: uab wait <ref|ms|selector|--text|--url|--load|--fn>') }
+  if (!arg) return { error: badRequest('usage: moxxie wait <ref|ms|selector|--text|--url|--load|--fn>') }
   if (/^\d+$/.test(arg)) return { spec: { ms: Number(arg) } }
   // A ref → grounded wait; anything else is treated as a CSS selector.
   if (/^(@|ref=)?e\d+$/.test(arg)) {
@@ -687,14 +687,14 @@ async function handleStateVerb(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const sub = flags.args[0]
   const target = flags.args[1] ?? flags.state
   if (sub === 'save') {
-    if (!target) return badRequest('usage: uab state save <path>')
+    if (!target) return badRequest('usage: moxxie state save <path>')
     return withConnection(flags, async ({ context }) => {
       await context.storageState({ path: target })
       return ok({ saved: true })
     })
   }
   if (sub === 'load') {
-    if (!target) return badRequest('usage: uab state load <path>')
+    if (!target) return badRequest('usage: moxxie state load <path>')
     let parsed: { cookies?: unknown }
     try {
       parsed = JSON.parse(await fs.readFile(target, 'utf8')) as { cookies?: unknown }
@@ -710,12 +710,12 @@ async function handleStateVerb(flags: ParsedFlags): Promise<Envelope<unknown>> {
       return ok({ loaded: true, cookies: Array.isArray(parsed.cookies) ? parsed.cookies.length : 0 })
     })
   }
-  return badRequest('usage: uab state save|load <path>')
+  return badRequest('usage: moxxie state save|load <path>')
 }
 
 async function handleCookies(flags: ParsedFlags): Promise<Envelope<unknown>> {
-  if (flags.args[0] !== 'set') return badRequest('usage: uab cookies set --curl <file>')
-  if (!flags.curl) return badRequest('usage: uab cookies set --curl <file>')
+  if (flags.args[0] !== 'set') return badRequest('usage: moxxie cookies set --curl <file>')
+  if (!flags.curl) return badRequest('usage: moxxie cookies set --curl <file>')
   let raw: string
   try {
     raw = await fs.readFile(flags.curl, 'utf8')
@@ -780,7 +780,7 @@ async function handleSession(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const sub = flags.args[0]
   if (sub === 'id') {
     const base = flags.scope === 'worktree' ? worktreeRoot(process.cwd()) : process.cwd()
-    const prefix = flags.prefix ?? 'uab'
+    const prefix = flags.prefix ?? 'moxxie'
     const id = `${prefix}-${createHash('sha256').update(base).digest('hex').slice(0, 12)}`
     // Deliberately omit `base` (a path) from the envelope — no-leak invariant.
     return ok({ id, scope: flags.scope ?? 'cwd' })
@@ -798,7 +798,7 @@ async function handleSession(flags: ParsedFlags): Promise<Envelope<unknown>> {
     }
     return ok({ sessions })
   }
-  return badRequest('usage: uab session id|list')
+  return badRequest('usage: moxxie session id|list')
 }
 
 function worktreeRoot(start: string): string {
@@ -843,7 +843,7 @@ async function handleDoctor(): Promise<Envelope<unknown>> {
     report.chromium = false
   }
   try {
-    const root = path.join(os.homedir(), '.uab')
+    const root = path.join(os.homedir(), '.moxxie')
     await fs.mkdir(root, { recursive: true })
     const probe = path.join(root, `.doctor-${process.pid}`)
     await fs.writeFile(probe, 'ok', 'utf8')
@@ -857,13 +857,13 @@ async function handleDoctor(): Promise<Envelope<unknown>> {
 
 function handleSkill(flags: ParsedFlags): Envelope<unknown> {
   const short =
-    'uab — keyless browser automation for AI agents. Lean loop: ' +
+    'moxxie — keyless browser automation for AI agents. Lean loop: ' +
     '`open <url>` -> `snapshot -i` (grounded @eN refs) -> act with `--enable-actions` ' +
     '(`click @eN`, `fill @eN <text>`) -> re-`snapshot` to observe the diff. ' +
     'Read-only by default; actor verbs need `--enable-actions`. IDs are grounded: ' +
     'a stale ref fails loudly (re-snapshot, never guess). Extract is host-run: ' +
     '`extract --schema <json>` prints a bundle you infer over, then `extract resolve --ids <json>` ' +
-    'maps element IDs back to real values. `uab doctor` checks your install.'
+    'maps element IDs back to real values. `moxxie doctor` checks your install.'
   if (flags.full) {
     return ok(
       short +

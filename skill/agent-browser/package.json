@@ -1,13 +1,13 @@
 {
-  "name": "agent-browser",
+  "name": "moxxie",
   "version": "0.1.0",
   "private": true,
   "description": "uab — keyless browser-automation CLI for AI sub-agents, built on Playwright. An agent-browser-compatible superset that never calls a model.",
   "license": "MIT",
-  "author": "ultimate-agent-browser",
+  "author": "moxxie",
   "type": "module",
   "bin": {
-    "uab": "./dist/cli.js"
+    "moxxie": "./dist/cli.js"
   },
   "engines": {
     "node": ">=24"

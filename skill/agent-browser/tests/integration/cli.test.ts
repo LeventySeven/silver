@@ -7,7 +7,7 @@ import { ERRORS } from '../../src/core/errors.js'
 import type { RefMap } from '../../src/perception/refmap.js'
 
 // Unique per run so parallel/retry invocations never collide.
-const NAME = `uab-cli-${process.pid}-${Date.now()}`
+const NAME = `moxxie-cli-${process.pid}-${Date.now()}`
 
 // A page with a heading, a text input, and a button that MUTATES the DOM on
 // click (appends a node → domNodeCount changes → the page-change fingerprint

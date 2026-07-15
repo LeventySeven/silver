@@ -13,7 +13,7 @@
  *
  * `fill` is special (spec §6): `.fill(value)` then re-read `.inputValue()`; on
  * mismatch fall back to `.pressSequentially(value)` (stubborn controlled React
- * inputs). The stamped `data-uab-ref` attribute is cleaned up best-effort after
+ * inputs). The stamped `data-moxxie-ref` attribute is cleaned up best-effort after
  * every act.
  *
  * NO model calls. The page-change flag is computed separately (pagechange.ts);

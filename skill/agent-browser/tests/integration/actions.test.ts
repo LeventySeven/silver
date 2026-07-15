@@ -9,7 +9,7 @@ import { settleAndFingerprint } from '../../src/actuation/pagechange.js'
 import { ERRORS } from '../../src/core/errors.js'
 
 // Unique per run so parallel/retry invocations never collide.
-const NAME = `uab-act-${process.pid}-${Date.now()}`
+const NAME = `moxxie-act-${process.pid}-${Date.now()}`
 
 // A text input, a button that MUTATES the DOM (appends a node -> domNodeCount
 // changes -> the page-change fingerprint changes), and a "guard" button whose

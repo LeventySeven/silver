@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * `uab` CLI dispatcher (plan Task 11, spec §5/§7).
+ * `moxxie` CLI dispatcher (plan Task 11, spec §5/§7).
  *
  * A THIN dispatcher: parse argv, apply the phase-quarantine registry gate, run
  * the handler, and turn any throw into a sanitized failure envelope. All real
@@ -101,8 +101,8 @@ function usage(): Envelope<unknown> {
   return {
     success: true,
     data: {
-      name: 'uab',
-      usage: 'uab <verb> [args] [flags]',
+      name: 'moxxie',
+      usage: 'moxxie <verb> [args] [flags]',
       lean_loop: 'open <url> -> snapshot -i -> (--enable-actions) click/fill @eN -> snapshot',
       verbs: {
         lifecycle: ['open', 'goto', 'navigate', 'close', 'back', 'forward', 'reload'],

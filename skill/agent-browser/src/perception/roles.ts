@@ -2,7 +2,7 @@
  * ARIA role allowlists (plan Task 5).
  *
  * Copied VERBATIM from reference/agent-browser/cli/src/native/snapshot.rs:11-62
- * so `uab` stays a compatible superset of Vercel's grammar. These sets drive
+ * so `moxxie` stays a compatible superset of Vercel's grammar. These sets drive
  * ref-eligibility in the walk:
  *
  *   - INTERACTIVE_ROLES  -> always ref-eligible

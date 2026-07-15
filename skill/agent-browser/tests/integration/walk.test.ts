@@ -3,7 +3,7 @@ import { openSession, connect, closeSession } from '../../src/core/session.js'
 import { snapshotNodes, type SnapNode } from '../../src/perception/walk.js'
 
 // Unique per run so parallel/retry invocations never collide.
-const NAME = `uab-walk-${process.pid}-${Date.now()}`
+const NAME = `moxxie-walk-${process.pid}-${Date.now()}`
 
 const FIXTURE = `<!doctype html>
 <html><body>

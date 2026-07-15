@@ -1,5 +1,5 @@
 /**
- * Public API barrel for the `uab` package. Later batches import these symbols;
+ * Public API barrel for the `moxxie` package. Later batches import these symbols;
  * keep the surface stable.
  */
 export type { Envelope } from './core/envelope.js'
