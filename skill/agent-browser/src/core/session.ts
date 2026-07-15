@@ -134,6 +134,11 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
     '--disable-session-crashed-bubble',
     // deterministic viewport for reproducible snapshots/screenshots (P0-8)
     `--window-size=${VIEWPORT.width},${VIEWPORT.height}`,
+    // SSRF note (C1): the DNS-rebinding guard is a Node pre-check in egress.ts
+    // (`assertNavigableResolved`), run BEFORE goto/fetch. We deliberately do NOT
+    // pin `--host-resolver-rules` here — it would break legitimate resolution and
+    // `localhost` — so a residual rebind TOCTOU between our lookup and Chromium's
+    // own is accepted and documented (see egress.ts).
     // stealth: never advertise automation (spec §7) — note: NO --enable-automation
     ...(opts.headed ? [] : ['--headless=new']),
     'about:blank',

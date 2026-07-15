@@ -61,7 +61,13 @@ const AB = {
   'login-flow': { vercelExpect: ['Login successful'], note: 'both mask the password; uab uses [redacted] (no length leak)' },
   'extract-grounding': { unsupported: 'Vercel has no extract verb', note: 'uab-only: ID-grounded extract --schema' },
   'hallucination-trap': { vercelExpect: ['Example Domain'], note: '' },
-  'injection-neutralized': { vercelExpect: ['PROMPT_INJECTION_NEUTRALIZED'], note: 'uab-only: prompt-injection neutralization (Vercel returns raw <system> tags)' },
+  // Graded on a FORMAT-NEUTRAL expectation (fix I5): the old check demanded
+  // moxxie's OWN `PROMPT_INJECTION_NEUTRALIZED` token — a sentinel Vercel can
+  // never emit, so the Vercel side was rigged to fail. We instead assert the raw
+  // `<system>` tag SURVIVES in Vercel's output: Vercel passes forged transcript
+  // tags through verbatim (it "passes") while moxxie neutralizes them — an honest
+  // A/B where each CLI is judged on what a correct-for-its-design tool produces.
+  'injection-neutralized': { vercelExpect: ['<system>'], note: 'uab neutralizes forged <system> tags; Vercel passes them through raw' },
 }
 
 function parseArgs(argv) {
@@ -178,15 +184,22 @@ async function main() {
   const uabK = (uabPass / tasks.length).toFixed(3)
   const vcK = haveVercel && vcExpressible > 0 ? (vcPass / vcExpressible).toFixed(3) : 'n/a'
   console.log('')
-  console.log('# capabilities uab has that Vercel does NOT (verified live):')
-  console.log('#   - trifecta-by-default: uab denies file:// egress; Vercel opens file:///etc/passwd')
-  console.log('#   - prompt-injection neutralization + content-boundary fencing; Vercel passes <system> tags raw')
-  console.log('#   - ID-grounded `extract --schema` (fabricated URLs structurally impossible); Vercel has no extract')
-  console.log('#   - diff-when-shorter snapshots + generation-stamped stale-ref grounding gate')
+  console.log('# capability deltas (honest labeling of evidence — fix M4):')
+  console.log('#   TASK-VERIFIED by a scripted task in THIS run (see the table above):')
+  console.log('#     - prompt-injection: `injection-neutralized` — uab emits [PROMPT_INJECTION_NEUTRALIZED]')
+  console.log('#       + boundary fences; Vercel surfaces the raw <system> tag (graded format-neutrally).')
+  console.log('#     - extract: `extract-grounding` — uab has ID-grounded `extract --schema`; Vercel')
+  console.log('#       has no extract verb (marked N/A above).')
+  console.log('#   ASSERTED-BY-DESIGN (proven by the unit/trifecta suites, NOT by a task in this harness):')
+  console.log('#     - trifecta-by-default: uab denies file:// egress on default flags (trifecta.mjs test 1).')
+  console.log('#     - generation-stamped stale-@ref grounding gate + diff-when-shorter snapshots.')
+  console.log('#   (To promote an asserted delta to task-verified, add a task driving both CLIs')
+  console.log('#    through file:// and a stale-@ref click.)')
   console.log('')
   console.log(`# SUMMARY: uab pass_k=${uabK} (${uabPass}/${tasks.length}) vs vercel pass_k=${vcK}` +
     (haveVercel ? ` (${vcPass}/${vcExpressible} expressible; extract N/A on Vercel)` : ' (Vercel not run)') +
-    ` — uab uniquely ships extract + trifecta-by-default + injection-neutralization.`)
+    ` — task-verified deltas: injection-neutralization + extract. Egress/grounding deltas are` +
+    ` asserted-by-design (see the unit + trifecta suites).`)
   process.exit(0)
 }
 

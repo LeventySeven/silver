@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest'
-import { assertNavigable, assertContainedPath } from '../../src/security/egress.js'
+import {
+  assertNavigable,
+  assertNavigableResolved,
+  assertContainedPath,
+  type DnsLookupAll,
+} from '../../src/security/egress.js'
 import { neutralize, capOutput } from '../../src/security/injection.js'
 import { buildRegistry, isDispatchable } from '../../src/security/registry.js'
 import {
@@ -117,6 +122,102 @@ describe('egress: allowedDomains suffix match (never substring)', () => {
 
   it('empty allowedDomains array behaves as denylist default (allowed)', () => {
     expect(assertNavigable('https://example.com/', opts([]))).toEqual({ ok: true })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// egress: assertNavigableResolved — DNS-rebinding SSRF close (fix C1)
+// ---------------------------------------------------------------------------
+describe('egress: assertNavigableResolved (DNS-rebinding SSRF guard)', () => {
+  const base = { allowFile: false }
+  /** Injectable resolver stub: return these addresses for any host. */
+  const lookupTo =
+    (addrs: string[]): DnsLookupAll =>
+    async () =>
+      addrs.map((address) => ({ address, family: address.includes(':') ? 6 : 4 }))
+
+  it('denies a public hostname that RESOLVES to loopback (nip.io-style rebind)', async () => {
+    const r = await assertNavigableResolved('http://127-0-0-1.nip.io/', base, lookupTo(['127.0.0.1']))
+    expect(r.ok).toBe(false)
+  })
+
+  it('denies a public hostname resolving to the cloud-metadata link-local IP', async () => {
+    const r = await assertNavigableResolved(
+      'http://169.254.169.254.nip.io/latest/meta-data/',
+      base,
+      lookupTo(['169.254.169.254']),
+    )
+    expect(r.ok).toBe(false)
+  })
+
+  it('denies when ANY of several resolved addresses is private (rebind race)', async () => {
+    const r = await assertNavigableResolved(
+      'http://mixed.example/',
+      base,
+      lookupTo(['93.184.216.34', '10.0.0.5']),
+    )
+    expect(r.ok).toBe(false)
+  })
+
+  it('denies IPv4-mapped-IPv6 loopback (::ffff:127.0.0.1)', async () => {
+    const r = await assertNavigableResolved('http://sneaky.example/', base, lookupTo(['::ffff:127.0.0.1']))
+    expect(r.ok).toBe(false)
+  })
+
+  it('denies IPv6 unique-local (fc00::/7) and link-local (fe80::/10)', async () => {
+    expect((await assertNavigableResolved('http://a.example/', base, lookupTo(['fd12:3456::1']))).ok).toBe(false)
+    expect((await assertNavigableResolved('http://b.example/', base, lookupTo(['fe80::1']))).ok).toBe(false)
+  })
+
+  it('allows a normal public host (resolves only to public addresses)', async () => {
+    const r = await assertNavigableResolved('https://example.com/', base, lookupTo(['93.184.216.34']))
+    expect(r.ok).toBe(true)
+  })
+
+  it('allows localhost by NAME without resolving (explicit loopback, not a rebind vector)', async () => {
+    let called = false
+    const r = await assertNavigableResolved('http://localhost:8080/', base, async () => {
+      called = true
+      return []
+    })
+    expect(r.ok).toBe(true)
+    expect(called).toBe(false)
+  })
+
+  it('runs the LEXICAL gate first — file:// is denied before any DNS lookup', async () => {
+    let called = false
+    const r = await assertNavigableResolved('file:///etc/passwd', base, async () => {
+      called = true
+      return []
+    })
+    expect(r.ok).toBe(false)
+    expect(called).toBe(false)
+  })
+
+  it('fails closed when DNS resolution errors', async () => {
+    const r = await assertNavigableResolved('http://broken.example/', base, async () => {
+      throw new Error('ENOTFOUND')
+    })
+    expect(r.ok).toBe(false)
+  })
+
+  it('fails closed when DNS returns no addresses', async () => {
+    const r = await assertNavigableResolved('http://empty.example/', base, lookupTo([]))
+    expect(r.ok).toBe(false)
+  })
+
+  it('a host in --allowed-domains bypasses the resolution check (operator opt-in)', async () => {
+    let called = false
+    const r = await assertNavigableResolved(
+      'http://internal.corp.example/',
+      { allowFile: false, allowedDomains: ['corp.example'] },
+      async () => {
+        called = true
+        return [{ address: '10.1.2.3', family: 4 }]
+      },
+    )
+    expect(r.ok).toBe(true)
+    expect(called).toBe(false)
   })
 })
 
@@ -380,11 +481,6 @@ describe('confirm: requiresConfirm', () => {
     expect(requiresConfirm('scroll')).toBe(false)
     expect(requiresConfirm('hover')).toBe(false)
     expect(requiresConfirm('snapshot')).toBe(false)
-  })
-
-  it('honors destructive/paid context flags for otherwise-benign verbs', () => {
-    expect(requiresConfirm('hover', { destructive: true })).toBe(true)
-    expect(requiresConfirm('scroll', { paid: true })).toBe(true)
   })
 
   it('MUTATING_VERBS is a Set tagging download/upload/eval', () => {

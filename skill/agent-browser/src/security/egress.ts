@@ -21,6 +21,8 @@
  * route around it (red-team aside-05 #8: put the hard deny at the lowest layer).
  */
 import * as path from 'node:path'
+import * as dns from 'node:dns'
+import * as net from 'node:net'
 import type { ErrorCode } from '../core/errors.js'
 
 /** Guaranteed to be a real member of the error taxonomy. */
@@ -133,6 +135,146 @@ function matchesAnySuffix(host: string, domains: readonly string[]): boolean {
   for (const d of domains) {
     if (host === d || host.endsWith('.' + d)) return true
   }
+  return false
+}
+
+/** Normalize an `--allowed-domains` list (trim, lowercase, strip leading dots). */
+function normalizeAllowed(allowed?: string[]): string[] {
+  if (!allowed || allowed.length === 0) return []
+  return allowed
+    .map((d) => d.trim().toLowerCase().replace(/^\.+/, ''))
+    .filter((d) => d.length > 0)
+}
+
+// ---------------------------------------------------------------------------
+// DNS-rebinding SSRF close (red-team C1).
+//
+// The lexical `assertNavigable` denies RAW-IP literals but a PUBLIC hostname
+// that RESOLVES to a private/metadata address slips through: e.g.
+// `http://169.254.169.254.nip.io/` or `http://127.0.0.1.nip.io/` (real public
+// wildcard-DNS) are ordinary hostnames lexically, yet resolve to the cloud
+// metadata endpoint / loopback. `assertNavigableResolved` runs the lexical gate
+// AND resolves the host, denying if ANY address is loopback/link-local/private/
+// reserved — unless the operator opted the domain in via `--allowed-domains`.
+//
+// Residual TOCTOU (accepted, documented): Chromium performs its OWN resolution
+// when it navigates, so a hostile authoritative server could rebind between our
+// lookup and Chromium's. The Node pre-check is the guard we ship; a full close
+// would need `--host-resolver-rules` pinning, which would break legitimate
+// resolution (and `localhost`) and is not adopted.
+// ---------------------------------------------------------------------------
+
+/** A resolved address (mirrors the shape of Node's `dns.LookupAddress`). */
+export type ResolvedAddress = { address: string; family: number }
+
+/** Injectable resolver (default: `dns.promises.lookup(host,{all:true})`). */
+export type DnsLookupAll = (host: string) => Promise<ResolvedAddress[]>
+
+const defaultLookupAll: DnsLookupAll = async (host) => {
+  const res = await dns.promises.lookup(host, { all: true })
+  return res.map((r) => ({ address: r.address, family: r.family }))
+}
+
+/**
+ * `localhost` / `*.localhost` are RFC 6761 special-use loopback names. They are
+ * NOT a DNS-rebinding vector (a rebind hides a private IP behind a PUBLIC name);
+ * the agent typed the loopback name explicitly, and the lexical gate already
+ * permits it. We preserve that and skip resolution for these names. (A raw
+ * `127.0.0.1` literal stays denied by the lexical IP gate.)
+ */
+function isExplicitLoopbackName(host: string): boolean {
+  return host === 'localhost' || host.endsWith('.localhost')
+}
+
+/**
+ * Async navigability guard: the lexical `assertNavigable` PLUS a DNS resolution
+ * check that denies any host resolving to a non-public address. Never throws.
+ *
+ * @param lookup  injectable resolver (tests pass a stub; prod uses OS DNS).
+ */
+export async function assertNavigableResolved(
+  url: string,
+  opts: EgressOptions,
+  lookup: DnsLookupAll = defaultLookupAll,
+): Promise<NavigableResult> {
+  // (a) LEXICAL gate first — scheme / raw-IP / dangerous-host / allowlist. If it
+  // denies, we are done (and never resolve DNS for an already-denied target).
+  const lexical = assertNavigable(url, opts)
+  if (!lexical.ok) return lexical
+
+  // Only http(s) targets carry a resolvable host. A lifted `file:` nav has no
+  // host and was already vetted lexically — permit it unchanged.
+  let host: string
+  let scheme: string
+  try {
+    const u = new URL(url.trim())
+    scheme = u.protocol.replace(/:$/, '').toLowerCase()
+    host = u.hostname.toLowerCase()
+  } catch {
+    return DENY
+  }
+  if (scheme !== 'http' && scheme !== 'https') return lexical
+  if (host.length === 0) return DENY
+  const bareHost = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host
+
+  // Explicit loopback names are not a rebinding vector (see above).
+  if (isExplicitLoopbackName(bareHost)) return ALLOW
+
+  // Operator-trusted domains bypass the resolution check: they may legitimately
+  // point at internal hosts, and the operator opted in via `--allowed-domains`.
+  const allowed = normalizeAllowed(opts.allowedDomains)
+  if (allowed.length > 0 && matchesAnySuffix(bareHost, allowed)) return ALLOW
+
+  // (b) RESOLVE and reject if ANY address is loopback/link-local/private/reserved.
+  let addrs: ResolvedAddress[]
+  try {
+    addrs = await lookup(bareHost)
+  } catch {
+    // Cannot prove the host is safe → fail closed.
+    return DENY
+  }
+  if (addrs.length === 0) return DENY
+  for (const a of addrs) {
+    if (isBlockedAddress(a.address)) return DENY
+  }
+  return ALLOW
+}
+
+/**
+ * True iff `address` is a loopback / link-local / private / reserved IP (v4 or
+ * v6, including IPv4-mapped IPv6). An unparseable address fails closed (true).
+ */
+export function isBlockedAddress(address: string): boolean {
+  if (net.isIPv4(address)) return isBlockedV4(address)
+  if (net.isIPv6(address)) {
+    // IPv4-mapped IPv6 (`::ffff:127.0.0.1`) — judge the embedded v4.
+    const mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i.exec(address)
+    if (mapped) return isBlockedV4(mapped[1])
+    return isBlockedV6(address.toLowerCase())
+  }
+  return true
+}
+
+function isBlockedV4(ip: string): boolean {
+  const parts = ip.split('.').map((p) => Number(p))
+  if (parts.length !== 4 || parts.some((x) => !Number.isInteger(x) || x < 0 || x > 255)) return true
+  const [a, b] = parts
+  if (a === 0) return true // 0.0.0.0/8 — "this host" / reserved
+  if (a === 10) return true // 10/8 private
+  if (a === 127) return true // 127/8 loopback
+  if (a === 169 && b === 254) return true // 169.254/16 link-local (metadata)
+  if (a === 172 && b >= 16 && b <= 31) return true // 172.16/12 private
+  if (a === 192 && b === 168) return true // 192.168/16 private
+  if (a === 100 && b >= 64 && b <= 127) return true // 100.64/10 CGNAT
+  if (a >= 224) return true // 224/4 multicast + 240/4 reserved + 255.255.255.255
+  return false
+}
+
+function isBlockedV6(ip: string): boolean {
+  if (ip === '::' || ip === '::0' || ip === '0:0:0:0:0:0:0:0') return true // unspecified
+  if (ip === '::1' || ip === '0:0:0:0:0:0:0:1') return true // loopback
+  if (/^fe[89ab]/.test(ip)) return true // fe80::/10 link-local
+  if (/^f[cd]/.test(ip)) return true // fc00::/7 unique-local
   return false
 }
 

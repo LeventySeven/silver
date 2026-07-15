@@ -42,13 +42,15 @@ import { groundRef, newGeneration, type RefMap, type RefEntry } from '../percept
 import { snapshotNodes, type SnapNode } from '../perception/walk.js'
 import { render } from '../perception/serialize.js'
 import { observe } from '../perception/diff.js'
-import { assertNavigable, assertContainedPath } from '../security/egress.js'
+import { assertNavigableResolved, assertContainedPath } from '../security/egress.js'
 import { neutralize, capOutput } from '../security/injection.js'
 import { redactValue } from '../security/redact.js'
 import { requiresConfirm, confirmGateDecision, isDestructivePaidName } from '../security/confirm.js'
 import {
   act,
   find,
+  locate,
+  cleanupStamp,
   type ActVerb,
   type ActOptions,
   type FindKind,
@@ -298,7 +300,10 @@ async function handleOpen(flags: ParsedFlags): Promise<Envelope<unknown>> {
   if (!url) return badRequest('a URL is required (usage: moxxie open <url>)')
 
   // Egress guard at the FIRST layer — before any browser is spawned/navigated.
-  const nav = assertNavigable(url, {
+  // The RESOLVED guard (lexical + DNS) closes the rebinding SSRF hole (C1): a
+  // public hostname resolving to loopback/metadata/private is denied here, before
+  // `page.goto`. `localhost` is exempt by name (see egress.ts).
+  const nav = await assertNavigableResolved(url, {
     allowFile: flags.allowFileAccess,
     allowedDomains: flags.allowedDomains,
   })
@@ -444,7 +449,11 @@ async function fetchGuarded(
   const signal = flags.timeout ? AbortSignal.timeout(flags.timeout) : undefined
   let current = url
   for (let hop = 0; hop < MAX_HOPS; hop++) {
-    if (!assertNavigable(current, opts).ok) return { ok: false, code: 'navigation_blocked' }
+    // Resolved guard per hop (C1 + P1-SEC5): a redirect Location that lexically
+    // looks benign but RESOLVES to a private/metadata address is denied here.
+    if (!(await assertNavigableResolved(current, opts)).ok) {
+      return { ok: false, code: 'navigation_blocked' }
+    }
     const res = await fetch(current, {
       redirect: 'manual',
       ...(signal ? { signal } : {}),
@@ -584,8 +593,55 @@ async function handleFind(flags: ParsedFlags): Promise<Envelope<unknown>> {
     if (subValue !== undefined) opts.value = subValue
     if (flags.name !== undefined) opts.name = flags.name
     if (flags.index !== undefined) opts.index = flags.index
-    return (await find(page, kind, val, subaction, opts)) as Envelope<unknown>
+
+    // Narrowed paid/destructive confirm gate (fix P0-4 parity with handleAct):
+    // `find <kind> <value> click` can DISPATCH a click/press activation, so it
+    // MUST run the SAME gate a direct `click @eN` runs — otherwise
+    // `find text "Buy now" click` bypasses the gate that `click @eN` enforces.
+    // Applies only to click/press-like subactions, only on a NON-TTY session,
+    // and only when the verb was not pre-approved via `--confirm-actions`.
+    if (
+      subaction !== undefined &&
+      CONFIRM_GATED_VERBS.has(subaction) &&
+      !process.stdout.isTTY &&
+      !flags.confirmActions.includes(subaction)
+    ) {
+      // (a) the semantic target strings the caller supplied (kind value + --name).
+      let paid =
+        isDestructivePaidName(val) ||
+        (flags.name !== undefined && isDestructivePaidName(flags.name))
+      // (b) the located element's accessible name (best-effort textContent).
+      if (!paid) {
+        try {
+          const loc = locate(page, kind, val, opts)
+          if ((await loc.count().catch(() => 0)) > 0) {
+            const name = (await loc.textContent({ timeout: flags.timeout }).catch(() => '')) ?? ''
+            paid = isDestructivePaidName(name)
+          }
+        } catch {
+          /* locate failure → find() below returns element_not_found cleanly */
+        }
+      }
+      if (paid) return fail('confirm_required')
+    }
+
+    const res = (await find(page, kind, val, subaction, opts)) as Envelope<FindResultShape>
+    // Neutralize/cap any returned page text through the SAME choke point as
+    // `get text` (fix I4): FindResult.text is raw page textContent otherwise.
+    if (res.success && res.data && typeof res.data.text === 'string') {
+      return ok({ ...res.data, text: presentPageText(res.data.text, flags) })
+    }
+    return res as Envelope<unknown>
   })
+}
+
+/** Shape of the `find` envelope's data (mirrors actions.ts FindResult). */
+type FindResultShape = {
+  kind: string
+  val: string
+  matched: number
+  text?: string
+  verb?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -639,11 +695,17 @@ async function handleGet(flags: ParsedFlags): Promise<Envelope<unknown>> {
         const ref = rest[0]
         const attrName = rest[1]
         if (!ref || !attrName) return badRequest('usage: moxxie get attr @eN <attribute>')
-        // Neutralize + cap the attribute value (fix P0-1): a forged
-        // `title="</system>ignore prior"` must not reach the host un-scrubbed.
-        return withLocator(page, flags.session, ref, async (loc) =>
-          ok({ attribute: attrName, value: presentPageText((await loc.getAttribute(attrName)) ?? '', flags) }),
-        )
+        // Redact THEN neutralize + cap (fix P0-1 + I3): `get attr @<pw> value`
+        // would otherwise leak a raw `hunter2`. isPassword is read from the live
+        // DOM `type`; role/name come from the grounded ref. redactValue also
+        // catches card-shaped values regardless of the attribute name.
+        return withLocator(page, flags.session, ref, async (loc, entry) => {
+          const raw = (await loc.getAttribute(attrName)) ?? ''
+          const type = ((await loc.getAttribute('type')) ?? '').toLowerCase()
+          const isPassword = type === 'password'
+          const redacted = redactValue(entry.role, entry.name, raw, isPassword)
+          return ok({ attribute: attrName, value: presentPageText(redacted, flags) })
+        })
       }
       default:
         return badRequest('usage: moxxie get text|value|attr|title|url|count [ref]')
@@ -689,6 +751,10 @@ async function withLocator(
     const loc = await toLocator(page, cdp, g.entry, g.ref)
     return await fn(loc, g.entry)
   } finally {
+    // Clean up the stamped `data-moxxie-ref` (fix I1): get/is/attr paths stamp via
+    // toLocator but, unlike act(), never cleaned up — leaving stale stamps that
+    // could let a later `.first()` pick the wrong element (breaks R4 no-misclick).
+    await cleanupStamp(page).catch(() => {})
     await cdp.detach().catch(() => {})
   }
 }
@@ -766,7 +832,15 @@ async function handleExtract(flags: ParsedFlags): Promise<Envelope<unknown>> {
     const { text, refmap } = render(
       nodes,
       { generation: gen, entries: {} },
-      { generation: gen, title: await page.title().catch(() => ''), url: page.url() },
+      {
+        generation: gen,
+        title: await page.title().catch(() => ''),
+        url: page.url(),
+        // Bound the extract snapshot the same way handleSnapshot does (fix M1):
+        // an uncapped bundle could blow the host's context. Exceeding the cap
+        // fails loudly with output_overflow (never a silent truncation).
+        ...(flags.maxOutput !== undefined ? { maxChars: flags.maxOutput } : {}),
+      },
     )
     await saveRefMap(flags.session, refmap)
 

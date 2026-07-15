@@ -343,9 +343,21 @@ function mapActionError(err: unknown): ErrorCode {
   return 'element_not_found'
 }
 
-/** Best-effort removal of every stamped ref attribute (string JS: no DOM lib). */
-async function cleanupStamp(page: Page): Promise<void> {
-  await page.evaluate(
-    `(function(){var e=document.querySelectorAll('[${REF_ATTR}]');for(var i=0;i<e.length;i++){e[i].removeAttribute('${REF_ATTR}');}return e.length;})()`,
-  )
+/**
+ * Best-effort removal of every stamped ref attribute (string JS: no DOM lib).
+ *
+ * Runs in EVERY frame (fix I2): `page.evaluate` alone touches only the main
+ * frame, so an iframe-scoped stamp would leak permanently. We mirror
+ * locateStamped's frame loop so a stamp landed in a child frame is also cleared.
+ * Idempotent and non-throwing — safe to call from any read/act/wait finally.
+ */
+export async function cleanupStamp(page: Page): Promise<void> {
+  const js = `(function(){var e=document.querySelectorAll('[${REF_ATTR}]');for(var i=0;i<e.length;i++){e[i].removeAttribute('${REF_ATTR}');}return e.length;})()`
+  for (const frame of page.frames()) {
+    try {
+      await frame.evaluate(js)
+    } catch {
+      /* frame detached / cross-origin / navigating — best effort, never throw */
+    }
+  }
 }

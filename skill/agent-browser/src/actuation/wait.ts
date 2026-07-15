@@ -19,6 +19,7 @@ import type { Page, Locator, CDPSession } from 'playwright'
 import type { RefMap } from '../perception/refmap.js'
 import { groundRef } from '../perception/refmap.js'
 import { toLocator } from './resolve.js'
+import { cleanupStamp } from './actions.js'
 
 export type WaitState = 'attached' | 'detached' | 'visible' | 'hidden'
 
@@ -62,7 +63,13 @@ export async function waitFor(page: Page, spec: WaitSpec): Promise<void> {
     const g = groundRef(spec.refmap, spec.ref)
     if (!g.ok) throw new WaitError(g.code)
     const loc: Locator = await toLocator(page, spec.cdp, g.entry, g.ref)
-    await loc.waitFor({ state: spec.state ?? 'visible', timeout: spec.timeout })
+    // Clean up the stamped `data-moxxie-ref` (fix I1): toLocator stamps here too,
+    // and only act() cleaned up — a leaked stamp can mis-anchor a later locate.
+    try {
+      await loc.waitFor({ state: spec.state ?? 'visible', timeout: spec.timeout })
+    } finally {
+      await cleanupStamp(page).catch(() => {})
+    }
     return
   }
   if ('text' in spec) {

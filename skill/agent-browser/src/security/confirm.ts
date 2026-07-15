@@ -43,11 +43,6 @@ export const MUTATING_VERBS: Set<string> = new Set<string>([
   'dialog',
 ])
 
-export type ConfirmContext = {
-  destructive?: boolean
-  paid?: boolean
-}
-
 /**
  * NARROW paid/destructive accessible-name lexicon (spec §7, red-team P0-4).
  *
@@ -66,12 +61,13 @@ export function isDestructivePaidName(name: string): boolean {
 }
 
 /**
- * Whether `verb` requires confirmation. True when the verb is a mutating verb,
- * or the caller has flagged this specific invocation as destructive or paid
- * (e.g. an otherwise-benign verb landing on a "Buy" / "Delete" control).
+ * Whether `verb` requires confirmation: true iff `verb` is a mutating verb.
+ *
+ * The paid/destructive-name check is a SEPARATE gate (`isDestructivePaidName`,
+ * applied post-grounding in the handlers), so there is no per-invocation context
+ * to thread through here.
  */
-export function requiresConfirm(verb: string, ctx?: ConfirmContext): boolean {
-  if (ctx?.destructive === true || ctx?.paid === true) return true
+export function requiresConfirm(verb: string): boolean {
   return MUTATING_VERBS.has(verb)
 }
 

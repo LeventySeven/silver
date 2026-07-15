@@ -196,6 +196,53 @@ describe('security hardening (real Chromium via the run() entry)', () => {
     expect(cont.env.success).toBe(true)
   })
 
+  // --- Fix P0-4 parity (C2): `find <kind> <value> click` runs the SAME confirm
+  //     gate a direct `click @eN` runs — else find bypasses the paid/destructive gate.
+  it('confirm gate parity: find text "Buy now" click is gated like a direct click', async () => {
+    await run(['open', base + '/buy.html', '--session', NAME])
+
+    // Denied by default (non-TTY, no --confirm-actions) BEFORE any dispatch.
+    const denied = await run(['find', 'text', 'Buy now', 'click', '--enable-actions', '--session', NAME])
+    expect(denied.env.success).toBe(false)
+    expect(denied.env.error).toBe(ERRORS.confirm_required.message)
+
+    // Pre-approved via --confirm-actions click → the located control is clicked.
+    const approved = await run([
+      'find',
+      'text',
+      'Buy now',
+      'click',
+      '--enable-actions',
+      '--confirm-actions',
+      'click',
+      '--session',
+      NAME,
+    ])
+    expect(approved.env.success).toBe(true)
+
+    // An ordinary control located by text is never gated.
+    const cont = await run(['find', 'text', 'Continue', 'click', '--enable-actions', '--session', NAME])
+    expect(cont.env.success).toBe(true)
+  })
+
+  // --- Fix I3: `get attr @<pw> value` redacts the password value (only get value
+  //     / snapshot redacted before). Card-shaped values are caught by name too.
+  it('get attr redacts a password field value regardless of attribute name', async () => {
+    const map = await snapshotMap('/pw.html')
+    const pinRef = refByName(map, 'Card PIN')
+
+    const ga = await run(['get', 'attr', `@${pinRef}`, 'value', '--session', NAME])
+    expect(ga.env.success).toBe(true)
+    const v = (ga.env.data as { value: string }).value
+    expect(v).not.toContain('hunter2')
+    expect(v).toContain('[redacted]')
+
+    // A normal text field's attribute is NOT over-redacted.
+    const cityRef = refByName(map, 'City')
+    const gc = await run(['get', 'attr', `@${cityRef}`, 'value', '--session', NAME])
+    expect((gc.env.data as { value: string }).value).toContain('Paris')
+  })
+
   // --- Fix P0-7: dialogs are auto-ACCEPTED (not silently dismissed) and surfaced.
   it('a confirm() dialog is accepted (not dismissed) and reported by dialog status', async () => {
     const map = await snapshotMap('/dialog.html')

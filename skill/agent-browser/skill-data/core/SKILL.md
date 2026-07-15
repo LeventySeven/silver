@@ -110,9 +110,9 @@ prevents Playwright's default silent-cancel from swallowing a `confirm("delete?"
 
 ### NOT IMPLEMENTED — do not call
 `tab`, `frame`, `network`, `pdf` return a clean `"not implemented in v1"` error. The
-registry also lists `keyboard`/`mouse`/`keydown`/`keyup`/`eval`/`download`/`set` but they
-have no handler — they too return `"not implemented in v1"`. Do not advertise or attempt
-these. There is no multi-tab, cross-frame, request-interception, or PDF support yet.
+registry also lists `keyboard`/`mouse`/`keydown`/`keyup`/`eval`/`download`/`set`/`scrollintoview`
+but they have no handler — they too return `"not implemented in v1"`. Do not advertise or
+attempt these. There is no multi-tab, cross-frame, request-interception, or PDF support yet.
 
 ## `find` — semantic locators (skip the snapshot when the target is obvious)
 
