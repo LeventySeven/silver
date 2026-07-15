@@ -1,0 +1,16 @@
+{
+  "id": "heading-get-text",
+  "task": "Open the links fixture, snapshot it, then read the heading's text by its @ref.",
+  "start_url": "{BASE}/links.html",
+  "script": [
+    ["snapshot", "-i"],
+    ["get", "text", "@e1"]
+  ],
+  "expectedPatterns": [
+    "Docs Index"
+  ],
+  "forbiddenPatterns": [
+    "element_not_found",
+    "refs are stale"
+  ]
+}

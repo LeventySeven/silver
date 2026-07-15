@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Login Fixture</title></head>
+<body>
+  <!--
+    A login form WITH a password. Deterministic snapshot -i refs:
+      e1 = heading "Sign in"
+      e2 = textbox "username"
+      e3 = textbox "password"  (value "hunter2" -> serializer emits [redacted])
+      e4 = button "Sign in"
+    Clicking @e4 reveals "Login successful for <username>" in #msg (the eval
+    fills @e2 then asserts the post-submit text). The password value MUST NEVER
+    appear in snapshot / get-text output (trifecta test 3).
+  -->
+  <h1>Sign in</h1>
+  <form onsubmit="return false">
+    <input type="text" name="user" aria-label="username" placeholder="username">
+    <input type="password" name="pass" aria-label="password" value="hunter2">
+    <button type="button"
+            onclick="document.getElementById('msg').textContent =
+                     'Login successful for ' + document.querySelector('[name=user]').value">Sign in</button>
+  </form>
+  <div id="msg"></div>
+</body>
+</html>

@@ -1,0 +1,19 @@
+{
+  "id": "login-flow",
+  "task": "Open the login fixture, fill the username, submit, and confirm the post-submit success message. The pre-filled password must never leak.",
+  "start_url": "{BASE}/login.html",
+  "enableActions": true,
+  "script": [
+    ["snapshot", "-i"],
+    ["fill", "@e2", "alice"],
+    ["click", "@e4"],
+    ["get", "text"]
+  ],
+  "expectedPatterns": [
+    "Login successful for alice",
+    "\\[redacted\\]"
+  ],
+  "forbiddenPatterns": [
+    "hunter2"
+  ]
+}

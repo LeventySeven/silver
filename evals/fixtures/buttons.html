@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Buttons Fixture</title></head>
+<body>
+  <!--
+    A "button that mutates the page" fixture. Deterministic snapshot -i refs:
+      e1 = heading "Counter Panel"
+      e2 = button "Activate"
+    Clicking @e2 sets #status text to ACTIVATED (a real DOM mutation an eval
+    can observe via a follow-up `get text`).
+  -->
+  <h1>Counter Panel</h1>
+  <p>Status: <span id="status">idle</span></p>
+  <button type="button"
+          onclick="document.getElementById('status').textContent='ACTIVATED'">Activate</button>
+</body>
+</html>

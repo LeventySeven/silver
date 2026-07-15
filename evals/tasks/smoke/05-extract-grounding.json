@@ -1,0 +1,16 @@
+{
+  "id": "extract-grounding",
+  "task": "Extract the links from the links fixture with a url-bearing schema. The host-facing bundle must expose grounded element IDs (the ^\\d+-\\d+ shape) instead of a raw href.",
+  "start_url": "{BASE}/links.html",
+  "script": [
+    ["extract", "--schema", "{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\"},\"url\":{\"type\":\"string\",\"format\":\"uri\"}}}"]
+  ],
+  "expectedPatterns": [
+    "id=\\d+-\\d+",
+    "the element ID of the link",
+    "\"pattern\""
+  ],
+  "forbiddenPatterns": [
+    "grounding-secret\\.example"
+  ]
+}

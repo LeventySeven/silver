@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Links Fixture</title></head>
+<body>
+  <!--
+    A list-of-links page. Deterministic snapshot -i refs:
+      e1 = heading "Docs Index"
+      e2 = link "Alpha Guide"  (href points at grounding-secret.example)
+      e3 = link "Beta Guide"
+    The hrefs use the host `grounding-secret.example` so the extract grounding
+    task can PROVE the host-facing bundle never leaks a raw href: extract emits
+    `id=<gen>-<n>` element IDs (the ^\d+-\d+$ shape) and strips the real URLs.
+  -->
+  <h1>Docs Index</h1>
+  <ul>
+    <li><a href="https://grounding-secret.example/alpha">Alpha Guide</a></li>
+    <li><a href="https://grounding-secret.example/beta">Beta Guide</a></li>
+  </ul>
+</body>
+</html>

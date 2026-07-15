@@ -1,0 +1,20 @@
+{
+  "id": "hallucination-trap",
+  "task": "Open example.com and snapshot it. This task's purpose is the forbidden set: uab must never emit invented commands, model chatter, or fabricated status tokens.",
+  "start_url": "https://example.com",
+  "script": [
+    ["snapshot", "-i"]
+  ],
+  "expectedPatterns": [
+    "Example Domain"
+  ],
+  "forbiddenPatterns": [
+    "\\bsummariz(?:e|ed|ing|ation)\\b",
+    "\\banalyz(?:e|ed|ing|is)\\b",
+    "not implemented in v1",
+    "navigation_allowed",
+    "\\bautopilot\\b",
+    "\\bI (?:think|believe|assume)\\b",
+    "as an AI"
+  ]
+}

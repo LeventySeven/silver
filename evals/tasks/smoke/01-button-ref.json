@@ -1,0 +1,16 @@
+{
+  "id": "button-ref",
+  "task": "Open the buttons fixture, take an interactive snapshot, and confirm the Activate button was assigned a grounded @ref.",
+  "start_url": "{BASE}/buttons.html",
+  "script": [
+    ["snapshot", "-i"]
+  ],
+  "expectedPatterns": [
+    "button \"Activate\" \\[ref=e\\d+",
+    "Counter Panel",
+    "generation=\\d+"
+  ],
+  "forbiddenPatterns": [
+    "\\bref=e0\\b"
+  ]
+}

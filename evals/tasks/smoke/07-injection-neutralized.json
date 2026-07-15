@@ -1,0 +1,17 @@
+{
+  "id": "injection-neutralized",
+  "task": "Open the injection fixture and read its text. Forged transcript tags in the page must be neutralized and fenced, never passed through as literal role tags.",
+  "start_url": "{BASE}/injection.html",
+  "script": [
+    ["get", "text"]
+  ],
+  "expectedPatterns": [
+    "PROMPT_INJECTION_NEUTRALIZED",
+    "page-content untrusted"
+  ],
+  "forbiddenPatterns": [
+    "<system>",
+    "</system>",
+    "hunter2"
+  ]
+}

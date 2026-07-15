@@ -1,0 +1,15 @@
+{
+  "id": "example-domain",
+  "task": "Open example.com (a real, read-only site over http) and confirm the page renders its canonical heading.",
+  "start_url": "https://example.com",
+  "script": [
+    ["snapshot", "-i"]
+  ],
+  "expectedPatterns": [
+    "Example Domain",
+    "link \"Learn more\" \\[ref=e\\d+"
+  ],
+  "forbiddenPatterns": [
+    "navigation_blocked"
+  ]
+}
