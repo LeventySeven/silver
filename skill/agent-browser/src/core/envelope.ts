@@ -30,8 +30,10 @@ export function ok<T>(data: T, warning?: string): Envelope<T> {
  * so no path / host / secret can ever leak into `error`. This is the no-leak
  * invariant enforced by tests/unit/errors.test.ts (and later no-leak.test.ts).
  */
-export function fail(code: ErrorCode, ctx?: Record<string, unknown>): Envelope<null> {
+export function fail(code: ErrorCode, ctx?: Record<string, unknown>): Envelope<never> {
   // ctx is intentionally unused in the message body — see the doc comment.
+  // Returns Envelope<never> so a failure is assignable to any Envelope<T> a
+  // command handler is declared to return, without a cast.
   void ctx
   const entry = ERRORS[code]
   const message = entry ? entry.message : 'an unknown error occurred'
