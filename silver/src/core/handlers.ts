@@ -1635,9 +1635,12 @@ async function coordDrag(
   to: { x: number; y: number },
 ): Promise<void> {
   if (coordActions.coordDrag) return void (await coordActions.coordDrag(page, from.x, from.y, to.x, to.y))
+  // Fallback parity with actions.ts coordDrag (S8): interpolate the middle move
+  // so DnD libs see intermediate `mousemove`s instead of a single teleport.
+  const steps = Math.round(Math.min(20, Math.max(5, Math.hypot(to.x - from.x, to.y - from.y) / 40)))
   await page.mouse.move(from.x, from.y)
   await page.mouse.down()
-  await page.mouse.move(to.x, to.y)
+  await page.mouse.move(to.x, to.y, { steps })
   await page.mouse.up()
 }
 

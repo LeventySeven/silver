@@ -23,7 +23,7 @@ import type { Page, Locator, CDPSession } from 'playwright'
 import type { RefMap } from '../perception/refmap.js'
 import { groundRef } from '../perception/refmap.js'
 import { ok, fail, type Envelope } from '../core/envelope.js'
-import type { ErrorCode } from '../core/errors.js'
+import { classifyEngineError, type ErrorCode } from '../core/errors.js'
 import { redactValue, REDACTED } from '../security/redact.js'
 import type { SecretRegistry } from '../security/secret.js'
 import { resolveTotpTokens, hasTotpToken } from '../security/totp.js'
@@ -420,14 +420,27 @@ function withForce(opts: ActOptions): { force?: boolean; timeout?: number } {
   return o
 }
 
-/** Map a thrown error (Playwright or ActionError) to an envelope ErrorCode. */
+/**
+ * Map a thrown error (Playwright or ActionError) to an envelope ErrorCode.
+ *
+ * The `ActionError`, `TimeoutError` (name-based), and pointer-intercept checks
+ * are kept ahead of `classifyEngineError` — they are more specific and the
+ * message-needle classifier does not cover them. `classifyEngineError` then
+ * catches the classes the old narrow `/crash/i` regex missed: a mid-action
+ * transport death ("Target closed"/"websocket closed" → `page_crash`, retryable
+ * so the host's reload → session respawn recovers instead of re-snapshotting a
+ * DEAD session forever), a wrong-element-type throw (`wrong_element_type`), and
+ * an unreachable-host `net::ERR_*` (`navigation_failed`). `element_not_found`
+ * stays the final default for a genuinely unclassified miss.
+ */
 function mapActionError(err: unknown): ErrorCode {
   if (err instanceof ActionError) return err.code
   const name = err instanceof Error ? err.name : ''
   const msg = err instanceof Error ? err.message : ''
   if (name === 'TimeoutError') return 'timeout'
   if (/intercepts pointer events|subtree intercepts/i.test(msg)) return 'element_obscured'
-  if (/crash/i.test(msg)) return 'page_crash'
+  const classified = classifyEngineError(err)
+  if (classified !== null) return classified
   return 'element_not_found'
 }
 
@@ -510,7 +523,16 @@ export async function coordType(
   }
 }
 
-/** Press-drag from (x1,y1) to (x2,y2) via page.mouse (no ref, no locator). */
+/**
+ * Press-drag from (x1,y1) to (x2,y2) via page.mouse (no ref, no locator).
+ *
+ * The middle move is INTERPOLATED into N steps (S8): a single teleporting
+ * `mouse.move(x2,y2)` fires only one intermediate `mousemove`, and drag-and-drop
+ * libraries (SortableJS, range sliders, HTML5 DnD) require intermediate
+ * `mousemove` events to register the drag — so the drop no-ops while we still
+ * returned `success:true`. Playwright's native `{ steps }` fires the intermediate
+ * `mousemove`s those libs need. Step count scales with distance (5..20).
+ */
 export async function coordDrag(
   page: Page,
   x1: number,
@@ -518,10 +540,11 @@ export async function coordDrag(
   x2: number,
   y2: number,
 ): Promise<Envelope<CoordResult>> {
+  const steps = Math.round(Math.min(20, Math.max(5, Math.hypot(x2 - x1, y2 - y1) / 40)))
   try {
     await page.mouse.move(x1, y1)
     await page.mouse.down()
-    await page.mouse.move(x2, y2)
+    await page.mouse.move(x2, y2, { steps })
     await page.mouse.up()
     return ok({ verb: 'drag', x: x1, y: y1, x2, y2 })
   } catch (err) {

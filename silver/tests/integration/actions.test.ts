@@ -246,4 +246,72 @@ describe('actuation (real Chromium, Playwright delegation + stale-ref guard)', (
       }
     },
   )
+
+  it(
+    'coordDrag interpolates the middle move so DnD-style intermediate mousemoves fire (S8)',
+    async () => {
+      const S = `${NAME}-drag-interp`
+      await openSession(S, { headed: false })
+      const { browser, page } = await connect(S)
+      try {
+        // A document-level mousemove counter. The OLD single-teleport code fired
+        // only the two endpoint moves (which DnD libs miss); the interpolated
+        // drag fires the initial move + `steps` intermediate mousemoves.
+        await page.setContent(
+          `<!doctype html><html><body style="margin:0">
+             <div id="pad" style="width:800px;height:400px"></div>
+             <script>
+               window.__moves = 0;
+               document.addEventListener('mousemove', function(){ window.__moves++; });
+             </script>
+           </body></html>`,
+          { waitUntil: 'load' },
+        )
+
+        await page.evaluate('window.__moves = 0')
+        // 400px horizontal drag -> steps = round(min(20,max(5,400/40))) = 10.
+        const dragEnv = await coordDrag(page, 100, 100, 500, 100)
+        expect(dragEnv.success).toBe(true)
+
+        const moves = (await page.evaluate('window.__moves')) as number
+        // Teleport would fire ~2 mousemoves; interpolation fires the initial move
+        // plus 10 intermediate ones. Assert well above the 2-move teleport floor.
+        expect(moves).toBeGreaterThan(2)
+        expect(moves).toBeGreaterThanOrEqual(5)
+      } finally {
+        await browser.close()
+        await closeSession(S).catch(() => {})
+      }
+    },
+  )
+})
+
+describe('mapActionError classification via coord verbs (S2)', () => {
+  // A mock Page whose mouse method throws a chosen engine-shaped message, so we
+  // exercise mapActionError's delegation to classifyEngineError through the
+  // public coord path without a real browser.
+  function throwingPage(message: string): import('playwright').Page {
+    const boom = (): never => {
+      throw new Error(message)
+    }
+    return {
+      url: () => 'https://example.com/',
+      mouse: { click: boom, move: boom, down: boom, up: boom },
+      keyboard: { type: boom },
+    } as unknown as import('playwright').Page
+  }
+
+  it('maps a transport-death "Target closed" to page_crash (retryable), not element_not_found', async () => {
+    const env = await coordClick(throwingPage('Target closed'), 10, 10)
+    expect(env.success).toBe(false)
+    expect(env.error).toBe(ERRORS.page_crash.message)
+    expect(env.error).not.toBe(ERRORS.element_not_found.message)
+  })
+
+  it('maps a "Not a checkbox or radio button" throw to wrong_element_type, not element_not_found', async () => {
+    const env = await coordClick(throwingPage('Not a checkbox or radio button'), 10, 10)
+    expect(env.success).toBe(false)
+    expect(env.error).toBe(ERRORS.wrong_element_type.message)
+    expect(env.error).not.toBe(ERRORS.element_not_found.message)
+  })
 })
