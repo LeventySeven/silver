@@ -107,6 +107,7 @@ import {
   settleAndFingerprint,
   fingerprintOnly,
   bumpGenerationOnPageChange,
+  structuralChange,
   detectEmptyPage,
   type SettleMode,
 } from '../actuation/pagechange.js'
@@ -182,6 +183,14 @@ type UabState = {
   generation: number
   /** The most recent snapshot text, for diff-when-shorter observation. */
   prevTree: string | null
+  /**
+   * S1: the render-shape of `prevTree` — a fingerprint of the shape-affecting
+   * snapshot flags (interactive/compact/depth/selector/urls). `prevTree` is only
+   * diff-comparable to a NEW tree taken with the SAME shape; a shape-flip shares
+   * almost no lines, so diffing them would drive the Myers edit distance to
+   * ~N+M. A mismatch (or absence) forces a first-observation FULL tree.
+   */
+  shapeKey?: string
   /** The most recent page fingerprint, for the page_changed flag. */
   fingerprint: string | null
   /** The last extract bundle's reverse-map, keyed to its generation. */
@@ -218,6 +227,35 @@ async function patchState(name: string, patch: Partial<UabState>): Promise<UabSt
   const next: UabState = { ...cur, ...patch }
   await saveState(name, next)
   return next
+}
+
+/**
+ * S1: a fingerprint of the shape-affecting snapshot flags. Two snapshots are only
+ * diff-comparable when this key matches; a shape-flip (e.g. `-i` on then off)
+ * yields a wildly different tree whose diff would drive the Myers edit distance
+ * toward N+M (the OOM path), so a mismatch forces a full-tree first observation.
+ */
+export function snapshotShapeKey(flags: {
+  interactive?: boolean
+  compact?: boolean
+  depth?: number
+  selector?: string
+  urls?: boolean
+}): string {
+  return `${!!flags.interactive}|${!!flags.compact}|${flags.depth ?? ''}|${flags.selector ?? ''}|${!!flags.urls}`
+}
+
+/**
+ * S1: the tree the new snapshot may be diffed against — the stored `prevTree`
+ * ONLY when it exists AND was rendered with the same shape (`shapeKey` matches);
+ * otherwise `null`, which makes `observe` emit the full tree. This is the guard
+ * that keeps the diff path off two differently-shaped trees.
+ */
+export function diffBaseline(
+  prev: { prevTree: string | null; shapeKey?: string } | null | undefined,
+  shapeKey: string,
+): string | null {
+  return prev && prev.prevTree !== null && prev.shapeKey === shapeKey ? prev.prevTree : null
 }
 
 // ---------------------------------------------------------------------------
@@ -1053,6 +1091,10 @@ async function handleSnapshot(flags: ParsedFlags): Promise<Envelope<unknown>> {
     const prevRefmap = await loadRefMap(flags.session)
     const gen = newGeneration(prev?.generation ?? 0)
 
+    // S1: the render-shape of THIS snapshot, from the shape-affecting flags. The
+    // stored prevTree is only diff-comparable to a tree taken with the same shape.
+    const shapeKey = snapshotShapeKey(flags)
+
     // sparse_tree metrics ride the walk's in-page scan (zero extra round-trip) and
     // are filled in place; they are NEVER stored on any RefEntry (geometry stays
     // lazy — red-team #3), so the default serialize path is untouched.
@@ -1078,13 +1120,19 @@ async function handleSnapshot(flags: ParsedFlags): Promise<Envelope<unknown>> {
     )
     await saveRefMap(flags.session, refmap)
 
-    const obsv = observe(prev?.prevTree ?? null, text)
+    // S1 (primary): only diff against the stored tree when it was rendered with
+    // the SAME shape flags. A shape-flip (e.g. `snapshot -i` then `snapshot`)
+    // shares almost no lines with the stored tree, so diffing them would drive the
+    // Myers edit distance to ~N+M — the OOM path. On a mismatch (or when there is
+    // no stored tree) treat this as a first observation and return the FULL tree.
+    const obsv = observe(diffBaseline(prev, shapeKey), text)
     // Read-only observe: NO networkidle settle race (engine-plan P1). The cheap
     // fingerprint still emits the page_changed/stale_refs flag.
     const fp = await fingerprintOnly(page, prev?.fingerprint, gen)
     await saveState(flags.session, {
       generation: gen,
       prevTree: text,
+      shapeKey,
       fingerprint: fp.fingerprint,
       ...(prev?.extract ? { extract: prev.extract } : {}),
     })
@@ -1470,22 +1518,6 @@ async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
       await cdp.detach().catch(() => {})
     }
   })
-}
-
-/**
- * R4 helper: did the act STRUCTURALLY change the page — a URL change or a
- * DOM-node-count change — as opposed to a mere focus shift? The page fingerprint
- * is `url|focusedBackendId|domNodeCount`; a focus-only change (index 1) does not
- * invalidate the current refmap, so it must NOT trigger a generation bump (else a
- * `focus @eN` followed by `get value @eN` would spuriously fail ref_stale). A
- * missing previous fingerprint means "no basis" → not a structural change.
- */
-function structuralChange(prev: string | null | undefined, cur: string): boolean {
-  if (!prev) return false
-  const p = prev.split('|')
-  const c = cur.split('|')
-  // Compare url (index 0) and domNodeCount (last index); ignore focus (index 1).
-  return p[0] !== c[0] || p[p.length - 1] !== c[c.length - 1]
 }
 
 /**

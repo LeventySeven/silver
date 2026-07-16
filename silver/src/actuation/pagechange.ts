@@ -31,9 +31,15 @@ import { newGeneration } from '../perception/refmap.js'
 export type PageChange = {
   /** Echoed session generation, when the caller supplies one. */
   generation?: number
-  /** The fingerprint differs from the previous one. */
+  /** The fingerprint differs from the previous one (url, focus, OR node count). */
   page_changed: boolean
-  /** Alias of page_changed: any change may have invalidated live refs. */
+  /**
+   * A STRUCTURAL change (url or DOM-node-count) may have invalidated live refs —
+   * a focus-only shift does NOT (S7). This mirrors the generation-bump criterion
+   * exactly, so the flag never over-reports: a fill/focus that only moves focus
+   * no longer flips `stale_refs`, and a genuinely stale ref still hard-fails
+   * `ref_stale` via the generation mechanism regardless of this flag.
+   */
   stale_refs: boolean
   /** The freshly computed fingerprint (the CLI stores this as the next prev). */
   fingerprint: string
@@ -71,6 +77,22 @@ export function compareFingerprint(prev: string | null | undefined, cur: string)
 }
 
 /**
+ * Pure STRUCTURAL comparison (S7): did the page change in a way that can
+ * invalidate live refs — a `url` change (index 0) or a `domNodeCount` change
+ * (last index) — as opposed to a mere focus shift (index 1, ignored)? The
+ * fingerprint is `url|focusedBackendId|domNodeCount`. This is the SAME criterion
+ * `bumpGenerationOnPageChange` uses, so the `stale_refs` flag stays consistent
+ * with the actual generation bump. A missing previous fingerprint means "no
+ * basis for comparison" -> not a structural change.
+ */
+export function structuralChange(prev: string | null | undefined, cur: string): boolean {
+  if (prev === null || prev === undefined || prev === '') return false
+  const p = prev.split('|')
+  const c = cur.split('|')
+  return p[0] !== c[0] || p[p.length - 1] !== c[c.length - 1]
+}
+
+/**
  * Settle the page (per `mode`), fingerprint it, and compare to `prev`.
  *
  * @param page       the connected page
@@ -85,8 +107,12 @@ export async function settleAndFingerprint(
   mode: SettleMode = 'default',
 ): Promise<PageChange> {
   const fingerprint = await fingerprintAfterSettle(page, mode)
-  const changed = compareFingerprint(prev, fingerprint)
-  const out: PageChange = { page_changed: changed, stale_refs: changed, fingerprint }
+  // page_changed = ANY fingerprint change (url, focus, or node count).
+  // stale_refs = STRUCTURAL change only (url or node count) — a focus-only move
+  // does not invalidate refs, so it must not raise stale_refs (S7).
+  const page_changed = compareFingerprint(prev, fingerprint)
+  const stale_refs = structuralChange(prev, fingerprint)
+  const out: PageChange = { page_changed, stale_refs, fingerprint }
   if (generation !== undefined) out.generation = generation
   return out
 }

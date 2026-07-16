@@ -19,6 +19,32 @@ export const NO_CHANGES = 'No changes detected'
 /** Lines of unchanged context kept around each change, git-default. */
 const CONTEXT = 3
 
+/**
+ * S1 belt (memory bound). The Myers forward pass records one snapshot of the
+ * V-array (length `2*(N+M)+1`) per edit-distance `d`. For two highly DISSIMILAR
+ * trees the edit distance D ≈ N+M, so an unbounded pass builds ~D snapshots of a
+ * ~2(N+M) array → O((N+M)^2) memory → multi-GB heap → the CLI is OOM-killed.
+ *
+ * `MAX_TRACE_CELLS` caps the TOTAL cells the trace may hold. Since each snapshot
+ * is `2*max+1` cells, the effective `d` cap = `MAX_TRACE_CELLS / (2*max+1)` — it
+ * scales INVERSELY with tree size, so trace memory stays under a fixed ceiling
+ * (~64MB) regardless of input size. When the true edit distance exceeds the cap
+ * the pass bails and `observe` falls back to the full tree; for a near-total
+ * change the diff is never shorter than the tree anyway, so nothing useful is
+ * lost. A normal small change has a tiny D (a handful of edits) that stays far
+ * under the cap, so the ordinary diff path is completely unaffected.
+ */
+const MAX_TRACE_CELLS = 8_000_000
+
+/**
+ * Up-front size guard: a tree pair this large whose lengths differ by this large
+ * a fraction is a near-total change whose diff can never beat the full tree, so
+ * skip straight to the full tree without running Myers at all. Sized so no normal
+ * small diff (a few changed lines on a stable page) is ever affected.
+ */
+const LARGE_TREE_LINES = 2000
+const LENGTH_SKEW_FRAC = 0.3
+
 type Op = { type: 'eq' | 'del' | 'ins'; text: string }
 
 /**
@@ -49,7 +75,20 @@ export function observe(
 export function unifiedDiff(prev: string, next: string): string {
   const a = prev.split('\n')
   const b = next.split('\n')
+
+  // S1 belt (up-front): a huge pair whose lengths are wildly skewed is a
+  // near-total change; its diff can never be shorter than the full tree, so bail
+  // to the full tree (observe treats '' as "use the full tree") without paying
+  // for a Myers pass at all. Small pages never trip this (maxLen < threshold).
+  const maxLen = Math.max(a.length, b.length)
+  if (maxLen > LARGE_TREE_LINES && Math.abs(a.length - b.length) > maxLen * LENGTH_SKEW_FRAC) {
+    return ''
+  }
+
   const ops = myers(a, b)
+  // S1 belt: the forward pass hit its memory bound before converging (two large,
+  // highly-dissimilar trees) — fall back to the full tree.
+  if (ops === null) return ''
 
   // Line-number-annotated entries (1-based, matching unified-diff convention).
   let oldNo = 0
@@ -107,7 +146,7 @@ export function unifiedDiff(prev: string, next: string): string {
  * ins ops. Classic greedy forward pass recording the V-array per edit distance
  * `d`, then a backtrack over that trace to recover the script.
  */
-function myers(a: string[], b: string[]): Op[] {
+function myers(a: string[], b: string[]): Op[] | null {
   const n = a.length
   const m = b.length
   const max = n + m
@@ -115,8 +154,14 @@ function myers(a: string[], b: string[]): Op[] {
   const v = new Array<number>(2 * max + 1).fill(0)
   const trace: number[][] = []
 
+  // S1 belt: cap the number of recorded snapshots so the trace can NEVER exceed
+  // MAX_TRACE_CELLS. Each snapshot is `2*max+1` cells, so the cap on `d` scales
+  // inversely with tree size. `Math.min(max, …)` keeps small inputs (where the
+  // budget dwarfs `max`) byte-for-byte identical to the unbounded algorithm.
+  const maxD = Math.min(max, Math.floor(MAX_TRACE_CELLS / (2 * max + 1)))
+
   let done = false
-  for (let d = 0; d <= max && !done; d++) {
+  for (let d = 0; d <= maxD && !done; d++) {
     trace.push(v.slice())
     for (let k = -d; k <= d; k += 2) {
       let x: number
@@ -137,6 +182,11 @@ function myers(a: string[], b: string[]): Op[] {
       }
     }
   }
+
+  // S1 belt: the pass reached its snapshot cap without the two trees converging
+  // (their edit distance exceeds the bound) — signal "too dissimilar to diff
+  // cheaply" so the caller falls back to the full tree instead of over-allocating.
+  if (!done) return null
 
   // Backtrack through the recorded traces to reconstruct the script.
   const ops: Op[] = []
