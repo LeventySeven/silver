@@ -103,6 +103,15 @@ describe('cli dispatcher (real Chromium via the run() entry)', () => {
       const blocked = await run(['open', 'file:///etc/passwd', '--session', NAME])
       expect(blocked.env.success).toBe(false)
       expect(blocked.env.error).toBe(ERRORS.navigation_blocked.message)
+      // A file: denial earns NO loopback hint.
+      expect(blocked.env.warning ?? '').not.toContain('localhost')
+
+      // --- S9: a raw 127.0.0.1 literal is STILL blocked, but earns the localhost
+      // remedy as a warning (the agent almost certainly meant `localhost`). ---
+      const loopback = await run(['open', 'http://127.0.0.1:9/', '--session', NAME])
+      expect(loopback.env.success).toBe(false)
+      expect(loopback.env.error).toBe(ERRORS.navigation_blocked.message)
+      expect(loopback.env.warning ?? '').toContain('http://localhost:PORT')
     },
   )
 })

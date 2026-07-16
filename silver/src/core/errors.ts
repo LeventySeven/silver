@@ -95,10 +95,14 @@ export const ERRORS = {
     message:
       'the operation still failed after the maximum bounded retries; do not retry blindly — back off further, reduce request rate, or investigate the underlying failure',
   },
+  // S9: a login wall was detected (a password field + a login URL/title signal).
+  // This is branch-NEUTRAL: the same signal fires for a plain login form the host
+  // can fill+submit AND for a page best unlocked by restoring a prior session, so
+  // the advisory names both branches rather than assuming the saved-state path.
   auth_required: {
     retryableByHost: false,
     message:
-      'the page requires authentication; load a saved state (`state load`) or cookies (`cookies set --curl`)',
+      'a login form was detected — if you have credentials, fill the fields and submit; if you already have a saved session, `state load` first',
   },
   not_permitted: {
     retryableByHost: false,
@@ -145,6 +149,26 @@ export const ERRORS = {
     message:
       'Silver requires the Chromium engine (its perception/actuation use the CDP protocol); firefox/webkit are not supported. Re-run without --engine (or with --engine chromium).',
   },
+  // S4: the verb does not apply to the target's element TYPE — e.g. `is checked`
+  // on a non-checkbox/radio, `select` on a non-<select>, `fill` on a non-input.
+  // DISTINCT from `page_crash` (whose `reload` advice is destructive and wrong
+  // here: nothing crashed; the ref is just the wrong kind of element). Not
+  // retryable — a fresh snapshot returns the SAME element; the host must pick a
+  // different element of the right type.
+  wrong_element_type: {
+    retryableByHost: false,
+    message:
+      'the element does not support that action (e.g. `is checked` on a non-checkbox, `select` on a non-<select>) — pick an element of the right type; do NOT reload',
+  },
+  // S4: NEUTRAL fallback for an engine throw that matches no known class. Replaces
+  // the old `page_crash` default so a merely-unclassified error no longer tells
+  // the host to destructively `reload`. Real crashes still surface as `page_crash`
+  // via `classifyEngineError`; this code makes no claim the page died.
+  engine_error: {
+    retryableByHost: true,
+    message:
+      'the browser engine returned an unclassified error; re-snapshot and retry, or simplify the action — do NOT assume the page crashed',
+  },
 } as const
 
 export type ErrorCode = keyof typeof ERRORS
@@ -184,6 +208,25 @@ const NAVIGATION_FAILED_NEEDLES: readonly string[] = [
 ]
 
 /**
+ * Lowercased fragments of the errors Playwright throws when an action is issued
+ * against an element of the WRONG TYPE (verbatim from playwright-core 1.61's
+ * `createStacklessError(...)` calls: "Not a checkbox or radio button",
+ * "Element is not a <select> element", "Element is not an <input>, ...",
+ * "Node is not an HTMLInputElement", "Node is not an <input>, ..."). These are
+ * specific, multi-word engine strings — never page content (the classifier only
+ * ever inspects a thrown error's `.message`) and disjoint from the nav/crash
+ * needles — so matching them cannot misfire on a real transport drop. Checked
+ * BEFORE the crash needles so an `is checked @<a-link>` throw becomes the
+ * non-destructive `wrong_element_type`, never `page_crash`.
+ */
+const WRONG_TYPE_NEEDLES: readonly string[] = [
+  'not a checkbox or radio button',
+  'is not a <select>',
+  'is not an <input>',
+  'node is not an htmlinputelement',
+]
+
+/**
  * Message fragments Playwright/CDP emit when the browser or its transport went
  * away mid-command (a crash/close, not a page-level error) → `page_crash`.
  */
@@ -217,12 +260,15 @@ function errorText(err: unknown): string {
  * Map a thrown engine error to a taxonomy code by message needle, or `null` when
  * it matches neither class (caller keeps its own default). `navigation_failed`
  * is checked first so an unreachable-host `net::ERR_*` surfaced through a closed
- * page is not swallowed by the broader crash needles.
+ * page is not swallowed by the broader crash needles; `wrong_element_type` is
+ * checked BEFORE the crash needles so a type-mismatch throw never becomes the
+ * destructive-reload `page_crash`.
  */
 export function classifyEngineError(err: unknown): ErrorCode | null {
   const text = errorText(err)
   if (text.length === 0) return null
   if (NAVIGATION_FAILED_NEEDLES.some((n) => text.includes(n))) return 'navigation_failed'
+  if (WRONG_TYPE_NEEDLES.some((n) => text.includes(n))) return 'wrong_element_type'
   if (PAGE_CRASH_NEEDLES.some((n) => text.includes(n))) return 'page_crash'
   return null
 }

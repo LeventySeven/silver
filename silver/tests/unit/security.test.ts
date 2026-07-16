@@ -5,6 +5,7 @@ import {
   assertContainedPath,
   subresourceEgressDecision,
   containedFilename,
+  isLoopbackLiteralHost,
   type DnsLookupAll,
 } from '../../src/security/egress.js'
 import { neutralize, capOutput } from '../../src/security/injection.js'
@@ -94,6 +95,32 @@ describe('egress: raw-IP deny', () => {
   it('denies decimal and hex integer hosts (IP obfuscations)', () => {
     expect(assertNavigable('http://2130706433/', base).ok).toBe(false)
     expect(assertNavigable('http://0x7f000001/', base).ok).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// S9: loopback-literal remedy predicate. The literal STAYS denied (above); this
+// only decides whether the denial earns a "use http://localhost:PORT" hint.
+// ---------------------------------------------------------------------------
+describe('egress: loopback-literal remedy hint (S9)', () => {
+  it('flags 127/8 IPv4 literals and ::1 (the agent meant localhost)', () => {
+    expect(isLoopbackLiteralHost('http://127.0.0.1/')).toBe(true)
+    expect(isLoopbackLiteralHost('http://127.0.0.1:3000/api')).toBe(true)
+    expect(isLoopbackLiteralHost('http://127.1.2.3/')).toBe(true)
+    expect(isLoopbackLiteralHost('http://[::1]/')).toBe(true)
+    expect(isLoopbackLiteralHost('http://[::1]:8080/x')).toBe(true)
+  })
+  it('does NOT flag metadata / private / public hosts (denied, but no hint)', () => {
+    expect(isLoopbackLiteralHost('http://169.254.169.254/latest/meta-data')).toBe(false)
+    expect(isLoopbackLiteralHost('http://192.168.1.1:8080/x')).toBe(false)
+    expect(isLoopbackLiteralHost('http://10.0.0.1/')).toBe(false)
+    expect(isLoopbackLiteralHost('http://[2001:db8::1]/')).toBe(false)
+    expect(isLoopbackLiteralHost('https://example.com/')).toBe(false)
+  })
+  it('does NOT flag localhost by name (already allowed) or garbage input', () => {
+    expect(isLoopbackLiteralHost('http://localhost:3000/')).toBe(false)
+    expect(isLoopbackLiteralHost('not a url')).toBe(false)
+    expect(isLoopbackLiteralHost('')).toBe(false)
   })
 })
 

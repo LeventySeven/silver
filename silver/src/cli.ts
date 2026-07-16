@@ -174,8 +174,10 @@ export async function run(argv: string[]): Promise<RunResult> {
 
 /**
  * Map any thrown value to a sanitized failure envelope. Known typed errors map
- * to their code; everything else falls back to `page_crash`. A raw message
- * (which could embed a path/secret) is NEVER surfaced.
+ * to their code; a truly-unclassified throw falls back to the NEUTRAL
+ * `engine_error` (S4) — not `page_crash`, whose `reload` advice is destructive
+ * and wrong when nothing actually crashed. A raw message (which could embed a
+ * path/secret) is NEVER surfaced.
  */
 export function mapThrow(err: unknown): Envelope<never> {
   if (err instanceof OutputOverflowError) return fail('output_overflow')
@@ -190,16 +192,19 @@ export function mapThrow(err: unknown): Envelope<never> {
 
   if (err instanceof Error && err.name === 'TimeoutError') return fail('timeout')
 
-  // R6: classify a raw engine throw by message needle BEFORE the generic
-  // page_crash fallback — an unreachable-host `net::ERR_*` becomes retryable
-  // `navigation_failed` (DISTINCT from the never-retry policy `navigation_blocked`)
-  // and a CDP/transport drop becomes `page_crash`. Needles only — nothing from the
-  // error object is interpolated into the surfaced string (no-leak).
+  // R6/S4: classify a raw engine throw by message needle BEFORE the generic
+  // fallback — an unreachable-host `net::ERR_*` becomes retryable
+  // `navigation_failed` (DISTINCT from the never-retry policy `navigation_blocked`),
+  // a type-mismatch throw becomes non-destructive `wrong_element_type`, and a real
+  // CDP/transport drop becomes `page_crash`. Needles only — nothing from the error
+  // object is interpolated into the surfaced string (no-leak).
   const engineCode = classifyEngineError(err)
   if (engineCode) return fail(engineCode)
 
-  // Unknown → safe generic fallback (message is fixed; nothing from `err` leaks).
-  return fail('page_crash')
+  // Unknown → NEUTRAL fallback (message is fixed; nothing from `err` leaks). NOT
+  // `page_crash`: an unclassified throw is not evidence the page died, so we must
+  // not advise the host to destructively `reload` (S4).
+  return fail('engine_error')
 }
 
 function isErrorCode(code: string): code is ErrorCode {

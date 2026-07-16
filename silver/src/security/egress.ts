@@ -221,6 +221,31 @@ function isExplicitLoopbackName(host: string): boolean {
 }
 
 /**
+ * S9: true iff `url`'s host is a LOOPBACK IP LITERAL the lexical gate denies but
+ * that the agent almost certainly meant as `localhost` (which the guard permits
+ * by name): a 127/8 IPv4 literal or the IPv6 `::1`. Callers use this ONLY to
+ * attach a "use http://localhost:PORT" remedy to the UNCHANGED
+ * `navigation_blocked` denial — it does NOT relax the block. Deliberately does
+ * NOT match metadata/link-local (169.254/16) or private ranges (10/8, 172.16/12,
+ * 192.168/16): those stay denied with no such hint. Pure; never throws.
+ */
+export function isLoopbackLiteralHost(url: string): boolean {
+  const raw = typeof url === 'string' ? url.trim() : ''
+  if (raw.length === 0) return false
+  let host: string
+  try {
+    host = new URL(raw).hostname.toLowerCase()
+  } catch {
+    return false
+  }
+  // `new URL('http://[::1]/').hostname` is `[::1]` — strip the IPv6 brackets.
+  const bare = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host
+  if (bare === '::1' || bare === '0:0:0:0:0:0:0:1') return true
+  if (IPV4_RE.test(bare)) return Number(bare.split('.')[0]) === 127 // 127/8 loopback
+  return false
+}
+
+/**
  * Async navigability guard: the lexical `assertNavigable` PLUS a DNS resolution
  * check that denies any host resolving to a non-public address. Never throws.
  *

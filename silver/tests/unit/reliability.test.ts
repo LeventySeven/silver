@@ -41,8 +41,31 @@ describe('classifyEngineError (R6)', () => {
     expect(classifyEngineError(new Error('net::ERR_ABORTED'))).toBeNull()
   })
 
-  it('returns null for unrelated errors', () => {
+  it('S4: maps a wrong-element-type throw to wrong_element_type (NOT page_crash)', () => {
+    // Verbatim playwright-core 1.61 createStacklessError messages.
+    expect(classifyEngineError(new Error('Not a checkbox or radio button'))).toBe(
+      'wrong_element_type',
+    )
+    expect(classifyEngineError(new Error('Element is not a <select> element'))).toBe(
+      'wrong_element_type',
+    )
+    expect(
+      classifyEngineError(
+        new Error('Element is not an <input>, <textarea> or [contenteditable] element'),
+      ),
+    ).toBe('wrong_element_type')
+    expect(classifyEngineError(new Error('Node is not an HTMLInputElement'))).toBe(
+      'wrong_element_type',
+    )
+    // A realistic `is checked @<a-link>` surface must NOT become page_crash.
+    expect(
+      classifyEngineError(new Error('elementHandle.isChecked: Not a checkbox or radio button')),
+    ).not.toBe('page_crash')
+  })
+
+  it('returns null for a generic/unclassified throw (cli falls back to engine_error)', () => {
     expect(classifyEngineError(new Error('element not found'))).toBeNull()
+    expect(classifyEngineError(new Error('something totally unexpected happened'))).toBeNull()
     expect(classifyEngineError(null)).toBeNull()
     expect(classifyEngineError(undefined)).toBeNull()
   })
@@ -62,6 +85,8 @@ describe('new error codes (R5/R6/E4)', () => {
     'repetition_detected',
     'navigation_failed',
     'retries_exhausted',
+    'wrong_element_type',
+    'engine_error',
   ]
 
   it('every new code has a non-empty message and boolean retryableByHost', () => {
@@ -82,6 +107,31 @@ describe('new error codes (R5/R6/E4)', () => {
   it('repetition_detected and retries_exhausted advise against blind retry', () => {
     expect(ERRORS.repetition_detected.retryableByHost).toBe(false)
     expect(ERRORS.retries_exhausted.retryableByHost).toBe(false)
+  })
+
+  it('S4: wrong_element_type is non-retryable and warns AGAINST reload', () => {
+    expect(ERRORS.wrong_element_type.retryableByHost).toBe(false)
+    expect(ERRORS.wrong_element_type.message.toLowerCase()).toContain('do not reload')
+    // It must not carry the destructive `reload` advice page_crash gives.
+    expect(ERRORS.wrong_element_type.message.toLowerCase()).not.toContain('run `reload`')
+  })
+
+  it('S4: engine_error is a NEUTRAL retryable fallback that does not claim a crash', () => {
+    expect(ERRORS.engine_error.retryableByHost).toBe(true)
+    expect(ERRORS.engine_error.message.toLowerCase()).toContain('unclassified')
+    expect(ERRORS.engine_error.message.toLowerCase()).toContain('do not assume the page crashed')
+    expect(ERRORS.engine_error.message).not.toBe(ERRORS.page_crash.message)
+  })
+
+  it('S9: auth_required is branch-neutral (fill+submit OR restore a saved session)', () => {
+    const m = ERRORS.auth_required.message.toLowerCase()
+    // Names the fill+submit branch (plain login form)…
+    expect(m).toContain('fill')
+    expect(m).toContain('submit')
+    // …and the restore-session branch (`state load`).
+    expect(m).toContain('state load')
+    // The old wording assumed only the saved-state path — must no longer read that way.
+    expect(m).toContain('login form')
   })
 
   it('no new code leaks a path or secret substring', () => {

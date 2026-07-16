@@ -86,7 +86,7 @@ import {
 } from '../perception/walk.js'
 import { render } from '../perception/serialize.js'
 import { observe } from '../perception/diff.js'
-import { assertNavigableResolved, assertContainedPath } from '../security/egress.js'
+import { assertNavigableResolved, assertContainedPath, isLoopbackLiteralHost } from '../security/egress.js'
 import { neutralize, capOutput } from '../security/injection.js'
 import { redactValue } from '../security/redact.js'
 import { requiresConfirm, confirmGateDecision, isDestructivePaidName } from '../security/confirm.js'
@@ -707,7 +707,7 @@ async function handleOpen(flags: ParsedFlags): Promise<Envelope<unknown>> {
     allowFile: flags.allowFileAccess,
     allowedDomains: flags.allowedDomains,
   })
-  if (!nav.ok) return fail('navigation_blocked')
+  if (!nav.ok) return navBlocked(url)
 
   return withConnection(flags, async ({ page }) => {
     // Install the capture instrumentation BEFORE navigating so console/network
@@ -902,7 +902,7 @@ async function handleTabNew(flags: ParsedFlags): Promise<Envelope<unknown>> {
       allowFile: flags.allowFileAccess,
       allowedDomains: flags.allowedDomains,
     })
-    if (!nav.ok) return fail('navigation_blocked')
+    if (!nav.ok) return navBlocked(url)
   }
 
   return withConnection(flags, async ({ context }) => {
@@ -1193,7 +1193,9 @@ async function handleRead(flags: ParsedFlags): Promise<Envelope<unknown>> {
     // guarded per-hop + neutralized; the cookie only rides same-origin hops.
     const cookieHeader = await sessionCookieHeader(flags, url)
     const fetched = await fetchGuarded(url, flags, cookieHeader)
-    if (!fetched.ok) return fail(fetched.code)
+    // fetched.code is always `navigation_blocked`; route through navBlocked so a
+    // loopback-literal target carries the localhost remedy (S9).
+    if (!fetched.ok) return navBlocked(url)
     if (!fetched.res.ok) return fail('page_crash')
     const html = await fetched.res.text()
     return ok(presentPageText(htmlToText(html), flags))
@@ -3754,6 +3756,26 @@ function shellSplit(s: string): string[] {
 /** A clean, non-leaking bad-request envelope (static message only). */
 function badRequest(message: string): Envelope<never> {
   return { success: false, data: null, error: message }
+}
+
+/**
+ * S9: static remedy attached (as a WARNING) to a `navigation_blocked` denial when
+ * the blocked target is a loopback IP LITERAL — the agent almost certainly meant
+ * `localhost`, which the egress guard permits by name. Fixed string: it names the
+ * generic working form only and interpolates no host/path/secret (no-leak).
+ */
+const LOOPBACK_LITERAL_REMEDY =
+  'a loopback IP literal (127.x / ::1) is blocked, but the loopback NAME is allowed — use `http://localhost:PORT` instead'
+
+/**
+ * A `navigation_blocked` denial. The block itself is UNCHANGED; when the denied
+ * target is a 127/8 or ::1 literal we additionally surface the loopback remedy as
+ * a non-fatal warning. Metadata/private ranges get the plain denial (no hint).
+ */
+function navBlocked(url: string): Envelope<never> {
+  const env = fail('navigation_blocked')
+  if (isLoopbackLiteralHost(url)) return { ...env, warning: LOOPBACK_LITERAL_REMEDY }
+  return env
 }
 
 function notImplemented(): Envelope<never> {
