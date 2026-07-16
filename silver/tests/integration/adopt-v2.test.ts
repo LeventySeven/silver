@@ -90,37 +90,49 @@ describe('adopt-list-v2 (F2 doctor · G5 skill · B1 coord · E4 download)', () 
     await new Promise<void>((resolve) => server.close(() => resolve()))
   })
 
-  // ---- F2: doctor real-launch probe ----
-  it('doctor runs a real headless launch probe and returns passed/total', async () => {
+  // ---- F2/K4: doctor real-launch probe + structured report shape ----
+  it('doctor runs a real headless launch probe and returns the structured report', async () => {
     const res = await run(['doctor'])
     expect(res.env.success).toBe(true)
+    type Check = { name: string; status: string; message: string; fix?: string; details?: string }
     const d = res.env.data as {
-      playwright: boolean
-      chromium: boolean
-      browser_launch: boolean
-      uab_writable: boolean
+      checks: Check[]
+      verdict: 'ok' | 'issues'
+      next: string
       passed: number
       total: number
-      ok: boolean
-      fixes?: Record<string, string>
     }
-    // Deterministic checks (fast, no contention).
-    expect(d.playwright).toBe(true)
-    expect(d.chromium).toBe(true)
-    expect(d.uab_writable).toBe(true)
-    // The REAL launch probe ran (a boolean, not just existsSync). On an unloaded
-    // box it is true; under peak parallel test load a fresh full-Chromium launch
-    // can lose the resource race, in which case a static Fix: string is attached.
-    expect(typeof d.browser_launch).toBe('boolean')
-    if (!d.browser_launch) {
-      expect(d.fixes?.browser_launch).toContain('Fix:')
+    // K4: structured shape — an array of {name,status,message,fix,details} checks
+    // plus verdict / next / passed / total.
+    expect(Array.isArray(d.checks)).toBe(true)
+    expect(typeof d.verdict).toBe('string')
+    expect(typeof d.next).toBe('string')
+    const by = (n: string): Check | undefined => d.checks.find((c) => c.name === n)
+    // Deterministic checks (fast, no contention) pass on this machine.
+    expect(by('playwright')?.status).toBe('pass')
+    expect(by('chromium')?.status).toBe('pass')
+    expect(by('uab_writable')?.status).toBe('pass')
+    // The new K4 checks are present.
+    expect(by('session_locks')).toBeDefined()
+    expect(by('cdp_reachable')).toBeDefined()
+    // The REAL launch probe ran (a status, not just existsSync). On an unloaded box
+    // it passes; under peak parallel test load a fresh full-Chromium launch can lose
+    // the resource race, in which case a remediation command is attached.
+    const launch = by('browser_launch')
+    expect(launch).toBeDefined()
+    if (launch?.status === 'fail') {
+      expect(launch.fix).toContain('playwright install')
     }
-    // Accounting invariants (F2): passed = number of passing checks, total = 4,
-    // ok iff all passed.
-    expect(d.total).toBe(4)
-    const trues = [d.playwright, d.chromium, d.browser_launch, d.uab_writable].filter(Boolean).length
-    expect(d.passed).toBe(trues)
-    expect(d.ok).toBe(d.passed === d.total)
+    // Every check carries a remediation command whenever it is not passing.
+    for (const c of d.checks) {
+      if (c.status === 'fail') expect(typeof c.fix).toBe('string')
+    }
+    // Accounting invariants: passed = number of passing checks; total = checks.length;
+    // verdict is 'ok' iff no check failed.
+    expect(d.total).toBe(d.checks.length)
+    expect(d.passed).toBe(d.checks.filter((c) => c.status === 'pass').length)
+    const anyFail = d.checks.some((c) => c.status === 'fail')
+    expect(d.verdict).toBe(anyFail ? 'issues' : 'ok')
   })
 
   // ---- G5: skill reference catalog ----

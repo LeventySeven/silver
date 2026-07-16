@@ -13,6 +13,10 @@ const FIXTURE = `<!doctype html>
   <input type="checkbox" checked aria-label="offscreen check"
          style="position:absolute; left:-9999px">
   <input type="password" aria-label="Secret" value="hunter2">
+  <!-- P1 ARIA-paradox: interactive role, but confidently-wrong empty name -->
+  <div role="button" aria-label="" tabindex="0">Delete account</div>
+  <!-- P3: a native file input Chrome reports as a generic button -->
+  <input type="file" aria-label="Upload avatar">
 </body></html>`
 
 function find(nodes: SnapNode[], pred: (n: SnapNode) => boolean): SnapNode | undefined {
@@ -67,6 +71,19 @@ describe('snapshotNodes (real Chromium AX walk + cursor cascade)', () => {
       // --- password input flagged for downstream redaction ---
       const password = find(nodes, (n) => n.isPassword)
       expect(password, 'password input flagged isPassword').toBeTruthy()
+
+      // --- P1 ARIA-paradox: role=button + empty accessible name gets a usable
+      //     synthesized name AND stays ref-eligible (not a nameless ref) ---
+      const paradox = find(nodes, (n) => n.role === 'button' && n.name === 'Delete account')
+      expect(paradox, 'role=button empty-name div synthesizes a name from text').toBeTruthy()
+      expect(paradox!.refEligible).toBe(true)
+      // no ref-eligible button is left with an empty name
+      const namelessButton = find(nodes, (n) => n.role === 'button' && n.refEligible && n.name === '')
+      expect(namelessButton, 'no ref-eligible button left nameless').toBeUndefined()
+
+      // --- P3: native <input type=file> tagged inputType 'file' for relabel ---
+      const fileInput = find(nodes, (n) => n.inputType === 'file')
+      expect(fileInput, 'file input tagged inputType=file').toBeTruthy()
 
       // sanity: at least one non-ref-eligible node exists (structure/text kept)
       expect(nodes.some((n) => !n.refEligible)).toBe(true)

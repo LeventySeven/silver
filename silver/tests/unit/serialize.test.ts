@@ -404,6 +404,54 @@ describe('render — text-leaf merge (P1-P1)', () => {
   })
 })
 
+describe('render — P3 state badges + file-input relabel', () => {
+  it('renders [checked] and [selected] state badges from AXNode props', () => {
+    const nodes = [
+      mk({
+        backendNodeId: 1,
+        role: 'checkbox',
+        name: 'Subscribe',
+        level: 0,
+        refEligible: true,
+        flags: { checked: true },
+      }),
+      mk({
+        backendNodeId: 2,
+        role: 'option',
+        name: 'Blue',
+        level: 0,
+        refEligible: true,
+        flags: { selected: true },
+      }),
+    ]
+    const { text } = render(nodes, emptyMap, { generation: 1, title: '', url: '' })
+    expect(text).toContain('- checkbox "Subscribe" [ref=e1, checked=true]')
+    expect(text).toContain('- option "Blue" [ref=e2, selected]')
+  })
+
+  it('relabels a native <input type=file> off the generic button role', () => {
+    const nodes = [
+      // Chrome exposes <input type=file> as role button, name "Choose File".
+      mk({
+        backendNodeId: 1,
+        role: 'button',
+        name: 'Choose File',
+        level: 0,
+        refEligible: true,
+        inputType: 'file',
+      }),
+      // an ordinary button carries no file-upload badge
+      mk({ backendNodeId: 2, role: 'button', name: 'Submit', level: 0, refEligible: true }),
+    ]
+    const { text } = render(nodes, emptyMap, { generation: 1, title: '', url: '' })
+    expect(text).toContain('- button "Choose File" [ref=e1, file-upload]')
+    expect(text).toContain('- button "Submit" [ref=e2]')
+    // the file badge does not spill a bogus format hint
+    expect(text).not.toContain('format_hint=file')
+    expect(text).not.toContain('format=')
+  })
+})
+
 describe('cleanUrl — base resolution (P1-P2)', () => {
   it('resolves a root-relative href against the page base', () => {
     expect(cleanUrl('/login', 'https://example.com/app/page')).toBe('https://example.com/login')

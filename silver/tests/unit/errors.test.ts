@@ -13,6 +13,10 @@ const REQUIRED_CODES = [
   'auth_required',
   'not_permitted',
   'output_overflow',
+  'page_empty',
+  'repetition_detected',
+  'navigation_failed',
+  'retries_exhausted',
 ] as const
 
 describe('error taxonomy', () => {

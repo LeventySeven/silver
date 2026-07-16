@@ -168,4 +168,84 @@ describe('silver subagent — keyless scoped-child orchestration', () => {
     expect(l.subagents.length).toBe(2)
     await nuke(ns)
   })
+
+  // -------------------------------------------------------------------------
+  // O1 — result-file handoff: a long `done --text` result must NOT be silently
+  // truncated at MAX_PROMPT; it is written to a file and `resultPath` surfaced.
+  // -------------------------------------------------------------------------
+  it('O1: a result longer than MAX_PROMPT is written to a file (not truncated) + resultPath surfaced', async () => {
+    const ns = `${NS}-big`
+    await run(['subagent', 'spawn', 'produce a big report', '--enable-actions', '--namespace', ns])
+
+    // 60k chars — comfortably over MAX_PROMPT (20k). A UNIQUE sentinel near the
+    // very end proves the tail was NOT lost to truncation.
+    const tail = 'THE_UNTRUNCATED_END_MARKER'
+    const big = 'x'.repeat(60_000) + tail
+
+    const done = await run(['subagent', 'done', 'sa1', '--text', big, '--namespace', ns])
+    expect(done.env.success).toBe(true)
+    const d = data<{ id: string; status: string; result: string; resultPath: string }>(done)
+    expect(d.status).toBe('done')
+    expect(typeof d.resultPath).toBe('string')
+    expect(d.resultPath.length).toBeGreaterThan(0)
+
+    // The FULL, untruncated result is on disk (tail sentinel present, full length).
+    const onDisk = await fs.readFile(d.resultPath, 'utf8')
+    expect(onDisk.length).toBe(big.length)
+    expect(onDisk.endsWith(tail)).toBe(true)
+
+    // list + wait both surface resultPath so the parent can fetch the whole thing.
+    const listed = await run(['subagent', 'list', '--namespace', ns])
+    const rec = data<{ subagents: Array<{ id: string; resultPath: string | null }> }>(listed).subagents.find(
+      (s) => s.id === 'sa1',
+    )
+    expect(rec?.resultPath).toBe(d.resultPath)
+
+    const waited = await run(['subagent', 'wait', 'sa1', '--timeout', '2000', '--namespace', ns])
+    const w = data<{ results: Array<{ id: string; resultPath: string | null }> }>(waited)
+    expect(w.results[0].resultPath).toBe(d.resultPath)
+    await nuke(ns)
+  })
+
+  it('O1: a short result stays inline (no file, resultPath null) — unchanged behavior', async () => {
+    const ns = `${NS}-small`
+    await run(['subagent', 'spawn', 'quick', '--enable-actions', '--namespace', ns])
+    const done = await run(['subagent', 'done', 'sa1', '--text', 'all good', '--namespace', ns])
+    const d = data<{ result: string; resultPath: string | null }>(done)
+    expect(d.result).toContain('all good')
+    expect(d.resultPath).toBeNull()
+    await nuke(ns)
+  })
+
+  it('O1: --result-file <path> moves the file into the subagents dir + records resultPath', async () => {
+    const ns = `${NS}-rf`
+    await run(['subagent', 'spawn', 'file handoff', '--enable-actions', '--namespace', ns])
+
+    const src = path.join(os.tmpdir(), `silver-result-${process.pid}-${Date.now()}.txt`)
+    const body = 'a big external result\n'.repeat(2000) + 'FILE_TAIL_MARKER'
+    await fs.writeFile(src, body, 'utf8')
+
+    const done = await run(['subagent', 'done', 'sa1', '--result-file', src, '--namespace', ns])
+    expect(done.env.success).toBe(true)
+    const d = data<{ resultPath: string }>(done)
+    expect(typeof d.resultPath).toBe('string')
+    const onDisk = await fs.readFile(d.resultPath, 'utf8')
+    expect(onDisk).toBe(body)
+    // The stored copy lives under the subagents dir (not the caller's temp path).
+    expect(d.resultPath).not.toBe(src)
+    expect(d.resultPath).toContain(path.join(sanitizeNamespace(ns), 'subagents'))
+
+    await fs.rm(src, { force: true }).catch(() => {})
+    await nuke(ns)
+  })
+
+  it('O1: --result-file that cannot be read fails cleanly WITHOUT leaking the path', async () => {
+    const ns = `${NS}-rfbad`
+    await run(['subagent', 'spawn', 'bad file', '--enable-actions', '--namespace', ns])
+    const secretPath = '/nonexistent/SECRET_PATH_TOKEN/result.txt'
+    const done = await run(['subagent', 'done', 'sa1', '--result-file', secretPath, '--namespace', ns])
+    expect(done.env.success).toBe(false)
+    expect(done.env.error).not.toContain('SECRET_PATH_TOKEN')
+    await nuke(ns)
+  })
 })

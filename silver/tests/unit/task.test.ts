@@ -3,8 +3,11 @@ import { promises as fs, existsSync } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { run } from '../../src/cli.js'
-import { sanitizeNamespace } from '../../src/core/session.js'
+import { sanitizeNamespace, setNamespace } from '../../src/core/session.js'
 import { ERRORS } from '../../src/core/errors.js'
+import { parseFlags } from '../../src/core/flags.js'
+import { scrubBase64String } from '../../src/task/store.js'
+import { EXEC_FIXED_ENV, execTmpdir, handleTask } from '../../src/task/index.js'
 
 const NS = `task-${process.pid}-${Date.now()}`
 
@@ -367,5 +370,108 @@ describe('silver task — Webwright keyless run-folder artifact', () => {
     expect(miss.reuse).toBe(false)
     expect(miss.ref).toBeNull()
     expect(miss.reason).toBe('dom_hash_mismatch')
+  })
+
+  // -------------------------------------------------------------------------
+  // T4a — base64 log hygiene: a screenshot / data-URL is stripped before it is
+  // persisted to the action_log (else one shot bloats the run folder by MB).
+  // -------------------------------------------------------------------------
+  it('T4a: scrubBase64String replaces a data-URL and a raw base64 blob with a size marker', () => {
+    const dataUrl = 'before data:image/png;base64,iVBORw0KGgoAAAANSUhEUg== after'
+    const scrubbed = scrubBase64String(dataUrl)
+    expect(scrubbed).toContain('<omitted:base64')
+    expect(scrubbed).toContain('bytes>')
+    expect(scrubbed).toContain('before')
+    expect(scrubbed).toContain('after')
+    expect(scrubbed).not.toContain('iVBORw0KGgo')
+
+    // A raw base64 blob (Silver's screenshot/pdf verbs return raw, no data:).
+    const blob = 'A'.repeat(4000)
+    const scrubbedBlob = scrubBase64String(`shot=${blob}`)
+    expect(scrubbedBlob).not.toContain(blob)
+    expect(scrubbedBlob).toContain('<omitted:base64 3000 bytes>') // floor(4000*3/4)
+
+    // A short ordinary token is NOT touched (no false positive).
+    expect(scrubBase64String('deadbeef1234')).toBe('deadbeef1234')
+  })
+
+  it('T4a: task log strips a base64 image/data-URL before writing action_log.jsonl', async () => {
+    await run(['task', 'start', 'shoot the page', '--id', 'b64', '--namespace', NS])
+    const payload = 'ABCDabcd0123' + 'Q'.repeat(3000) // > raw-blob threshold
+    await run([
+      'task',
+      'log',
+      'b64',
+      JSON.stringify({ kind: 'shot', image: `data:image/png;base64,${payload}`, raw: 'Z'.repeat(3000) }),
+      '--namespace',
+      NS,
+    ])
+
+    const jsonl = await fs.readFile(path.join(nsTasks(), 'b64', 'run_1', 'action_log.jsonl'), 'utf8')
+    // The base64 payloads are gone; the size markers are present.
+    expect(jsonl).not.toContain(payload)
+    expect(jsonl).not.toContain('Z'.repeat(3000))
+    expect(jsonl).toContain('<omitted:base64')
+    // The surrounding structure survives (only the blob was removed).
+    const last = JSON.parse(jsonl.trim().split('\n').pop() as string)
+    expect(last.event.kind).toBe('shot')
+    expect(String(last.event.image)).toContain('<omitted:base64')
+  })
+
+  // -------------------------------------------------------------------------
+  // T5 — subprocess env hygiene for `task exec`.
+  // -------------------------------------------------------------------------
+  it('T5: exec applies the fixed non-interactive child env + a workspace TMPDIR, restored after', async () => {
+    // The fixed env carries the paginator / progress-bar / color / CI hygiene keys.
+    expect(EXEC_FIXED_ENV.PAGER).toBe('cat')
+    expect(EXEC_FIXED_ENV.MANPAGER).toBe('cat')
+    expect(EXEC_FIXED_ENV.LESS).toBe('-R')
+    expect(EXEC_FIXED_ENV.PIP_PROGRESS_BAR).toBe('off')
+    expect(EXEC_FIXED_ENV.TQDM_DISABLE).toBe('1')
+    expect(EXEC_FIXED_ENV.CI).toBe('1')
+    expect(EXEC_FIXED_ENV.NO_COLOR).toBe('1')
+    // The TMPDIR is scoped inside the run folder (not the shared system tmp).
+    expect(execTmpdir('env1', 1).endsWith(path.join('env1', 'run_1', 'tmp'))).toBe(true)
+
+    await run(['task', 'start', 'env hygiene', '--id', 'env1', '--namespace', NS])
+    const beforePager = process.env.PAGER
+    const beforeNoColor = process.env.NO_COLOR
+    const exec = await run(['task', 'exec', 'env1', '--enable-actions', '--namespace', NS, '--', 'version'])
+    expect(exec.env.success).toBe(true)
+
+    // The workspace-scoped TMPDIR was created under the run folder…
+    expect(existsSync(path.join(nsTasks(), 'env1', 'run_1', 'tmp'))).toBe(true)
+    // …and the parent env was restored exactly (no leak across commands).
+    expect(process.env.PAGER).toBe(beforePager)
+    expect(process.env.NO_COLOR).toBe(beforeNoColor)
+  })
+
+  // -------------------------------------------------------------------------
+  // T6a — --echo-plan anti-drift: the open plan items + goal ride the envelope.
+  // -------------------------------------------------------------------------
+  it('T6a: --echo-plan appends the open plan checklist + goal to the exec envelope', async () => {
+    await run(['task', 'start', 'buy milk and eggs', '--id', 'ep1', '--namespace', NS])
+    // handleTask reads the active namespace from module state (set by run());
+    // set it explicitly since we call the handler directly with the flag.
+    setNamespace(NS)
+    const base = parseFlags(['task', 'exec', 'ep1', '--enable-actions', '--namespace', NS, '--', 'version'])
+    ;(base as typeof base & { echoPlan?: boolean }).echoPlan = true
+    const res = await handleTask(base)
+    setNamespace(undefined)
+
+    expect(res.success).toBe(true)
+    const d = res.data as {
+      echoPlan?: { goal: string; open: string[]; checked: number; total: number }
+    }
+    expect(d.echoPlan).toBeDefined()
+    expect(d.echoPlan!.goal).toContain('buy milk and eggs')
+    // The plan template ships CP1 + CP2, both open (unchecked).
+    expect(d.echoPlan!.total).toBe(2)
+    expect(d.echoPlan!.checked).toBe(0)
+    expect(d.echoPlan!.open.length).toBe(2)
+
+    // Without the flag the field is absent (opt-in, no drift tax by default).
+    const plain = await run(['task', 'exec', 'ep1', '--enable-actions', '--namespace', NS, '--', 'version'])
+    expect((plain.env.data as Record<string, unknown>).echoPlan).toBeUndefined()
   })
 })

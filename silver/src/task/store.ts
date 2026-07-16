@@ -174,9 +174,59 @@ export async function startRun(id: string, goal: string): Promise<StartedRun> {
   return { id, run: runName, runNumber: n, dir, goal: meta.goal }
 }
 
-/** Append one event to a run's action_log.jsonl (append-only, timestamped). */
+// ---------------------------------------------------------------------------
+// T4a — base64 log hygiene. A screenshot / data-URL persisted verbatim to a
+// run's action_log bloats the folder by MB. Before any event is written we
+// replace every base64 image / data-URL payload with a `<omitted:base64 N
+// bytes>` size marker (the count is the DECODED byte size). KEYLESS: pure regex.
+// ---------------------------------------------------------------------------
+
+/** `data:<mime>[;params];base64,<payload>` — the canonical embedded-image form. */
+const DATA_URL_RE = /data:[\w.+-]*\/?[\w.+-]*(?:;[\w-]+=[\w.+-]+)*;base64,([A-Za-z0-9+/]+={0,2})/g
+/**
+ * A long standalone base64 run (≥ threshold chars). Silver's own `screenshot`/
+ * `pdf` verbs return RAW base64 with no `data:` prefix (`{encoding:'base64',
+ * image:<b64>}`), so a host that logs such an envelope would otherwise persist
+ * the whole blob. The threshold is high enough that ordinary tokens/hashes/ids
+ * never match — only genuine multi-KB blobs do.
+ */
+const RAW_B64_RE = /[A-Za-z0-9+/]{2048,}={0,2}/g
+
+/** Decoded byte size of a base64 payload, computed WITHOUT allocating a Buffer. */
+function base64Bytes(b64: string): number {
+  const clean = b64.replace(/=+$/, '')
+  return Math.floor((clean.length * 3) / 4)
+}
+
+/** Replace base64 image / data-URL payloads in ONE string with a size marker. */
+export function scrubBase64String(s: string): string {
+  return s
+    .replace(DATA_URL_RE, (_m, payload: string) => `<omitted:base64 ${base64Bytes(payload)} bytes>`)
+    .replace(RAW_B64_RE, (m) => `<omitted:base64 ${base64Bytes(m)} bytes>`)
+}
+
+/**
+ * Deep-clone an arbitrary log event, replacing every base64 image / data-URL
+ * string value (at any depth, in arrays and objects) with a size marker. Pure /
+ * keyless; non-string leaves pass through untouched. Exported for the T4a test.
+ */
+export function scrubBase64(value: unknown): unknown {
+  if (typeof value === 'string') return scrubBase64String(value)
+  if (Array.isArray(value)) return value.map((v) => scrubBase64(v))
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = scrubBase64(v)
+    return out
+  }
+  return value
+}
+
+/** Append one event to a run's action_log.jsonl (append-only, timestamped).
+ * T4a: base64 image/data-URL payloads are stripped to a size marker first so a
+ * screenshot in a log can never bloat the run folder by MB. */
 export async function appendLog(id: string, n: number, event: unknown): Promise<void> {
-  const line = JSON.stringify({ ts: new Date().toISOString(), event }) + '\n'
+  const safe = scrubBase64(event)
+  const line = JSON.stringify({ ts: new Date().toISOString(), event: safe }) + '\n'
   await fs.mkdir(runDirPath(id, n), { recursive: true }).catch(() => {})
   await fs.appendFile(path.join(runDirPath(id, n), 'action_log.jsonl'), line, 'utf8')
 }

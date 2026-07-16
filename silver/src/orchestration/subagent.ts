@@ -54,6 +54,9 @@ const SPAWN_LOCK_NAME = '.subagents-lock'
 /** Aside's default: at most 5 concurrent children under one parent/namespace. */
 export const CONCURRENCY_CAP = 5
 const MAX_PROMPT = 20_000
+/** Hard bound on a result FILE (O1). Far above MAX_PROMPT — a long result is
+ * written whole (not truncated to MAX_PROMPT); this only caps a hostile blob. */
+const RESULT_FILE_MAX = 5_000_000
 const WAIT_DEFAULT_MS = 60_000
 const WAIT_POLL_MS = 50
 
@@ -74,6 +77,14 @@ export type SubRecord = {
   createdAt: string
   updatedAt: string
   result: string | null
+  /**
+   * O1 — path to the FULL, untruncated result on disk (under `.silver/<ns>/
+   * subagents/`), or null. Set when the result exceeds MAX_PROMPT (auto) or a
+   * `--result-file` was supplied. `result` then holds only a bounded preview;
+   * the parent reads `resultPath` only if it needs the whole thing (no silent
+   * truncation of long child output).
+   */
+  resultPath: string | null
 }
 
 function subagentsRoot(): string {
@@ -81,6 +92,19 @@ function subagentsRoot(): string {
 }
 function recordPath(id: string): string {
   return path.join(subagentsRoot(), `${id}.json`)
+}
+
+/** On-disk path for a child's FULL result (O1), under the subagents dir. */
+function resultFilePath(id: string): string {
+  return path.join(subagentsRoot(), `${id}.result.txt`)
+}
+
+/** Write a child's full result into the subagents dir; returns the path (O1). */
+async function writeResultFile(id: string, content: string): Promise<string> {
+  await fs.mkdir(subagentsRoot(), { recursive: true })
+  const out = resultFilePath(id)
+  await fs.writeFile(out, capOutput(content, RESULT_FILE_MAX), 'utf8')
+  return out
 }
 
 function badRequest(message: string): Envelope<never> {
@@ -226,6 +250,7 @@ async function subagentSpawn(flags: ParsedFlags): Promise<Envelope<unknown>> {
         createdAt: now,
         updatedAt: now,
         result: null,
+        resultPath: null,
       }
 
       try {
@@ -274,7 +299,14 @@ async function subagentWait(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const budget = Number.isFinite(flags.timeout) && (flags.timeout as number) > 0 ? (flags.timeout as number) : WAIT_DEFAULT_MS
   const deadline = Date.now() + budget
 
-  const results: Array<{ id: string; status: string; timedOut: boolean; result: string | null; description: string | null }> = []
+  const results: Array<{
+    id: string
+    status: string
+    timedOut: boolean
+    result: string | null
+    resultPath: string | null
+    description: string | null
+  }> = []
   for (const id of ids) {
     let rec = await readRecord(id)
     while (rec && rec.status === 'running' && Date.now() < deadline) {
@@ -282,7 +314,7 @@ async function subagentWait(flags: ParsedFlags): Promise<Envelope<unknown>> {
       rec = await readRecord(id)
     }
     if (!rec) {
-      results.push({ id, status: 'unknown', timedOut: false, result: null, description: null })
+      results.push({ id, status: 'unknown', timedOut: false, result: null, resultPath: null, description: null })
       continue
     }
     results.push({
@@ -290,6 +322,7 @@ async function subagentWait(flags: ParsedFlags): Promise<Envelope<unknown>> {
       status: rec.status,
       timedOut: rec.status === 'running',
       result: present(rec.result),
+      resultPath: rec.resultPath ?? null,
       description: rec.description,
     })
   }
@@ -298,14 +331,41 @@ async function subagentWait(flags: ParsedFlags): Promise<Envelope<unknown>> {
 
 async function subagentMark(flags: ParsedFlags, status: 'done' | 'failed'): Promise<Envelope<unknown>> {
   const id = sanitizeSegment(flags.args[1])
-  if (!id) return badRequest(`usage: silver subagent ${status === 'done' ? 'done' : 'fail'} <id> [--text <result>]`)
+  if (!id) return badRequest(`usage: silver subagent ${status === 'done' ? 'done' : 'fail'} <id> [--text <result>] [--result-file <path>]`)
   const rec = await readRecord(id)
   if (!rec) return badRequest('no such subagent; run `subagent list` to see ids')
+
+  // O1 — result-file handoff. `subagent done --text` USED to `capOutput(…,
+  // MAX_PROMPT)` and SILENTLY truncate a long result. Now: if `--result-file`
+  // is given (host-wired flag `resultFile`, or a trailing positional path), or
+  // `--text` exceeds MAX_PROMPT, write the FULL result into the subagents dir
+  // and record `resultPath`; `result` keeps only a bounded preview. The parent
+  // reads the file only if it needs the whole thing.
+  const explicitFile =
+    (flags as ParsedFlags & { resultFile?: string }).resultFile ?? flags.args[2] ?? null
+  if (explicitFile) {
+    let content: string
+    try {
+      content = await fs.readFile(explicitFile, 'utf8')
+    } catch {
+      // No path in the error string (no-leak invariant).
+      return badRequest('could not read --result-file (no such file or not readable)')
+    }
+    rec.resultPath = await writeResultFile(id, content)
+    rec.result = capOutput(content, MAX_PROMPT)
+  } else if (flags.text !== undefined) {
+    if (flags.text.length > MAX_PROMPT) {
+      rec.resultPath = await writeResultFile(id, flags.text)
+      rec.result = capOutput(flags.text, MAX_PROMPT) // bounded preview; full is on disk
+    } else {
+      rec.result = flags.text
+    }
+  }
+
   rec.status = status
-  rec.result = flags.text !== undefined ? capOutput(flags.text, MAX_PROMPT) : rec.result
   rec.updatedAt = new Date().toISOString()
   await writeRecord(rec)
-  return ok({ id, status, result: present(rec.result) })
+  return ok({ id, status, result: present(rec.result), resultPath: rec.resultPath ?? null })
 }
 
 async function subagentStatus(flags: ParsedFlags): Promise<Envelope<unknown>> {
@@ -339,6 +399,7 @@ function view(rec: SubRecord): Record<string, unknown> {
     background: rec.background,
     ageMs: Date.now() - Date.parse(rec.createdAt),
     result: present(rec.result),
+    resultPath: rec.resultPath ?? null,
   }
 }
 

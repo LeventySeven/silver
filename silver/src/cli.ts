@@ -22,8 +22,10 @@ import { fileURLToPath } from 'node:url'
 import * as path from 'node:path'
 import { fail, print, type Envelope } from './core/envelope.js'
 import type { ErrorCode } from './core/errors.js'
-import { ERRORS } from './core/errors.js'
+import { ERRORS, classifyEngineError } from './core/errors.js'
 import { parseFlags, type ParsedFlags } from './core/flags.js'
+import { loadConfig, mergeConfig } from './core/config.js'
+import { suggestVerb } from './core/suggest.js'
 import { buildRegistry } from './security/registry.js'
 import { handle } from './core/handlers.js'
 import { setNamespace, setFetchEgressPolicy } from './core/session.js'
@@ -43,7 +45,21 @@ import { WaitError } from './actuation/wait.js'
  * modify), so it is dispatched here directly; the others are read-only-safe and
  * bypass the gate for clarity. None can mutate page state.
  */
-const META_VERBS = new Set(['version', 'doctor', 'skill', 'session', 'batch'])
+const META_VERBS = new Set(['version', 'doctor', 'skill', 'skills', 'session', 'batch'])
+
+/**
+ * The FULL set of real verb names (read-only + actor + meta + layer), for the D5
+ * typo suggester. A verb present here is never "suggested" (it is a real verb —
+ * an actor verb without `--enable-actions` is a permission issue, not a typo).
+ */
+function knownVerbs(): string[] {
+  const set = new Set<string>([
+    ...buildRegistry({ enableActions: true }),
+    ...META_VERBS,
+    ...LAYER_VERBS,
+  ])
+  return [...set]
+}
 
 /**
  * Verbs owned by the task-artifact / memory / subagent layers. Registered
@@ -75,7 +91,19 @@ export type RunResult = { env: Envelope<unknown>; code: number; json: boolean }
  * tests invoke directly (no child_process).
  */
 export async function run(argv: string[]): Promise<RunResult> {
-  const flags = parseFlags(argv)
+  let flags = parseFlags(argv)
+
+  // E3: merge the file/env config UNDER the CLI flags before any dispatch, so a
+  // fleet stops repeating every flag (the drift source where one batch call
+  // silently forgets `--allowed-domains` and runs unrestricted). Lists concat
+  // (config ∪ CLI); scalars the CLI set explicitly win; config fills the rest.
+  // Default-ON; `--no-config` opts out. Fail-open: a malformed config is skipped
+  // with a warning (never a thrown error), never bricking every command.
+  if (!flags.noConfig) {
+    const loaded = loadConfig()
+    flags = mergeConfig(loaded.config, flags).flags
+  }
+
   const json = flags.json
 
   // Namespace is a per-invocation, process-wide setting that scopes ALL session
@@ -107,6 +135,24 @@ export async function run(argv: string[]): Promise<RunResult> {
     readOnly: !flags.enableActions,
   })
   if (!META_VERBS.has(flags.verb) && !registry.has(flags.verb)) {
+    // D5: a not-found verb may be a typo. Compute a suggestion over the FULL
+    // known-verb table (so a real actor verb missing its --enable-actions grant is
+    // NOT "suggested" — suggestVerb returns null for an exact known verb, leaving
+    // the plain not_permitted). The suggestion is derived from a SANITIZED token
+    // prefix only and returns a verb from our own table, so no URL/selector/secret
+    // ever reaches the error string (the load-bearing no-leak detail).
+    const sug = suggestVerb(flags.verb, knownVerbs())
+    if (sug) {
+      return {
+        env: {
+          success: false,
+          data: null,
+          error: `unknown verb "${sug.input}"; did you mean \`${sug.suggestion}\`? (pass --enable-actions if it is an actor verb)`,
+        },
+        code: 1,
+        json,
+      }
+    }
     return { env: fail('not_permitted'), code: 1, json }
   }
 
@@ -135,6 +181,14 @@ export function mapThrow(err: unknown): Envelope<never> {
   }
 
   if (err instanceof Error && err.name === 'TimeoutError') return fail('timeout')
+
+  // R6: classify a raw engine throw by message needle BEFORE the generic
+  // page_crash fallback — an unreachable-host `net::ERR_*` becomes retryable
+  // `navigation_failed` (DISTINCT from the never-retry policy `navigation_blocked`)
+  // and a CDP/transport drop becomes `page_crash`. Needles only — nothing from the
+  // error object is interpolated into the surfaced string (no-leak).
+  const engineCode = classifyEngineError(err)
+  if (engineCode) return fail(engineCode)
 
   // Unknown → safe generic fallback (message is fixed; nothing from `err` leaks).
   return fail('page_crash')

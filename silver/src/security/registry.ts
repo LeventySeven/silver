@@ -54,6 +54,10 @@ const READ_ONLY_VERBS: readonly string[] = [
   'state',
   'cookies',
   'skill',
+  // K1: `skills resolve --url|--message` runs the keyless skill auto-injection
+  // matcher (pure string/regex math, no page state) — read-only-dispatchable. The
+  // `skills` alias routes to the same handler as `skill`.
+  'skills',
   'doctor',
   'version',
   // S4: the decoupled two-phase confirm gate. `confirm <id>` / `deny <id>`

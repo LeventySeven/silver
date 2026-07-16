@@ -25,6 +25,8 @@
  * stored previous fingerprint against a fresh one without a browser.
  */
 import type { Page } from 'playwright'
+import { loadRefMap, saveRefMap } from '../core/session.js'
+import { newGeneration } from '../perception/refmap.js'
 
 export type PageChange = {
   /** Echoed session generation, when the caller supplies one. */
@@ -121,6 +123,91 @@ async function fingerprintAfterSettle(page: Page, mode: SettleMode): Promise<str
     .evaluate("document.getElementsByTagName('*').length")
     .catch(() => 0)) as number
   return `${url}|${focused}|${domNodeCount}`
+}
+
+// ---------------------------------------------------------------------------
+// R4: bump the RefMap generation on an `act` that reported page_changed:true.
+//
+// The residual silent-misclick window: the generation only ever bumps on
+// `snapshot`, so a MUTATING act that changes the DOM leaves the still-present
+// refs at the SAME generation as the map — `groundRef` accepts them, yet they
+// now point at a re-rendered (physically stale) tree. Bumping the map generation
+// WITHOUT re-minting entries makes every existing entry's generation
+// (`entry.generation` = old) differ from `map.generation` (= new), so the NEXT
+// ref hard-fails `ref_stale` instead of silently misclicking.
+//
+// The hub calls this AFTER `handleAct` computes `page_changed`, passing the flag
+// through. Keyless: a single integer bump + sidecar write, no browser round-trip.
+// ---------------------------------------------------------------------------
+
+export type GenerationBump = {
+  /** Whether the generation was actually bumped (only when pageChanged). */
+  bumped: boolean
+  /** The current map generation (post-bump when bumped, unchanged otherwise). */
+  generation: number
+}
+
+/**
+ * When `pageChanged` is true, bump the session RefMap's generation so the still-
+ * present (but now physically stale) refs fail loudly on the next command. The
+ * entries are intentionally kept — they simply no longer match `map.generation`,
+ * which is exactly what `groundRef` uses to distinguish "fresh" from "stale".
+ *
+ * No-op (and reports `bumped:false`) when the page did not change or when there
+ * is no RefMap yet (no snapshot taken → nothing to invalidate). Best-effort: a
+ * missing/corrupt refmap yields `{bumped:false, generation:0}` rather than
+ * throwing, so it can never turn a successful act into a failed command.
+ */
+export async function bumpGenerationOnPageChange(
+  session: string,
+  pageChanged: boolean,
+): Promise<GenerationBump> {
+  const map = await loadRefMap(session).catch(() => null)
+  if (!map) return { bumped: false, generation: 0 }
+  if (!pageChanged) return { bumped: false, generation: map.generation }
+  const nextGen = newGeneration(map.generation)
+  // Keep the entries at their OLD generation — bumping ONLY map.generation is
+  // what turns them stale (entry.generation !== map.generation → ref_stale).
+  await saveRefMap(session, { generation: nextGen, entries: map.entries })
+  return { bumped: true, generation: nextGen }
+}
+
+// ---------------------------------------------------------------------------
+// R5a: empty-page detection. After `open`/`goto`, an anti-bot blank shell, a
+// 429/403 interstitial, or a JS bundle that never rendered leaves a DOM with
+// (almost) no nodes. Detecting it lets the hub emit an advisory `page_empty`
+// flag instead of the host acting on a page that has not actually loaded.
+// ---------------------------------------------------------------------------
+
+/**
+ * Default node-count floor below which a page is considered empty. A truly blank
+ * document (`<html><head></head><body></body></html>`) is ~3 elements; a bare
+ * interstitial a handful more. Kept low to avoid false positives on thin-but-real
+ * pages — the hub can raise it per call.
+ */
+export const EMPTY_PAGE_NODE_THRESHOLD = 5
+
+type EmptyProbe = { count: number; bodyChildren: number; bodyTextLen: number }
+
+/**
+ * True when the page's DOM is (near-)empty: either fewer than `minNodes` total
+ * elements, OR a `<body>` with no child elements and no non-whitespace text (a
+ * shell whose content never rendered). Keyless: one in-page count, no AX walk.
+ * Best-effort — an evaluate failure (page gone mid-check) reports `false` rather
+ * than throwing, so detection never turns a live command into an error.
+ */
+export async function detectEmptyPage(
+  page: Page,
+  minNodes: number = EMPTY_PAGE_NODE_THRESHOLD,
+): Promise<boolean> {
+  const probe = (await page
+    .evaluate(
+      "(() => { const c = document.getElementsByTagName('*').length; const b = document.body; return { count: c, bodyChildren: b ? b.childElementCount : 0, bodyTextLen: b ? (b.innerText || b.textContent || '').trim().length : 0 }; })()",
+    )
+    .catch(() => null)) as EmptyProbe | null
+  if (probe === null) return false
+  if (probe.count < minNodes) return true
+  return probe.bodyChildren === 0 && probe.bodyTextLen === 0
 }
 
 /** The backendNodeId of `document.activeElement`, or 0 if none/unresolved. */

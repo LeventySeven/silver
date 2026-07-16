@@ -65,6 +65,48 @@ function idAt(flags: ParsedFlags, pos: number): string | null {
   return sanitizeSegment(flags.id ?? flags.args[pos])
 }
 
+// ---------------------------------------------------------------------------
+// T5 — subprocess env hygiene for `task exec`. A fixed non-interactive child env
+// (paginators → cat, no progress bars, no color, CI mode) + a workspace-scoped
+// TMPDIR, applied for the duration of the inner dispatch and then restored.
+// ---------------------------------------------------------------------------
+
+/** The fixed env every `task exec` child inherits (defeats paginator/progress hangs). */
+export const EXEC_FIXED_ENV: Readonly<Record<string, string>> = {
+  PAGER: 'cat',
+  MANPAGER: 'cat',
+  LESS: '-R',
+  PIP_PROGRESS_BAR: 'off',
+  TQDM_DISABLE: '1',
+  CI: '1',
+  NO_COLOR: '1',
+}
+
+/** The workspace-scoped TMPDIR for a run's `task exec` children (under the run folder). */
+export function execTmpdir(id: string, n: number): string {
+  return path.join(runDirPath(id, n), 'tmp')
+}
+
+/**
+ * Merge `env` into `process.env` (so anything the inner command spawns inherits
+ * it) and return a restore fn that puts the parent env back exactly — deleting
+ * keys that were previously unset. Silver runs one command per process, so this
+ * scoped mutate/restore is the mechanism for a "child env" without a real fork.
+ */
+function applyChildEnv(env: Record<string, string>): () => void {
+  const prev = new Map<string, string | undefined>()
+  for (const [k, v] of Object.entries(env)) {
+    prev.set(k, process.env[k])
+    process.env[k] = v
+  }
+  return () => {
+    for (const [k, v] of prev) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+}
+
 export async function handleTask(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const sub = flags.args[0]
   switch (sub) {
@@ -264,8 +306,21 @@ async function taskExec(flags: ParsedFlags): Promise<Envelope<unknown>> {
   if (inner.length === 0) return badRequest('usage: silver task exec <id> -- <silver-cmd...>')
 
   const argv = buildInnerArgv(inner, flags)
-  const { run } = await import('../cli.js')
-  const res = await run(argv)
+  // T5 — subprocess env hygiene: any child the inner command spawns (a paginator
+  // like git/man/less, a progress-bar drawer like pip/tqdm, or Chromium itself)
+  // can block the capture or spam `\r`. Merge a fixed non-interactive env plus a
+  // workspace-scoped TMPDIR for the duration of the inner dispatch, restoring the
+  // parent env afterward so nothing leaks across commands. KEYLESS.
+  const tmpdir = execTmpdir(id, n)
+  await fs.mkdir(tmpdir, { recursive: true }).catch(() => {})
+  const restoreEnv = applyChildEnv({ ...EXEC_FIXED_ENV, TMPDIR: tmpdir })
+  let res: Awaited<ReturnType<(typeof import('../cli.js'))['run']>>
+  try {
+    const { run } = await import('../cli.js')
+    res = await run(argv)
+  } finally {
+    restoreEnv()
+  }
 
   // Capture the resolved ref + DOM fingerprint the inner verb reported (when
   // present) so `task compile` can auto-name variables (T1) and the replay cache
@@ -283,7 +338,23 @@ async function taskExec(flags: ParsedFlags): Promise<Envelope<unknown>> {
     ...hint,
     ...(res.env.success ? {} : { error: res.env.error }),
   })
-  await refreshManifest(id, n)
+  const manifest = await refreshManifest(id, n)
+
+  // T6a — opt-in `--echo-plan` anti-drift: append the current plan.md checklist
+  // (OPEN items first) + the original goal to the exec envelope, so a long host
+  // loop keeps the goal fresh even as its own context rots. Off by default; the
+  // host wires `--echo-plan` (flags: `echoPlan`).
+  const echoPlan = (flags as ParsedFlags & { echoPlan?: boolean }).echoPlan === true
+  let planEcho: Record<string, unknown> | null = null
+  if (echoPlan) {
+    const plan = parsePlan(await readPlan(id, n))
+    planEcho = {
+      goal: present(manifest.goal),
+      open: plan.open.map((t) => present(t)), // open (unchecked) items first
+      checked: plan.checked,
+      total: plan.total,
+    }
+  }
 
   // Return the inner envelope verbatim so the host sees exactly what the command
   // produced, plus a marker that it was recorded to the task artifact.
@@ -292,7 +363,13 @@ async function taskExec(flags: ParsedFlags): Promise<Envelope<unknown>> {
     success: res.env.success,
     data:
       res.env.success && data !== null && typeof data === 'object'
-        ? { ...(data as Record<string, unknown>), task: id, run: `run_${n}`, logged: true }
+        ? {
+            ...(data as Record<string, unknown>),
+            task: id,
+            run: `run_${n}`,
+            logged: true,
+            ...(planEcho ? { echoPlan: planEcho } : {}),
+          }
         : data,
     error: res.env.error,
     ...(res.env.warning ? { warning: res.env.warning } : {}),

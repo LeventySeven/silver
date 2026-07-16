@@ -101,6 +101,21 @@ export type ParsedFlags = {
   background: boolean
   /** `subagent spawn --tab` — child runs on its own tab in a shared browser. */
   tab: boolean
+  // ---- E3 / S5 / O1 / T6a / K1 wiring flags ----
+  /** `--action-policy <file.json>` (S5): a real deny/allow/confirm policy file
+   * consulted ahead of the confirm gate. Absent → no policy layer. */
+  actionPolicy?: string
+  /** `--result-file <path>` (O1): write a full subagent result to disk instead of
+   * truncating it into the envelope. */
+  resultFile?: string
+  /** `--echo-plan` (T6a): append the current plan/goal to each `task exec` envelope. */
+  echoPlan: boolean
+  /** `--no-config` (E3): skip the `~/.silver/config.json` + `silver.json` merge. */
+  noConfig: boolean
+  /** `--use-config` (E3): explicitly opt into the config-file merge (the default). */
+  useConfig: boolean
+  /** `--message <text>` (K1): the host message `skills resolve` scores keywords over. */
+  message?: string
   // ---- network / storage verb sub-flags (Vercel-parity) ----
   /** `network requests --filter <url-substr>`. */
   filter?: string
@@ -186,6 +201,10 @@ const VALUE_FLAGS: Record<string, keyof ParsedFlags> = {
   method: 'method',
   status: 'status',
   body: 'body',
+  // E3 / S5 / O1 / K1 wiring value flags.
+  'action-policy': 'actionPolicy',
+  'result-file': 'resultFile',
+  message: 'message',
 }
 
 /** CSV value flags → string[]. */
@@ -223,6 +242,10 @@ const BOOL_FLAGS: Record<string, keyof ParsedFlags> = {
   'grant-permissions': 'grantPermissions',
   // S4: opt into the decoupled confirm/deny two-phase gate.
   'two-phase-confirm': 'twoPhaseConfirm',
+  // T6a / E3 wiring boolean flags.
+  'echo-plan': 'echoPlan',
+  'no-config': 'noConfig',
+  'use-config': 'useConfig',
   // NOTE: `--wait` is handled explicitly in the parse loop (it is dual-purpose:
   // a bare boolean for `download --wait`, and `--wait networkidle` for the
   // mutating-verb full-settle opt-in), so it is intentionally NOT listed here.
@@ -275,6 +298,9 @@ function defaults(): ParsedFlags {
     list: false,
     background: false,
     tab: false,
+    echoPlan: false,
+    noConfig: false,
+    useConfig: false,
     resourceTypes: [],
     abort: false,
     clear: false,

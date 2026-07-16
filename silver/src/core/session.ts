@@ -18,6 +18,7 @@ import * as path from 'node:path'
 import type { Browser, BrowserContext, BrowserType, Page } from 'playwright'
 import type { RefMap } from '../perception/refmap.js'
 import { decodeStateBuffer, encryptJson, isStateEncryptionEnabled } from './state-crypto.js'
+import { classifyEngineError } from './errors.js'
 import {
   containedFilename,
   subresourceEgressDecision,
@@ -644,6 +645,30 @@ export async function connect(name: string): Promise<Connection> {
 }
 
 /**
+ * R6: connect with a SINGLE crash-reconnect. A `page_crash`-class transport drop
+ * (`Target closed` / `websocket closed` / `browser has been closed`) on the
+ * connect attempt gets exactly ONE retry before failing — a browser that dropped
+ * its CDP transport between commands is often reachable again immediately, and a
+ * bounded single retry closes that flake without risking an unbounded loop.
+ *
+ * A NON-crash failure (e.g. a dead-pid `previous browser process is gone`, or a
+ * policy/engine error) is rethrown immediately — this helper only papers over a
+ * transport drop, never a genuine "reopen the session" condition. The hub can use
+ * this in place of `connect` where a crash-resilient attach is wanted.
+ */
+export async function connectWithCrashReconnect(name: string): Promise<Connection> {
+  try {
+    return await connect(name)
+  } catch (err) {
+    if (classifyEngineError(err) !== 'page_crash') throw err
+    // One-shot reconnect: a brief settle, then a single retry. If this also
+    // fails the error propagates (mapThrow surfaces page_crash → retryable).
+    await delay(150)
+    return await connect(name)
+  }
+}
+
+/**
  * Non-chromium connect (H1): launch a fresh persistent context for `engine`
  * against the session's profile dir and adapt it to the `Connection` shape.
  *
@@ -748,6 +773,98 @@ export async function loadRefMap(name: string): Promise<RefMap | null> {
     return await readSidecarObject<RefMap>(refmapPath(name))
   } catch {
     return null
+  }
+}
+
+// ---------------------------------------------------------------------------
+// R5b: action-repetition ring. A bounded ring of the last-K `(verb, ref,
+// fingerprint)` tuples in a per-session sidecar. When the same tuple recurs K
+// times with an UNCHANGED fingerprint the host is stuck in a no-progress loop
+// (clicking a dead button, re-filling a field that never accepts). The hub calls
+// `noteAction` after each act and `isRepeating` to decide whether to stamp the
+// ADVISORY `repetition_detected` flag — it NEVER blocks the action itself.
+//
+// A dedicated sidecar (never session.json / refmap.json) keeps this soft
+// reliability signal off the correctness-critical grounding files. Encrypted at
+// rest through the shared crypto (a fingerprint embeds the page URL).
+// ---------------------------------------------------------------------------
+
+const ACTION_RING = 'action-ring.json'
+
+/** How many recent actions the ring retains. */
+export const ACTION_RING_SIZE = 8
+
+/** Consecutive identical tail entries that trip the repetition advisory. */
+export const REPETITION_THRESHOLD = 3
+
+export type ActionRingEntry = {
+  /** The actor verb (click/fill/select/…). */
+  verb: string
+  /** The bare/`@eN` ref (or coordinate token) the verb targeted. */
+  ref: string
+  /** The post-settle page fingerprint at the time of the action. */
+  fingerprint: string
+}
+
+type ActionRing = { entries: ActionRingEntry[] }
+
+function actionRingPath(name: string): string {
+  return path.join(sessionDir(name), ACTION_RING)
+}
+
+/** A stable identity key for an action tuple (NUL-joined so fields can't collide). */
+function ringKey(e: ActionRingEntry): string {
+  return `${e.verb}\u0000${e.ref}\u0000${e.fingerprint}`
+}
+
+async function loadActionRing(name: string): Promise<ActionRing> {
+  try {
+    const r = await readSidecarObject<ActionRing>(actionRingPath(name))
+    return Array.isArray(r?.entries) ? r : { entries: [] }
+  } catch {
+    return { entries: [] }
+  }
+}
+
+/**
+ * Append `entry` to the session's action ring, bounded to `ACTION_RING_SIZE`
+ * (oldest dropped). Best-effort persistence: a write failure is swallowed so a
+ * soft-signal bookkeeping error never fails the underlying act.
+ */
+export async function noteAction(name: string, entry: ActionRingEntry): Promise<void> {
+  const ring = await loadActionRing(name)
+  ring.entries.push({ verb: entry.verb, ref: entry.ref, fingerprint: entry.fingerprint })
+  if (ring.entries.length > ACTION_RING_SIZE) {
+    ring.entries = ring.entries.slice(ring.entries.length - ACTION_RING_SIZE)
+  }
+  try {
+    await fs.mkdir(sessionDir(name), { recursive: true })
+    await writeSidecar(actionRingPath(name), ring)
+  } catch {
+    /* soft signal — never fail the act on a bookkeeping write */
+  }
+}
+
+/**
+ * True when the most recent `REPETITION_THRESHOLD` ring entries are all the SAME
+ * `(verb, ref, fingerprint)` — i.e. the host repeated one action with no page
+ * change. Read-only (does not mutate the ring). Call AFTER `noteAction` so the
+ * just-taken action is included in the tail.
+ */
+export async function isRepeating(name: string): Promise<boolean> {
+  const { entries } = await loadActionRing(name)
+  if (entries.length < REPETITION_THRESHOLD) return false
+  const tail = entries.slice(entries.length - REPETITION_THRESHOLD)
+  const first = ringKey(tail[0] as ActionRingEntry)
+  return tail.every((e) => ringKey(e) === first)
+}
+
+/** Clear the action ring (e.g. after a navigation resets the working context). */
+export async function clearActionRing(name: string): Promise<void> {
+  try {
+    await fs.rm(actionRingPath(name), { force: true })
+  } catch {
+    /* nothing to clear */
   }
 }
 

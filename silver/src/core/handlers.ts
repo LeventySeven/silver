@@ -43,6 +43,8 @@ import {
   normalizeEngine,
   grantDefaultPermissions,
   autoHandleDownloads,
+  noteAction,
+  isRepeating,
   type Connection,
   type OpenOptions,
 } from './session.js'
@@ -95,7 +97,16 @@ import {
 import * as actionsMod from '../actuation/actions.js'
 import * as confirmMod from '../security/confirm.js'
 import { toLocator, ResolveError } from '../actuation/resolve.js'
-import { settleAndFingerprint, fingerprintOnly, type SettleMode } from '../actuation/pagechange.js'
+import {
+  settleAndFingerprint,
+  fingerprintOnly,
+  bumpGenerationOnPageChange,
+  detectEmptyPage,
+  type SettleMode,
+} from '../actuation/pagechange.js'
+import { withRetries } from './retry.js'
+import { loadPolicy, decideAction } from '../security/policy.js'
+import { resolveSkills, type Skill } from './skillmatch.js'
 import { waitFor, WaitError, type WaitSpec, type WaitState } from '../actuation/wait.js'
 import { buildBundle, type JsonSchema } from '../extract/transform.js'
 import { resolveIds } from '../extract/resolve.js'
@@ -290,7 +301,15 @@ async function ensureConnected(name: string, opts: OpenOptions): Promise<Connect
     const info = await readSidecar(name).catch(() => null)
     if (info?.external) throw err
     await openSession(name, opts)
-    return await connect(name)
+    // E4: the CDP attach to a FRESHLY-spawned browser is the flaky call site — the
+    // detached Chromium is still bringing up its DevTools endpoint, so the first
+    // connect can hit a connection-refused/reset the browser clears in a few ms.
+    // Retry it under bounded backoff (transient only; the hard cap surfaces
+    // `retries_exhausted` rather than looping) instead of failing the whole command.
+    return await withRetries(() => connect(name), {
+      transient: { maxRetries: 3, baseMs: 100, maxMs: 1_000 },
+      rateLimit: { maxRetries: 0 },
+    })
   }
 }
 
@@ -530,6 +549,7 @@ export async function handle(flags: ParsedFlags): Promise<Envelope<unknown>> {
     case 'doctor':
       return handleDoctor()
     case 'skill':
+    case 'skills':
       return handleSkill(flags)
     case 'dialog':
       return handleDialog(flags)
@@ -596,7 +616,17 @@ async function handleOpen(flags: ParsedFlags): Promise<Envelope<unknown>> {
     // Install the capture instrumentation BEFORE navigating so console/network
     // that fires during page load is hooked from document-start (see capture.ts).
     await ensureCapture(page, flags.session).catch(() => {})
-    await page.goto(url, gotoOpts(flags))
+    // E4: wrap the flaky navigation in a bounded internal retry. A transient blip
+    // (a 503/reset/timeout on load) is retried under bounded backoff instead of
+    // surfacing as a hard failure the host must babysit; an unreachable-host
+    // `net::ERR_*` is classified FATAL (not retried) so R6 maps it to
+    // `navigation_failed` immediately. Exhausting the hard cap throws
+    // `retries_exhausted` (never an unbounded loop). rate-limit retries disabled —
+    // a nav rarely 429s and a load retry storm would only make it worse.
+    await withRetries(() => page.goto(url, gotoOpts(flags)), {
+      transient: { maxRetries: 2 },
+      rateLimit: { maxRetries: 0 },
+    })
     // Re-install on the freshly-loaded document so the page-side wrappers persist
     // into later commands (they live in the doc's JS, surviving our disconnect).
     await ensureCapture(page, flags.session).catch(() => {})
@@ -616,6 +646,10 @@ async function handleOpen(flags: ParsedFlags): Promise<Envelope<unknown>> {
     // structured booleans on the envelope AND as an advisory warning so the host
     // can branch immediately (CAPTCHA = hand back; auth = load state/cookies).
     const hz = await detectHazards(page)
+    // R5a: a (near-)empty DOM after nav is an anti-bot blank shell / a 429-403
+    // interstitial / a bundle that never rendered — surface `page_empty` so the
+    // host reloads or changes approach rather than acting on a blank page.
+    const empty = await detectEmptyPage(page)
     return ok(
       {
         url: page.url(),
@@ -623,8 +657,9 @@ async function handleOpen(flags: ParsedFlags): Promise<Envelope<unknown>> {
         page_changed: fp.page_changed,
         ...(hz.captcha ? { captcha_detected: true } : {}),
         ...(hz.auth ? { auth_required: true } : {}),
+        ...(empty ? { page_empty: true } : {}),
       },
-      hazardWarning(hz),
+      hazardWarning(hz, false, empty),
     )
   })
 }
@@ -926,7 +961,10 @@ async function handleSnapshot(flags: ParsedFlags): Promise<Envelope<unknown>> {
     // R2/R3: cheap keyless CAPTCHA / auth-wall detection, surfaced as an advisory
     // warning alongside the page_changed flag (a read path never hard-blocks).
     const hz = await detectHazards(page)
-    return ok(presentPageText(obsv.output, flags), hazardWarning(hz, fp.page_changed))
+    // R5a: empty-DOM advisory on the snapshot path too (a snapshot of a blank
+    // shell tells the host to reload rather than parse an empty tree).
+    const empty = await detectEmptyPage(page)
+    return ok(presentPageText(obsv.output, flags), hazardWarning(hz, fp.page_changed, empty))
   })
 }
 
@@ -985,10 +1023,12 @@ async function detectHazards(page: Page): Promise<Hazards> {
 /** Compose the advisory warning for a read/nav path from detected hazards +
  * the page-changed flag. `captcha_detected` / `auth_required` code tokens are
  * embedded so the host can branch on them; messages come from the ERRORS table. */
-function hazardWarning(hz: Hazards, pageChanged = false): string | undefined {
+function hazardWarning(hz: Hazards, pageChanged = false, empty = false): string | undefined {
   const parts: string[] = []
   if (hz.captcha) parts.push(`captcha_detected: ${ERRORS.captcha_detected.message}`)
   if (hz.auth) parts.push(`auth_required: ${ERRORS.auth_required.message}`)
+  // R5a: page_empty advisory (blank shell / interstitial / unrendered bundle).
+  if (empty) parts.push(`page_empty: ${ERRORS.page_empty.message}`)
   const pc = warnIf(pageChanged)
   if (pc) parts.push(pc)
   return parts.length > 0 ? parts.join(' | ') : undefined
@@ -1044,11 +1084,19 @@ async function fetchGuarded(
     // target — a cross-origin redirect must never leak the jar to another host.
     const headers =
       cookieHeader && safeOrigin(current) === targetOrigin ? { Cookie: cookieHeader } : undefined
-    const res = await fetch(current, {
-      redirect: 'manual',
-      ...(headers ? { headers } : {}),
-      ...(signal ? { signal } : {}),
-    })
+    // E4: retry a transient fetch failure (503/reset/timeout) under bounded backoff
+    // before surfacing it. A fatal error (bad URL, DNS-not-found) is rethrown
+    // immediately; exhausting the hard cap throws `retries_exhausted` which the
+    // hub's mapThrow surfaces as the loud, distinct code (never a silent loop).
+    const res = await withRetries(
+      () =>
+        fetch(current, {
+          redirect: 'manual',
+          ...(headers ? { headers } : {}),
+          ...(signal ? { signal } : {}),
+        }),
+      { transient: { maxRetries: 2 }, rateLimit: { maxRetries: 2 } },
+    )
     if (res.status >= 300 && res.status < 400) {
       const location = res.headers.get('location')
       if (!location) return { ok: true, res } // 3xx with no target — treat as final.
@@ -1135,6 +1183,20 @@ async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
     if (!decision.allow) return fail('not_permitted')
   }
 
+  // S5: the action-policy hard gate, consulted BEFORE the destructive-name check.
+  // Precedence deny > confirm > allow > default: a `deny` is a TERMINAL hard stop a
+  // confirmation can never override (fail hard); a `confirm` routes into the
+  // existing confirm gate below even for a non-paid-looking control; an `allow`
+  // (or no policy) proceeds. loadPolicy throws a fixed, path-free message on a bad
+  // file — the hub's mapThrow surfaces it sanitized (a security file must fail LOUD).
+  let policyConfirm = false
+  if (flags.actionPolicy) {
+    const policy = loadPolicy(flags.actionPolicy)
+    const decision = decideAction(policy, verb)
+    if (decision === 'deny') return fail('not_permitted')
+    if (decision === 'confirm') policyConfirm = true
+  }
+
   const refmap = await loadRefMap(flags.session)
   if (!refmap) return fail('element_not_found')
 
@@ -1144,10 +1206,17 @@ async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
   // paid/destructive (Buy/Pay/Delete/…) are gated, and only on a NON-TTY session
   // that did not pre-approve the verb via --confirm-actions. Plain clicks/fills
   // on non-matching names stay ungated (the smoke evals' buttons are unaffected).
-  if (CONFIRM_GATED_VERBS.has(verb)) {
+  // A policy `confirm` decision forces this gate for ANY verb (not just the
+  // click/press activations the paid/destructive heuristic covers); a
+  // CONFIRM_GATED_VERB additionally trips it when its accessible name looks
+  // paid/destructive. Either trigger routes into the same confirm flow below.
+  if (policyConfirm || CONFIRM_GATED_VERBS.has(verb)) {
     const g = groundRef(refmap, ref)
     if (!g.ok) return fail(g.code)
-    if (destructivePaidBlocks(g.entry.name, flags, verb)) {
+    const gateHit =
+      policyConfirm ||
+      (CONFIRM_GATED_VERBS.has(verb) && destructivePaidBlocks(g.entry.name, flags, verb))
+    if (gateHit) {
       // S4: with `--two-phase-confirm`, DON'T hard-deny — persist the pending
       // action and hand back a `requires_confirmation` id the host resolves with
       // a separate `silver confirm <id>` / `deny <id>`. This lets an automated
@@ -1201,16 +1270,52 @@ async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
       await patchState(flags.session, { fingerprint: fp.fingerprint })
 
       if (!env.success) return env
-      return ok({
-        ...env.data,
-        page_changed: fp.page_changed,
-        stale_refs: fp.stale_refs,
-        generation: refmap.generation,
-      })
+
+      // R4: bump the refmap generation when the act STRUCTURALLY changed the page
+      // (URL or DOM-node-count changed — a focus-only fingerprint shift does NOT
+      // invalidate refs and must not bump). Bumping map.generation WITHOUT
+      // re-minting entries makes every existing ref's generation differ from the
+      // map's, so the NEXT stale ref hard-fails `ref_stale` instead of silently
+      // misclicking a re-rendered tree. Keyless: one integer bump + sidecar write.
+      const struct = structuralChange(prev?.fingerprint, fp.fingerprint)
+      await bumpGenerationOnPageChange(flags.session, struct)
+
+      // R5b: record this (verb, ref, fingerprint) in the action ring and flag a
+      // stuck no-progress loop (K identical acts, unchanged fingerprint) as an
+      // ADVISORY `repetition_detected` — never blocking the action itself.
+      await noteAction(flags.session, { verb, ref, fingerprint: fp.fingerprint })
+      const repeating = await isRepeating(flags.session)
+
+      return ok(
+        {
+          ...env.data,
+          page_changed: fp.page_changed,
+          stale_refs: fp.stale_refs,
+          generation: refmap.generation,
+          ...(repeating ? { repetition_detected: true } : {}),
+        },
+        repeating ? `repetition_detected: ${ERRORS.repetition_detected.message}` : undefined,
+      )
     } finally {
       await cdp.detach().catch(() => {})
     }
   })
+}
+
+/**
+ * R4 helper: did the act STRUCTURALLY change the page — a URL change or a
+ * DOM-node-count change — as opposed to a mere focus shift? The page fingerprint
+ * is `url|focusedBackendId|domNodeCount`; a focus-only change (index 1) does not
+ * invalidate the current refmap, so it must NOT trigger a generation bump (else a
+ * `focus @eN` followed by `get value @eN` would spuriously fail ref_stale). A
+ * missing previous fingerprint means "no basis" → not a structural change.
+ */
+function structuralChange(prev: string | null | undefined, cur: string): boolean {
+  if (!prev) return false
+  const p = prev.split('|')
+  const c = cur.split('|')
+  // Compare url (index 0) and domNodeCount (last index); ignore focus (index 1).
+  return p[0] !== c[0] || p[p.length - 1] !== c[c.length - 1]
 }
 
 /**
@@ -2107,88 +2212,211 @@ async function listSessionNames(): Promise<string[]> {
 // ---------------------------------------------------------------------------
 
 /**
- * Static `Fix:` strings per doctor check (F2), errors.ts fixed-string style: no
- * path/host/secret interpolation. Surfaced ONLY on a failed check so the host
- * gets a concrete next step instead of guessing.
+ * K4: structured doctor check. Each carries a status, a host-facing message, and
+ * (on failure) a concrete REMEDIATION COMMAND — the host gets a next step instead
+ * of a bare boolean to guess at. `fix` is a fixed, path-free string (errors.ts
+ * no-leak style); `details` is an optional sanitized count/label, never a path.
  */
-const DOCTOR_FIXES: Record<string, string> = {
-  playwright: 'Fix: run `npm install` to install the playwright dependency',
-  chromium: 'Fix: run `npx playwright install chromium` to download the browser',
-  browser_launch:
-    'Fix: a headless launch failed — run `npx playwright install-deps` (Linux) or check the sandbox/shared libraries; on CI ensure the container ships Chromium runtime deps',
-  uab_writable:
-    'Fix: ~/.silver is not writable — check the home directory permissions / disk space',
+type DoctorStatus = 'pass' | 'fail' | 'warn' | 'skip'
+type DoctorCheck = {
+  name: string
+  status: DoctorStatus
+  message: string
+  fix?: string
+  details?: string
 }
 
+/**
+ * K4: structured doctor report — `{checks:[{name,status,message,fix,details}],
+ * verdict, next, passed, total}`. Probes: playwright import, a PRESENT Chromium
+ * executable, a REAL headless launch (the completeness proof `existsSync` misses),
+ * ~/.silver writability, session-lock staleness, and CDP-reachability of any live
+ * session. Each failing check ships a remediation command so a host self-repairs.
+ */
 async function handleDoctor(): Promise<Envelope<unknown>> {
-  const checks: Record<string, boolean> = {
-    playwright: false,
-    chromium: false,
-    browser_launch: false,
-    uab_writable: false,
-  }
+  const checks: DoctorCheck[] = []
 
-  // playwright module import + a PRESENT executable.
+  // 1. playwright module import + 2. a PRESENT Chromium executable.
   let chromiumType: typeof import('playwright').chromium | null = null
+  let chromiumPresent = false
   try {
     const { chromium } = await import('playwright')
-    checks.playwright = true
     chromiumType = chromium
+    checks.push({ name: 'playwright', status: 'pass', message: 'playwright module loads' })
     const exec = chromium.executablePath()
-    checks.chromium = Boolean(exec) && existsSync(exec)
+    chromiumPresent = Boolean(exec) && existsSync(exec)
+    checks.push(
+      chromiumPresent
+        ? { name: 'chromium', status: 'pass', message: 'the Chromium executable is present' }
+        : {
+            name: 'chromium',
+            status: 'fail',
+            message: 'the Chromium browser is not installed',
+            fix: 'npx playwright install chromium',
+          },
+    )
   } catch {
-    checks.playwright = false
-    checks.chromium = false
+    checks.push({
+      name: 'playwright',
+      status: 'fail',
+      message: 'the playwright dependency could not be loaded',
+      fix: 'npm install',
+    })
+    checks.push({
+      name: 'chromium',
+      status: 'fail',
+      message: 'cannot check for Chromium — playwright did not load',
+      fix: 'npm install',
+    })
   }
 
-  // F2: a REAL headless launch + 1x1 screenshot + close probe. `existsSync(exec)`
-  // alone reads `chromium:true` on a broken sandbox / missing shared lib (the #1
-  // CI failure); actually driving the browser catches it. Only attempted when the
-  // executable is present, so a missing-binary case fails `chromium` (not this).
-  if (checks.chromium && chromiumType) {
+  // 3. A REAL headless launch + 1x1 screenshot + close (the completeness probe:
+  // `existsSync(exec)` reads present on a broken sandbox / partial install / missing
+  // shared lib — the #1 CI failure — but actually driving the browser catches it).
+  if (chromiumPresent && chromiumType) {
     let browser: import('playwright').Browser | null = null
     try {
-      // A patient timeout: a doctor probe should not false-negative under load.
       browser = await chromiumType.launch({ headless: true, timeout: 60_000 })
       const page = await browser.newPage()
       await page.setViewportSize({ width: 1, height: 1 })
       await page.screenshot()
-      checks.browser_launch = true
+      checks.push({
+        name: 'browser_launch',
+        status: 'pass',
+        message: 'a headless Chromium launched and rendered a screenshot',
+      })
     } catch {
-      checks.browser_launch = false
+      checks.push({
+        name: 'browser_launch',
+        status: 'fail',
+        message: 'the Chromium executable is present but a headless launch failed (partial install or missing system libraries)',
+        fix: 'npx playwright install --with-deps chromium',
+      })
     } finally {
       if (browser) await browser.close().catch(() => {})
     }
+  } else {
+    checks.push({
+      name: 'browser_launch',
+      status: 'skip',
+      message: 'skipped the launch probe — Chromium is not installed',
+      fix: 'npx playwright install chromium',
+    })
   }
 
-  // ~/.silver writability probe.
+  // 4. ~/.silver writability.
   try {
     const root = path.join(os.homedir(), '.silver')
     await fs.mkdir(root, { recursive: true })
     const probe = path.join(root, `.doctor-${process.pid}`)
     await fs.writeFile(probe, 'ok', 'utf8')
     await fs.rm(probe, { force: true })
-    checks.uab_writable = true
+    checks.push({ name: 'uab_writable', status: 'pass', message: 'the ~/.silver state dir is writable' })
   } catch {
-    checks.uab_writable = false
+    checks.push({
+      name: 'uab_writable',
+      status: 'fail',
+      message: 'the ~/.silver state dir is not writable (permissions or disk space)',
+      fix: 'chmod u+rwx ~/.silver  # or free disk space',
+    })
   }
 
-  const keys = Object.keys(checks)
-  const passed = keys.filter((k) => checks[k]).length
-  // Attach a static Fix: string for every FAILED check (F2).
-  const fixes: Record<string, string> = {}
-  for (const k of keys) if (!checks[k] && DOCTOR_FIXES[k]) fixes[k] = DOCTOR_FIXES[k]
+  // 5. Session-lock staleness: a `.lock` whose holder pid is dead is a leftover
+  // from a crashed command; it will be auto-stolen on next use, but surface it.
+  checks.push(await doctorSessionLocks())
 
-  return ok({
-    ...checks,
-    passed,
-    total: keys.length,
-    ok: passed === keys.length,
-    ...(Object.keys(fixes).length > 0 ? { fixes } : {}),
-  })
+  // 6. CDP-reachability of any live session (a running/attached browser we can
+  // actually connect to). No live session → skip (nothing to probe).
+  checks.push(await doctorCdpReachable())
+
+  const passed = checks.filter((c) => c.status === 'pass').length
+  const total = checks.length
+  const firstFail = checks.find((c) => c.status === 'fail')
+  const verdict: 'ok' | 'issues' = firstFail ? 'issues' : 'ok'
+  const next = firstFail
+    ? firstFail.fix ?? firstFail.message
+    : 'all checks passed — silver is ready'
+
+  return ok({ checks, verdict, next, passed, total })
+}
+
+/** K4 check: scan session `.lock` files for a dead-holder (stale) lock. */
+async function doctorSessionLocks(): Promise<DoctorCheck> {
+  let stale = 0
+  let scanned = 0
+  try {
+    for (const name of await listSessionNames()) {
+      scanned++
+      let rec: { pid?: unknown } | null = null
+      try {
+        rec = JSON.parse(readFileSync(path.join(sessionDir(name), '.lock'), 'utf8'))
+      } catch {
+        continue // no lock (the common case) or unreadable — not counted stale
+      }
+      if (typeof rec?.pid === 'number' && !isPidAlive(rec.pid)) stale++
+    }
+  } catch {
+    return { name: 'session_locks', status: 'warn', message: 'could not enumerate sessions' }
+  }
+  if (stale === 0) {
+    return {
+      name: 'session_locks',
+      status: 'pass',
+      message: 'no stale session locks',
+      details: `${scanned} session(s) scanned`,
+    }
+  }
+  return {
+    name: 'session_locks',
+    status: 'warn',
+    message: 'stale session lock(s) from a crashed command (auto-stolen on next use)',
+    fix: 'silver close --all  # or remove the affected session',
+    details: `${stale} stale of ${scanned}`,
+  }
+}
+
+/** K4 check: can we actually attach over CDP to a live session? */
+async function doctorCdpReachable(): Promise<DoctorCheck> {
+  let target: string | null = null
+  try {
+    for (const name of await listSessionNames()) {
+      const info = await readSidecar(name).catch(() => null)
+      if (info && (info.external === true || isPidAlive(info.pid))) {
+        target = name
+        break
+      }
+    }
+  } catch {
+    /* fall through to skip */
+  }
+  if (!target) {
+    return {
+      name: 'cdp_reachable',
+      status: 'skip',
+      message: 'no live session to probe — start one with `silver open <url>`',
+    }
+  }
+  try {
+    const conn = await connect(target)
+    await conn.browser.close().catch(() => {})
+    return { name: 'cdp_reachable', status: 'pass', message: 'a live session is reachable over CDP' }
+  } catch {
+    return {
+      name: 'cdp_reachable',
+      status: 'fail',
+      message: 'a session is marked live but its CDP endpoint is unreachable (the browser may have died)',
+      fix: 'silver close --all  # then re-open',
+    }
+  }
 }
 
 function handleSkill(flags: ParsedFlags): Envelope<unknown> {
+  // K1: `skills resolve --url <url> [--message <text>]` runs the keyless skill
+  // auto-injection matcher (Aside hat/gat scorers) over the on-disk skill
+  // descriptors: non-site-specific skills are always on; site-specific ones stay
+  // hidden until a URL-glob or keyword match fires. Intercepted first so `resolve`
+  // is never mistaken for a reference name. Pure string/regex math — no page state.
+  if (flags.args[0] === 'resolve') return handleSkillResolve(flags)
   // `skill install [target-dir]` drops the on-disk skill payload into a project
   // (so `npx github:LeventySeven/silver skill install` works). Intercepted BEFORE
   // the `<ref>` catalog path so `install` is never mistaken for a reference name.
@@ -2258,6 +2486,101 @@ function handleSkill(flags: ParsedFlags): Envelope<unknown> {
     )
   }
   return ok(short)
+}
+
+// ---------------------------------------------------------------------------
+// K1: skill auto-injection resolution. Load the on-disk skill descriptors (each
+// SKILL/reference `.md`, its optional flat frontmatter block parsed for
+// siteSpecific / keywords / urls) and hand them to the keyless resolveSkills
+// matcher. A skill with no frontmatter is non-site-specific (always on).
+// ---------------------------------------------------------------------------
+
+/** Parse a leading `---\n…\n---` frontmatter block into a flat key→value map. */
+function parseFrontmatter(md: string): { fm: Record<string, string>; body: string } {
+  const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(md)
+  if (!m) return { fm: {}, body: md }
+  const fm: Record<string, string> = {}
+  for (const line of m[1].split(/\r?\n/)) {
+    const idx = line.indexOf(':')
+    if (idx <= 0) continue
+    const key = line.slice(0, idx).trim()
+    const val = line.slice(idx + 1).trim()
+    if (key.length > 0) fm[key.toLowerCase()] = val
+  }
+  return { fm, body: md.slice(m[0].length) }
+}
+
+/** Split a comma/whitespace flat list value (`a, b c`) into trimmed tokens. */
+function splitListValue(raw: string | undefined): string[] {
+  if (!raw) return []
+  return raw
+    .replace(/^\[|\]$/g, '')
+    .split(/[,\s]+/)
+    .map((s) => s.trim().replace(/^["']|["']$/g, ''))
+    .filter((s) => s.length > 0)
+}
+
+/** First meaningful line of a skill body, for a short description. */
+function firstDescription(body: string): string | undefined {
+  for (const line of body.split(/\r?\n/)) {
+    const t = line.replace(/^#+\s*/, '').replace(/\*\*/g, '').trim()
+    if (t.length > 0) return t.length > 160 ? t.slice(0, 157) + '…' : t
+  }
+  return undefined
+}
+
+/** Load skill descriptors from the on-disk skill payload (core SKILL + references). */
+function loadSkillDescriptors(): Skill[] {
+  const coreDir = path.join(PACKAGE_ROOT, 'skill-data', 'core')
+  const files: { name: string; rel: string }[] = [{ name: 'core', rel: 'SKILL.md' }]
+  try {
+    for (const f of readdirSync(path.join(coreDir, 'reference')).sort()) {
+      if (f.endsWith('.md')) files.push({ name: f.slice(0, -3), rel: path.join('reference', f) })
+    }
+  } catch {
+    /* no reference dir in this build — just the core SKILL */
+  }
+  const skills: Skill[] = []
+  for (const { name, rel } of files) {
+    let raw: string
+    try {
+      raw = readFileSync(path.join(coreDir, rel), 'utf8')
+    } catch {
+      continue
+    }
+    const { fm, body } = parseFrontmatter(raw)
+    const urls = splitListValue(fm.urls ?? fm.url)
+    const keywords = splitListValue(fm.keywords)
+    const siteSpecific = /^(1|true|yes|on)$/i.test((fm.sitespecific ?? '').trim())
+    const skill: Skill = { name, path: rel }
+    const description = firstDescription(body)
+    if (description) skill.description = description
+    if (siteSpecific) skill.siteSpecific = true
+    if (urls.length > 0 || keywords.length > 0) {
+      const autoInject: Skill['autoInject'] = {}
+      if (urls.length > 0) autoInject.url = urls
+      if (keywords.length > 0) autoInject.keywords = keywords
+      skill.autoInject = autoInject
+    }
+    skills.push(skill)
+  }
+  return skills
+}
+
+/** K1 handler: score the loaded skills against `--url` / `--message` and return
+ * the applicable ones (always-on + URL/keyword matches), most-specific first. */
+function handleSkillResolve(flags: ParsedFlags): Envelope<unknown> {
+  const url = flags.url ?? ''
+  const message = flags.message ?? ''
+  const skills = loadSkillDescriptors()
+  const matches = resolveSkills(url, message, skills).map((m) => ({
+    name: m.skill.name,
+    score: m.score,
+    reason: m.reason,
+    ...(m.skill.description ? { description: m.skill.description } : {}),
+    ...(m.skill.path ? { path: m.skill.path } : {}),
+  }))
+  return ok({ url: url || null, matched: matches.length, matches })
 }
 
 /**

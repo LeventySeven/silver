@@ -170,6 +170,10 @@ type ScanRecord = {
   prune: boolean
   /** C1: present iff this element is a hint-bearing form control (select / typed input). */
   formHint: FormHint | null
+  /** P1 (ARIA-paradox): text of an element whose ARIA `role` is interactive, used
+   * to NAME a `role=button aria-label=""`-style node whose accessible name is
+   * empty. Empty string when the element is not ARIA-interactive / has no text. */
+  roleText: string | null
 }
 type CursorInfo = {
   kind: string
@@ -234,6 +238,9 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
     const cursorByBackend = new Map<number, CursorInfo>()
     const pruneSet = new Set<number>()
     const hintByBackend = new Map<number, FormHint>()
+    // P1 (ARIA-paradox): backendNodeId -> synthesizable text for an
+    // interactive-ARIA-role node whose accessible name is empty.
+    const roleTextByBackend = new Map<number, string>()
     if (!scan.bail) {
       scan.records.forEach((rec, idx) => {
         const backend = idxToBackend.get(idx)
@@ -249,6 +256,7 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
         }
         if (rec.prune) pruneSet.add(backend)
         if (rec.formHint) hintByBackend.set(backend, rec.formHint)
+        if (rec.roleText) roleTextByBackend.set(backend, rec.roleText)
       })
     }
 
@@ -334,7 +342,13 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
 
         const cursorInfo = isMain && backend >= 0 ? cursorByBackend.get(backend) : undefined
         const cursorInteractive = cursorInfo !== undefined
-        const keepException = cursorInteractive || role === 'checkbox' || role === 'radio'
+        // P1 (ARIA-paradox): a `<div role="button" aria-label="">Save</div>` is
+        // ref-eligible (interactive role) but has an EMPTY accessible name, and
+        // Chrome may mark such a nameless node `ignored`. When we captured its
+        // text, keep it from being pruned so that text can name it below.
+        const hasRoleText = isMain && backend >= 0 && roleTextByBackend.has(backend)
+        const keepException =
+          cursorInteractive || role === 'checkbox' || role === 'radio' || hasRoleText
         const ignored = node.ignored === true
         const hiddenPruned = isMain && backend >= 0 && pruneSet.has(backend)
         const prune = (ignored || hiddenPruned) && !keepException
@@ -347,12 +361,20 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
         const dom = backend >= 0 ? domLookup.get(backend) : undefined
         const attrs = dom?.attrs ?? {}
         const rawName = asString(node.name?.value)
+        // P1 (ARIA-paradox): synthesize a name for an empty-named node from its
+        // own text — cursor-interactive text first, then the ARIA-interactive
+        // text captured for the paradox case (`role=button aria-label=""`). Pass
+        // empty attribute values as `undefined` so an empty `aria-label` does not
+        // short-circuit the accessible-name fallback chain to "".
+        const fallbackText =
+          cursorInfo?.text ??
+          (isMain && backend >= 0 ? roleTextByBackend.get(backend) : undefined)
         const name = accessibleName(rawName, {
-          ariaLabel: attrs['aria-label'],
-          alt: attrs['alt'],
-          title: attrs['title'],
-          placeholder: attrs['placeholder'],
-          textContent: interactive ? cursorInfo?.text : undefined,
+          ariaLabel: attrs['aria-label'] || undefined,
+          alt: attrs['alt'] || undefined,
+          title: attrs['title'] || undefined,
+          placeholder: attrs['placeholder'] || undefined,
+          textContent: interactive ? fallbackText : undefined,
         })
         const value = asString(node.value?.value)
 
@@ -402,6 +424,13 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
           if (hint.min !== null) snap.min = hint.min
           if (hint.max !== null) snap.max = hint.max
           if (hint.options && hint.options.length > 0) snap.options = hint.options
+        }
+
+        // P3: Chrome exposes a native `<input type=file>` as a generic `button`
+        // (name "Choose File") — tag it so the serializer relabels it, so the
+        // host does not treat a file picker as an ordinary button.
+        if (nodeName === 'input' && (attrs['type'] ?? '').toLowerCase() === 'file') {
+          snap.inputType = 'file'
         }
 
         result.push(snap)
@@ -750,6 +779,16 @@ const SCAN_JS = `(function () {
       }
     })();
 
+    // P1 (ARIA-paradox): an element whose ARIA role IS interactive (the AX tree
+    // will call it button/link/etc and mint a ref) but whose accessible name may
+    // be empty (confidently-wrong \`role=button aria-label=""\`). Capture its text
+    // as a name fallback so the ref is usable instead of empty-named.
+    var roleText = null;
+    var roleAttr = (el.getAttribute('role') || '').toLowerCase();
+    if (roleAttr && interactiveRoles[roleAttr]) {
+      roleText = (el.textContent || '').trim().slice(0, 100);
+    }
+
     // C1 format hints: capture select options + typed-input metadata so the
     // serializer can tell the agent the shape to fill. Runs for EVERY element
     // (many are interactive tags the cursor scan skips) — cheap attribute reads.
@@ -769,9 +808,9 @@ const SCAN_JS = `(function () {
       }
     }
 
-    if (cur || prune || fh) {
+    if (cur || prune || fh || roleText) {
       el.setAttribute('data-__uab-idx', String(out.length));
-      out.push({ cur: cur, kind: kind, hints: hints, text: text, hiddenInputType: hiddenInputType, hiddenInputChecked: hiddenInputChecked, prune: prune, formHint: fh });
+      out.push({ cur: cur, kind: kind, hints: hints, text: text, hiddenInputType: hiddenInputType, hiddenInputChecked: hiddenInputChecked, prune: prune, formHint: fh, roleText: roleText });
     }
   }
   return { bail: false, records: out };
