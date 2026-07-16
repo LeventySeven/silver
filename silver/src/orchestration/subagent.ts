@@ -37,6 +37,7 @@ import type { ParsedFlags } from '../core/flags.js'
 import { withSessionLock } from '../core/lock.js'
 import { nsRoot, sanitizeSegment } from '../core/nsdirs.js'
 import { neutralize, capOutput } from '../security/injection.js'
+import { assertContainedPath } from '../security/egress.js'
 
 export const SUBAGENTS_SUB = 'subagents'
 
@@ -344,9 +345,19 @@ async function subagentMark(flags: ParsedFlags, status: 'done' | 'failed'): Prom
   const explicitFile =
     (flags as ParsedFlags & { resultFile?: string }).resultFile ?? flags.args[2] ?? null
   if (explicitFile) {
+    // Path containment (mirrors screenshot/upload/state in core/handlers.ts): a
+    // `--result-file` may only be read from INSIDE the working directory. Without
+    // this, `subagent done <id> --result-file /etc/passwd` — reachable on the
+    // always-available read-only verb path, no --enable-actions — is an
+    // unauthenticated arbitrary local file-read. Fail-closed; the path is never
+    // echoed (no-leak invariant). A read-only child still reports its own result
+    // by writing it inside the project dir, so cwd-containment is the right,
+    // consistent boundary — not an actions gate.
+    const contained = assertContainedPath(explicitFile)
+    if (!contained.ok) return fail('path_denied')
     let content: string
     try {
-      content = await fs.readFile(explicitFile, 'utf8')
+      content = await fs.readFile(contained.resolved, 'utf8')
     } catch {
       // No path in the error string (no-leak invariant).
       return badRequest('could not read --result-file (no such file or not readable)')

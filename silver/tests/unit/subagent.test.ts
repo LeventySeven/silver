@@ -217,11 +217,13 @@ describe('silver subagent — keyless scoped-child orchestration', () => {
     await nuke(ns)
   })
 
-  it('O1: --result-file <path> moves the file into the subagents dir + records resultPath', async () => {
+  it('O1: --result-file <path> (in-cwd) moves the file into the subagents dir + records resultPath', async () => {
     const ns = `${NS}-rf`
     await run(['subagent', 'spawn', 'file handoff', '--enable-actions', '--namespace', ns])
 
-    const src = path.join(os.tmpdir(), `silver-result-${process.pid}-${Date.now()}.txt`)
+    // A child legitimately writes its result INSIDE the working dir; that path is
+    // contained, so the handoff reads it (see the path-containment guard below).
+    const src = path.join(process.cwd(), `silver-result-${process.pid}-${Date.now()}.txt`)
     const body = 'a big external result\n'.repeat(2000) + 'FILE_TAIL_MARKER'
     await fs.writeFile(src, body, 'utf8')
 
@@ -231,7 +233,7 @@ describe('silver subagent — keyless scoped-child orchestration', () => {
     expect(typeof d.resultPath).toBe('string')
     const onDisk = await fs.readFile(d.resultPath, 'utf8')
     expect(onDisk).toBe(body)
-    // The stored copy lives under the subagents dir (not the caller's temp path).
+    // The stored copy lives under the subagents dir (not the caller's source path).
     expect(d.resultPath).not.toBe(src)
     expect(d.resultPath).toContain(path.join(sanitizeNamespace(ns), 'subagents'))
 
@@ -242,10 +244,52 @@ describe('silver subagent — keyless scoped-child orchestration', () => {
   it('O1: --result-file that cannot be read fails cleanly WITHOUT leaking the path', async () => {
     const ns = `${NS}-rfbad`
     await run(['subagent', 'spawn', 'bad file', '--enable-actions', '--namespace', ns])
-    const secretPath = '/nonexistent/SECRET_PATH_TOKEN/result.txt'
+    const secretPath = path.join(process.cwd(), 'nonexistent-SECRET_PATH_TOKEN', 'result.txt')
     const done = await run(['subagent', 'done', 'sa1', '--result-file', secretPath, '--namespace', ns])
     expect(done.env.success).toBe(false)
     expect(done.env.error).not.toContain('SECRET_PATH_TOKEN')
+    await nuke(ns)
+  })
+
+  // -------------------------------------------------------------------------
+  // SECURITY — `--result-file` path containment. `subagent done`/`fail` are on
+  // the always-available read-only verb path (no --enable-actions), so an
+  // unrestricted read of `--result-file` is an unauthenticated arbitrary local
+  // file-read. The path must resolve inside the working directory or be refused
+  // (path_denied) fail-closed, with the path never echoed.
+  // -------------------------------------------------------------------------
+  it('SEC: --result-file with an out-of-cwd absolute path is refused (path_denied), file not read, no .result.txt', async () => {
+    const ns = `${NS}-rfesc`
+    await run(['subagent', 'spawn', 'exfil attempt', '--enable-actions', '--namespace', ns])
+
+    // /etc/passwd EXISTS and is readable — so if the guard were missing this WOULD
+    // be read. Refusal here proves it's the containment check, not a missing file.
+    const done = await run(['subagent', 'done', 'sa1', '--result-file', '/etc/passwd', '--namespace', ns])
+    expect(done.env.success).toBe(false)
+    expect(done.env.error).toBe(ERRORS.path_denied.message)
+
+    // The refusal is fail-closed: no result recorded, no full-result file persisted.
+    const d = data<{ resultPath: string | null } | null>(done)
+    expect(d).toBeNull()
+    const resultFile = path.join(
+      os.homedir(),
+      '.silver',
+      sanitizeNamespace(ns),
+      'subagents',
+      'sa1.result.txt',
+    )
+    await expect(fs.access(resultFile)).rejects.toThrow()
+
+    await nuke(ns)
+  })
+
+  it('SEC: --result-file out-of-cwd via a trailing positional path is also refused (path_denied)', async () => {
+    const ns = `${NS}-rfpos`
+    await run(['subagent', 'spawn', 'exfil attempt 2', '--enable-actions', '--namespace', ns])
+    // `subagent done <id> <path>` — the trailing positional is the same read sink.
+    const done = await run(['subagent', 'done', 'sa1', '/etc/passwd', '--namespace', ns])
+    expect(done.env.success).toBe(false)
+    expect(done.env.error).toBe(ERRORS.path_denied.message)
     await nuke(ns)
   })
 })
