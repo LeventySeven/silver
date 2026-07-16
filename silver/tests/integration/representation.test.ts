@@ -54,6 +54,20 @@ const REDACT_PAGE = `<!doctype html>
   <input type="text" value="keepme" aria-label="plainfield">
 </body></html>`
 
+// A page where card numbers appear as VISIBLE TEXT and in an accessible NAME —
+// the surfaces `get html`/`redactValue` do NOT cover, so before the maskCards
+// fix (Bug #8) they leaked via read / get text / snapshot while `get html`
+// masked the same card. Includes a card glued to a letter (Bug #4 boundary).
+const CARD_TEXT_PAGE = `<!doctype html>
+<html><head><title>Card text</title></head><body>
+  <h1>Receipt</h1>
+  <p>Your card 4111 1111 1111 1111 was charged.</p>
+  <p>Ref status 4111111111111111ok complete.</p>
+  <button aria-label="cardbtn">4111 1111 1111 1111</button>
+  <button aria-label="gluedbtn">4111111111111111ok</button>
+  <button aria-label="4111 1111 1111 1111 pay">Buy</button>
+</body></html>`
+
 let server: Server
 let base: string
 
@@ -81,7 +95,9 @@ describe('representation phase-1: get html / get box / sparse_tree', () => {
           ? CANVAS_BUSY_PAGE
           : url.startsWith('/redact')
             ? REDACT_PAGE
-            : CANVAS_PAGE
+            : url.startsWith('/cardtext')
+              ? CARD_TEXT_PAGE
+              : CANVAS_PAGE
       res.writeHead(200, { 'content-type': 'text/html' })
       res.end(body)
     })
@@ -243,5 +259,53 @@ describe('representation phase-1: get html / get box / sparse_tree', () => {
     expect(html).toContain('keepme')
     // The grounding stamp is still stripped (existing behavior preserved).
     expect(html).not.toContain('data-silver-ref')
+  })
+
+  // --- Bug #8: a card in VISIBLE TEXT / accessible NAME must redact via the
+  //     read paths (read / get text / snapshot) the same way get html does. ---
+  it('get text @ref redacts a card that is the element visible text', async () => {
+    await run(['open', `${base}/cardtext`, '--session', NAME])
+    await run(['snapshot', '-i', '--session', NAME])
+    const map = await loadRefMap(NAME)
+
+    const cardRef = refByName(map!, 'cardbtn')
+    const res = await run(['get', 'text', `@${cardRef}`, '--session', NAME])
+    expect(res.env.success).toBe(true)
+    expect(String(res.env.data)).toContain('[redacted]')
+    expect(String(res.env.data)).not.toContain('4111')
+
+    // Bug #4 boundary: a card glued to a letter must redact too.
+    const gluedRef = refByName(map!, 'gluedbtn')
+    const glued = await run(['get', 'text', `@${gluedRef}`, '--session', NAME])
+    expect(String(glued.env.data)).toContain('[redacted]')
+    expect(String(glued.env.data)).not.toContain('4111')
+  })
+
+  it('get text (whole page) redacts spaced AND glued cards in visible text', async () => {
+    await run(['open', `${base}/cardtext`, '--session', NAME])
+    const res = await run(['get', 'text', '--session', NAME])
+    expect(res.env.success).toBe(true)
+    const text = String(res.env.data)
+    expect(text).toContain('[redacted]')
+    expect(text).not.toContain('4111')
+  })
+
+  it('read <url> redacts a card that appears as visible page text', async () => {
+    const res = await run(['read', `${base}/cardtext`, '--session', NAME])
+    expect(res.env.success).toBe(true)
+    const md = res.env.data as string
+    expect(md).toContain('[redacted]')
+    expect(md).not.toContain('4111')
+  })
+
+  it('snapshot -i redacts a card carried in an accessible name', async () => {
+    await run(['open', `${base}/cardtext`, '--session', NAME])
+    const res = await run(['snapshot', '-i', '--session', NAME])
+    expect(res.env.success).toBe(true)
+    const tree = String(res.env.data)
+    // The Buy button's aria-label carried the card into its accessible NAME —
+    // a surface redactValue does not touch. maskCards at presentPageText masks it.
+    expect(tree).toContain('[redacted]')
+    expect(tree).not.toContain('4111')
   })
 })

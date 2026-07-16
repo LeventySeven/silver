@@ -29,6 +29,7 @@ import {
   SecretRegistry,
 } from '../../src/security/secret.js'
 import { ERRORS } from '../../src/core/errors.js'
+import { redactValue, maskCards, REDACTED } from '../../src/security/redact.js'
 
 // ---------------------------------------------------------------------------
 // egress: assertNavigable
@@ -995,5 +996,85 @@ describe('taint: taintGuardCheck (opt-in provenance guard)', () => {
       expect(TAINT_SENSITIVE_VERBS.has(v), v).toBe(true)
     }
     expect(TAINT_SENSITIVE_VERBS.has('snapshot')).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// redact: CARD_RE digit-run boundaries (Bug #4) + maskCards (Bug #8)
+// ---------------------------------------------------------------------------
+
+describe('redact: card boundary matching (CARD_RE via redactValue)', () => {
+  // redactValue's card signal uses the non-global CARD_RE.test(). A value that
+  // LOOKS like a card must redact even when glued to a letter/digit — the old
+  // \b anchors silently passed those through.
+  const matches = [
+    '4111111111111111ok', // glued to a trailing word (no separator)
+    '4111 1111 1111 1111', // space-grouped
+    'X4111111111111111', // glued to a leading letter
+    '4111-1111-1111-1111approved', // dash-grouped + glued trailing word
+    '4111111111111111', // a bare 16-digit run
+    '4111111111111', // minimum 13-digit run
+  ]
+  for (const v of matches) {
+    it(`redacts card-shaped value ${JSON.stringify(v)}`, () => {
+      expect(redactValue('textbox', 'field', v)).toBe(REDACTED)
+    })
+  }
+
+  const nonMatches = [
+    '123456', // too short (6-digit code)
+    '3.14159265358979', // plain decimal, not a card
+    '12345678901234567890', // 20-digit pure run (fragment of a longer number)
+  ]
+  for (const v of nonMatches) {
+    it(`keeps non-card value ${JSON.stringify(v)} unchanged`, () => {
+      expect(redactValue('textbox', 'field', v)).toBe(v)
+    })
+  }
+})
+
+describe('redact: maskCards (visible-text choke, CARD_RE_G)', () => {
+  it('masks a space-grouped card in prose', () => {
+    const out = maskCards('Your card 4111 1111 1111 1111 was charged.')
+    expect(out).toContain(REDACTED)
+    expect(out).not.toContain('4111')
+  })
+
+  it('masks a card glued directly to a word (no separator)', () => {
+    const out = maskCards('status=4111111111111111ok')
+    expect(out).toContain(REDACTED)
+    expect(out).not.toContain('4111')
+  })
+
+  it('masks a card glued to a leading letter', () => {
+    const out = maskCards('X4111111111111111')
+    expect(out).not.toContain('4111')
+    expect(out).toContain(REDACTED)
+  })
+
+  it('masks a dash-grouped card followed by a word', () => {
+    const out = maskCards('4111-1111-1111-1111approved')
+    expect(out).not.toContain('4111')
+    expect(out).toContain(REDACTED)
+  })
+
+  it('masks EVERY card in a multi-card blob', () => {
+    const out = maskCards('a 4111111111111111 b 4222222222222222 c')
+    expect(out).not.toMatch(/\d/)
+    expect(out).toBe(`a ${REDACTED} b ${REDACTED} c`)
+  })
+
+  it('leaves non-card digit content alone', () => {
+    expect(maskCards('pi is 3.14159265358979 today')).toBe('pi is 3.14159265358979 today')
+    expect(maskCards('code 123456')).toBe('code 123456')
+    expect(maskCards('no digits here')).toBe('no digits here')
+  })
+
+  it('is stable across repeated calls (no lastIndex statefulness bug)', () => {
+    const card = 'pay 4111 1111 1111 1111 now'
+    const first = maskCards(card)
+    const second = maskCards(card)
+    expect(first).toBe(second)
+    expect(first).not.toContain('4111')
   })
 })

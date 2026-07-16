@@ -89,7 +89,7 @@ import { observe } from '../perception/diff.js'
 import { htmlToMarkdown } from '../perception/markdown.js'
 import { assertNavigableResolved, assertContainedPath, isLoopbackLiteralHost } from '../security/egress.js'
 import { neutralize, capOutput } from '../security/injection.js'
-import { redactValue, redactHtml } from '../security/redact.js'
+import { redactValue, redactHtml, maskCards } from '../security/redact.js'
 import { requiresConfirm, confirmGateDecision, isDestructivePaidName } from '../security/confirm.js'
 import {
   act,
@@ -552,7 +552,12 @@ function attachDialogHandler(page: Page, session: string): void {
 // ---------------------------------------------------------------------------
 
 function presentPageText(text: string, flags: ParsedFlags): string {
-  const capped = capOutput(text, flags.maxOutput)
+  // Mask card numbers FIRST (security redaction — NOT gated on
+  // contentBoundaries) so this single choke covers read / get text / snapshot
+  // the way redactHtml/redactValue already cover get html / value / attr. Runs
+  // BEFORE the cap so a card straddling the maxOutput boundary can't half-leak.
+  const masked = maskCards(text)
+  const capped = capOutput(masked, flags.maxOutput)
   return flags.contentBoundaries ? neutralize(capped) : capped
 }
 

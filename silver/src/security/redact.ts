@@ -22,18 +22,30 @@ export const REDACTED = '[redacted]'
 
 /**
  * Card-shaped value: 13-19 digits, each optionally followed by a single space
- * or dash separator, on a word boundary. Matches "4111111111111111",
- * "4111 1111 1111 1111", "4111-1111-1111-1111", etc. Kept deliberately loose —
- * over-redacting a value is safe; leaking a card number is not.
+ * or dash separator. Matches "4111111111111111", "4111 1111 1111 1111",
+ * "4111-1111-1111-1111", etc. Kept deliberately loose — over-redacting a value
+ * is safe; leaking a card number is not.
+ *
+ * The run is anchored on DIGIT boundaries rather than `\b` word boundaries, so a
+ * card glued directly to a letter/digit still matches (`4111111111111111ok`,
+ * `X4111111111111111`, `4111-1111-1111-1111approved`) — a `\b` requires a
+ * word/non-word transition and simply does NOT fire at a digit⇄letter edge,
+ * letting such cards leak through. The anchors:
+ *   - `(?<![\d.\-])` — NOT preceded by a digit, dot, or dash, so the run can't
+ *     start in the middle of a longer number or a decimal (`3.14159265358979`
+ *     never matches).
+ *   - `(?<=\d)` — the run must END on a digit, never a trailing separator.
+ *   - `(?![\d])` — NOT followed by a digit, so a card-length run isn't matched
+ *     as a fragment of a longer pure-digit number.
  */
-const CARD_RE = /\b(?:\d[ -]?){13,19}\b/
+const CARD_RE = /(?<![\d.\-])(?:\d[ -]?){13,19}(?<=\d)(?![\d])/
 
 /**
  * Global variant of {@link CARD_RE} for masking EVERY card-shaped run in a blob
- * of markup (`redactValue` only needs a single boolean test). Kept in lock-step
- * with `CARD_RE` — same pattern, `g` flag.
+ * of markup / page text (`redactValue` only needs a single boolean test). Kept
+ * in lock-step with `CARD_RE` — same pattern, `g` flag.
  */
-const CARD_RE_G = /\b(?:\d[ -]?){13,19}\b/g
+const CARD_RE_G = /(?<![\d.\-])(?:\d[ -]?){13,19}(?<=\d)(?![\d])/g
 
 /** Case-insensitive hint that a field is a password field. */
 const PASSWORD_HINT_RE = /password|passwd|pwd/i
@@ -58,6 +70,23 @@ export function redactValue(
   if (PASSWORD_HINT_RE.test(role) || PASSWORD_HINT_RE.test(name)) return REDACTED
   if (rawValue !== '' && CARD_RE.test(rawValue)) return REDACTED
   return rawValue
+}
+
+/**
+ * Mask every card-shaped digit run in a blob of visible page TEXT with
+ * {@link REDACTED}. This is the security choke for the read paths that emit page
+ * text rather than a single node value or raw markup — `read`, `get text`, and
+ * `snapshot` (a card can surface in an element's accessible name or a StaticText
+ * node). Without this, the SAME card that `get html`/`redactValue` mask would
+ * leak verbatim through those surfaces.
+ *
+ * `String.prototype.replace` resets the shared global regex's `lastIndex` to 0
+ * at the start of the operation, so there is no cross-call statefulness bug from
+ * reusing `CARD_RE_G` here. Over-masking a long non-card digit run is the
+ * accepted trade — leaking a card is worse. Purely local (keyless).
+ */
+export function maskCards(text: string): string {
+  return text.replace(CARD_RE_G, REDACTED)
 }
 
 /**
