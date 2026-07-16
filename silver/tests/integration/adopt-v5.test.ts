@@ -137,6 +137,37 @@ describe('adopt Batch 5: wait --ready (S5) + read markdown (S6)', () => {
     expect(elapsed).toBeLessThan(7_000)
   }, 30_000)
 
+  // --- BUG #6: wait --url matches on a SUBSTRING (documented "contains"),
+  //     not a full-url glob (which never matched a bare substring). -----------
+  it('wait --url succeeds on a URL substring and times out on an absent one (BUG #6)', async () => {
+    // URL is http://localhost:PORT/index.html — contains "index" and "localhost".
+    await run(['open', `${base}/index.html`, '--session', NAME])
+
+    // A substring present in the URL resolves immediately (was a timeout before).
+    const t0 = Date.now()
+    const byPath = await run(['wait', '--url', 'index', '--session', NAME])
+    expect(byPath.env.success).toBe(true)
+    expect((byPath.env.data as { waited: boolean }).waited).toBe(true)
+    expect(Date.now() - t0).toBeLessThan(5_000)
+
+    // The host substring also matches (consistent with `expect url-matches`).
+    const byHost = await run(['wait', '--url', 'localhost', '--session', NAME])
+    expect(byHost.env.success).toBe(true)
+
+    // A substring NOT in the URL still times out (maps to the timeout error).
+    const absent = await run([
+      'wait',
+      '--url',
+      'this-fragment-is-not-in-the-url',
+      '--timeout',
+      '1500',
+      '--session',
+      NAME,
+    ])
+    expect(absent.env.success).toBe(false)
+    expect(absent.env.error).toContain('did not become ready in time')
+  }, 30_000)
+
   // --- S6: structured markdown for read <url> -----------------------------
   it('read <url> yields landmark-skipped markdown (headings, list) excluding nav/footer/aside', async () => {
     const r = await run(['read', `${base}/read`, '--session', NAME])

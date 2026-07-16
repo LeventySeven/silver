@@ -85,7 +85,12 @@ export async function waitFor(page: Page, spec: WaitSpec): Promise<void | ReadyR
     return
   }
   if ('url' in spec) {
-    await page.waitForURL(spec.url, { timeout: spec.timeout })
+    // SUBSTRING match, mirroring `expect url-matches` (handlers.ts `urlMatches`,
+    // which does `url.includes(pattern)`) and the "URL to contain a string" docs.
+    // A bare `waitForURL(string)` treats the string as a GLOB that must match the
+    // ENTIRE url, so a plain substring like "index" or "localhost" never matched
+    // and always timed out — contradicting the documented "contains" contract.
+    await page.waitForURL((url) => url.href.includes(spec.url), { timeout: spec.timeout })
     return
   }
   if ('load' in spec) {

@@ -406,9 +406,18 @@ async function readInputValue(locator: Locator, timeout: number | undefined): Pr
   try {
     return await locator.inputValue({ timeout })
   } catch {
-    // Not an input-like control (e.g. contenteditable) — signal a mismatch so
-    // the caller retries via pressSequentially.
-    return ''
+    // Not an input-like control (e.g. contenteditable): inputValue() only works
+    // on <input>/<textarea>/<select> and THROWS otherwise. Fall back to the
+    // element's TEXT so the readback is truthful — coercing to '' here made
+    // fillVerb see a spurious mismatch (always re-typing) and returned an empty
+    // ActResult.value for every contenteditable (rich-text/chat/comment widgets).
+    try {
+      return await locator.evaluate((el) =>
+        el.isContentEditable ? (el.innerText ?? el.textContent ?? '') : (el.textContent ?? ''),
+      )
+    } catch {
+      return ''
+    }
   }
 }
 

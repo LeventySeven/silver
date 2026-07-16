@@ -248,6 +248,40 @@ describe('actuation (real Chromium, Playwright delegation + stale-ref guard)', (
   )
 
   it(
+    'fill on a contenteditable returns the real text as the readback value (BUG #2)',
+    async () => {
+      const S = `${NAME}-ce`
+      await openSession(S, { headed: false })
+      const { browser, page } = await connect(S)
+      const cdp: CDPSession = await page.context().newCDPSession(page)
+      try {
+        // A rich-text box: contenteditable div exposed as role=textbox.
+        await page.setContent(
+          `<!doctype html><html><body>
+             <div contenteditable="true" role="textbox" aria-label="Editor"></div>
+           </body></html>`,
+          { waitUntil: 'load' },
+        )
+        const map1 = await takeSnapshot(page, 1, null)
+        const editorRef = refFor(map1, 'textbox', 'Editor')
+
+        // inputValue() throws on a contenteditable; before the fix readInputValue
+        // coerced to '' so the envelope value was ALWAYS '' (and fillVerb always
+        // re-typed). The fix reads the element TEXT — the value is now truthful.
+        const env = await act(page, cdp, 'fill', editorRef, 'hello world', map1, {})
+        expect(env.success).toBe(true)
+        expect(env.data?.value).toBe('hello world')
+        // A follow-up read of the DOM agrees with the envelope value.
+        expect((await page.locator('[contenteditable]').innerText()).trim()).toBe('hello world')
+      } finally {
+        await cdp.detach().catch(() => {})
+        await browser.close()
+        await closeSession(S).catch(() => {})
+      }
+    },
+  )
+
+  it(
     'coordDrag interpolates the middle move so DnD-style intermediate mousemoves fire (S8)',
     async () => {
       const S = `${NAME}-drag-interp`
