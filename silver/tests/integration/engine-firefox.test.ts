@@ -3,22 +3,24 @@ import { createServer, type Server } from 'node:http'
 import { AddressInfo } from 'node:net'
 import { run } from '../../src/cli.js'
 import { closeSession } from '../../src/core/session.js'
+import { ERRORS } from '../../src/core/errors.js'
 
-// H1: `--engine firefox` launches Playwright's Firefox instead of Chromium — the
-// real fix for TLS/H2-fingerprint sites that fail under Chromium. Firefox does
-// not expose a reconnectable CDP devtools port, so the session uses a
-// launch-per-command persistent-context model (see connectLaunched); a single
-// self-contained `open` verifies the engine actually launches and navigates.
+// F1: `--engine firefox|webkit` is REJECTED at session launch. Silver's whole
+// perception/actuation stack speaks CDP (`context.newCDPSession`), which
+// firefox/webkit do not expose — a non-chromium session could open but never
+// snapshot. Rather than ship that half-broken fallback, openSession fails LOUD
+// with the `engine_unsupported` taxonomy error. A real non-CDP firefox path is
+// out of scope (it needs an engine-agnostic perception rewrite).
 
 const NAME = `silver-ff-${process.pid}-${Date.now()}`
 
 const PAGE = `<!doctype html><html><head><title>firefox-ok</title></head>
-<body><h1 id="h">hello from firefox</h1></body></html>`
+<body><h1 id="h">hello</h1></body></html>`
 
 let server: Server
 let pageUrl: string
 
-describe('H1: --engine firefox launch', () => {
+describe('F1: --engine firefox|webkit is rejected at launch', () => {
   beforeAll(async () => {
     server = createServer((_req, res) => {
       res.writeHead(200, { 'content-type': 'text/html' })
@@ -33,13 +35,27 @@ describe('H1: --engine firefox launch', () => {
     try {
       await closeSession(NAME)
     } catch {
-      /* ignore */
+      /* never opened — nothing to close */
     }
     await new Promise<void>((resolve) => server.close(() => resolve()))
   })
 
-  it('opens a page under Firefox and returns its url + title', async () => {
+  it('rejects --engine firefox with a clear engine_unsupported error', async () => {
     const res = await run(['open', pageUrl, '--engine', 'firefox', '--session', NAME])
+    expect(res.env.success).toBe(false)
+    expect(res.env.error).toBe(ERRORS.engine_unsupported.message)
+    // The advisory names the requirement so a host can self-correct.
+    expect(String(res.env.error)).toMatch(/Chromium/i)
+  })
+
+  it('rejects --engine webkit the same way', async () => {
+    const res = await run(['open', pageUrl, '--engine', 'webkit', '--session', `${NAME}-wk`])
+    expect(res.env.success).toBe(false)
+    expect(res.env.error).toBe(ERRORS.engine_unsupported.message)
+  })
+
+  it('still opens normally under the default (chromium) engine', async () => {
+    const res = await run(['open', pageUrl, '--session', NAME])
     expect(res.env.success).toBe(true)
     const d = res.env.data as { url: string; title: string }
     expect(d.url).toBe(pageUrl)

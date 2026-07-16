@@ -357,19 +357,24 @@ async function taskExec(flags: ParsedFlags): Promise<Envelope<unknown>> {
   }
 
   // Return the inner envelope verbatim so the host sees exactly what the command
-  // produced, plus a marker that it was recorded to the task artifact.
+  // produced, plus a marker that it was recorded to the task artifact. When the
+  // inner data is NOT an object (e.g. `snapshot`/read verbs return a string), it
+  // is wrapped under `result` so the task/run/logged bookkeeping markers still
+  // attach — otherwise a string envelope would silently drop them.
   const data = res.env.success ? res.env.data : null
+  const markers = {
+    task: id,
+    run: `run_${n}`,
+    logged: true,
+    ...(planEcho ? { echoPlan: planEcho } : {}),
+  }
   return {
     success: res.env.success,
     data:
-      res.env.success && data !== null && typeof data === 'object'
-        ? {
-            ...(data as Record<string, unknown>),
-            task: id,
-            run: `run_${n}`,
-            logged: true,
-            ...(planEcho ? { echoPlan: planEcho } : {}),
-          }
+      res.env.success && data !== null
+        ? typeof data === 'object'
+          ? { ...(data as Record<string, unknown>), ...markers }
+          : { result: data, ...markers }
         : data,
     error: res.env.error,
     ...(res.env.warning ? { warning: res.env.warning } : {}),

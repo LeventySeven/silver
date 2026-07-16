@@ -15,7 +15,7 @@ import { spawn } from 'node:child_process'
 import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import type { Browser, BrowserContext, BrowserType, Page } from 'playwright'
+import type { Browser, BrowserContext, Page } from 'playwright'
 import type { RefMap } from '../perception/refmap.js'
 import { decodeStateBuffer, encryptJson, isStateEncryptionEnabled } from './state-crypto.js'
 import { classifyEngineError } from './errors.js'
@@ -25,12 +25,31 @@ import {
   type EgressOptions,
 } from '../security/egress.js'
 
-/** Playwright browser engines Silver can launch (H1). Default chromium. */
+/**
+ * Playwright browser engines Silver recognizes on the `--engine` flag. Only
+ * `chromium` is actually SUPPORTED at runtime — the whole perception/actuation
+ * stack speaks CDP (`context.newCDPSession`), which firefox/webkit do not expose.
+ * The non-chromium members exist ONLY so we can recognize the request and reject
+ * it with a clear `engine_unsupported` error at session launch (F1).
+ */
 export type Engine = 'chromium' | 'firefox' | 'webkit'
 
-/** Normalize a `--engine` value to a supported engine (default chromium). */
+/** Normalize a `--engine` value to a recognized engine (default chromium). */
 export function normalizeEngine(e: string | undefined): Engine {
   return e === 'firefox' ? 'firefox' : e === 'webkit' ? 'webkit' : 'chromium'
+}
+
+/**
+ * F1: reject a non-chromium engine at the launch/connect chokepoint. Throws an
+ * error carrying the `engine_unsupported` taxonomy code so the hub's `mapThrow`
+ * surfaces the fixed recovery message (no path/secret leak). Silver cannot
+ * snapshot under firefox/webkit — its perception uses CDP, which they lack — so
+ * we fail LOUD rather than opening a session that cannot perceive.
+ */
+function assertChromiumEngine(engine: Engine): void {
+  if (engine !== 'chromium') {
+    throw Object.assign(new Error('engine_unsupported'), { code: 'engine_unsupported' as const })
+  }
 }
 
 export type SessionInfo = {
@@ -46,10 +65,10 @@ export type SessionInfo = {
    */
   external?: boolean
   /**
-   * The Playwright engine this session launches (H1). Absent/`chromium` uses the
-   * detached-CDP daemon model (survives across commands). `firefox`/`webkit`
-   * speak Playwright's own protocol (not CDP-over-devtools-port), so they use a
-   * launch-per-command persistent-context model instead — see `connectLaunched`.
+   * The Playwright engine this session launches. Always `chromium` in practice —
+   * `openSession` rejects any other engine at launch (F1), because the whole
+   * perception/actuation stack is CDP-only. Retained on the type for forward
+   * compatibility and to let `connect` re-reject a stale non-chromium sidecar.
    */
   engine?: Engine
   /** The persistent profile dir (recorded for the non-chromium relaunch path). */
@@ -315,16 +334,6 @@ async function loadChromium(): Promise<typeof import('playwright').chromium> {
 }
 
 /**
- * Lazily import the Playwright `BrowserType` for `engine` (H1). Generalizes
- * `loadChromium` to firefox/webkit — Playwright bundles all three, so this adds
- * no new dependency. Kept a DYNAMIC import for the same fast-path reason.
- */
-export async function loadBrowser(engine: Engine): Promise<BrowserType> {
-  const pw = await import('playwright')
-  return engine === 'firefox' ? pw.firefox : engine === 'webkit' ? pw.webkit : pw.chromium
-}
-
-/**
  * True while `pid` is a live process (EPERM = alive-but-not-ours; ESRCH = gone).
  *
  * pid <= 0 is treated as dead: `process.kill(0, 0)` targets the whole process
@@ -469,26 +478,13 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
   const userDataDir = opts.profile ?? opts.userDataDir ?? path.join(dir, 'profile')
   await fs.mkdir(userDataDir, { recursive: true })
 
-  const engine = normalizeEngine(opts.engine)
-  // Non-chromium (firefox/webkit) do NOT speak CDP over a devtools port, so the
-  // detached-daemon-reconnect model does not apply. Record a lightweight sidecar;
-  // `connect` launches a fresh persistent context per command against this
-  // profile dir (disk state — cookies/storage — persists; live navigation does
-  // not carry across commands). This is the H1 fix for TLS/H2-fingerprint sites.
-  if (engine !== 'chromium') {
-    const info: SessionInfo = {
-      port: 0,
-      pid: 0,
-      wsEndpoint: '',
-      createdAt: new Date().toISOString(),
-      engine,
-      userDataDir,
-      headed: Boolean(opts.headed),
-    }
-    await fs.mkdir(dir, { recursive: true })
-    await writeSidecar(sidecarPath(name), info)
-    return info
-  }
+  // F1: firefox/webkit are rejected HERE, at launch — before any browser is
+  // spawned or any sidecar is written. Silver's snapshot/act stack is CDP-only
+  // (`context.newCDPSession`), so a non-chromium session could open but never
+  // perceive; shipping that half-broken fallback would advertise a capability
+  // Silver does not have. A real non-CDP firefox path is out of scope (it needs
+  // an engine-agnostic perception rewrite).
+  assertChromiumEngine(normalizeEngine(opts.engine))
 
   const requestedPort = opts.port ?? 0
   const chromium = await loadChromium()
@@ -615,10 +611,10 @@ export async function readSidecar(name: string): Promise<SessionInfo> {
  */
 export async function connect(name: string): Promise<Connection> {
   const info = await readSidecar(name)
-  // Non-chromium (firefox/webkit): launch a fresh persistent context per command
-  // (no surviving CDP daemon). Disk state persists via the profile dir.
-  const engine = normalizeEngine(info.engine)
-  if (engine !== 'chromium') return connectLaunched(name, info, engine)
+  // F1: a stale non-chromium sidecar (written before this engine was rejected)
+  // must fail LOUD here too — its CDP-only verbs could never work. Defense in
+  // depth: `openSession` no longer creates such sidecars.
+  assertChromiumEngine(normalizeEngine(info.engine))
   // PID-liveness (P1-S1): a stale sidecar whose browser died would otherwise
   // hang on a dead CDP endpoint. Treat a dead pid as "no live session" so the
   // caller (ensureConnected) re-spawns instead. Skipped for EXTERNAL sessions:
@@ -666,37 +662,6 @@ export async function connectWithCrashReconnect(name: string): Promise<Connectio
     await delay(150)
     return await connect(name)
   }
-}
-
-/**
- * Non-chromium connect (H1): launch a fresh persistent context for `engine`
- * against the session's profile dir and adapt it to the `Connection` shape.
- *
- * firefox/webkit do not expose a reconnectable CDP devtools port, so there is no
- * long-lived daemon to attach to — each command relaunches. `launchPersistentContext`
- * keeps disk state (cookies/localStorage) across relaunches. The returned
- * `browser` is a thin shim over the context (only `close`/`contexts` are used on
- * this path) since a persistent context has no owning `Browser`.
- */
-async function connectLaunched(
-  name: string,
-  info: SessionInfo,
-  engine: Engine,
-): Promise<Connection> {
-  const userDataDir = info.userDataDir ?? path.join(sessionDir(name), 'profile')
-  const browserType = await loadBrowser(engine)
-  const context = await browserType.launchPersistentContext(userDataDir, {
-    headless: !info.headed,
-    viewport: { width: VIEWPORT.width, height: VIEWPORT.height },
-  })
-  const page = context.pages()[0] ?? (await context.newPage())
-  await page.setViewportSize({ width: VIEWPORT.width, height: VIEWPORT.height }).catch(() => {})
-  // A persistent context has no `Browser`; expose only what callers use here.
-  const browser = {
-    close: () => context.close(),
-    contexts: () => [context],
-  } as unknown as Browser
-  return { browser, context, page }
 }
 
 /**

@@ -53,6 +53,12 @@ function humanForm(env: Envelope<unknown>): string {
   const lines: string[] = []
   if (!env.success) {
     lines.push(`error: ${env.error ?? 'unknown error'}`)
+    // A failure can still carry structured diagnostics (e.g. a `batch` failure
+    // reports per-subcommand results under `data`). In human mode that detail
+    // was previously dropped, leaving only the terse error line. Render it too.
+    if (env.data !== null && env.data !== undefined) {
+      lines.push(JSON.stringify(env.data, null, 2))
+    }
     if (env.warning) lines.push(`warning: ${env.warning}`)
     return lines.join('\n')
   }

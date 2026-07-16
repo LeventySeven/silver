@@ -116,6 +116,16 @@ export const ERRORS = {
     message:
       'another command is currently using this session; commands against one session run one at a time — retry shortly, or use a different --session',
   },
+  // F1: `--engine firefox|webkit` was requested, but Silver's entire perception/
+  // actuation stack speaks CDP (`context.newCDPSession`), which only Chromium
+  // exposes. Fail LOUD at session launch rather than opening a session that
+  // cannot snapshot. Not retryable — the fix is to drop `--engine` (or use
+  // chromium), not to retry.
+  engine_unsupported: {
+    retryableByHost: false,
+    message:
+      'Silver requires the Chromium engine (its perception/actuation use the CDP protocol); firefox/webkit are not supported. Re-run without --engine (or with --engine chromium).',
+  },
 } as const
 
 export type ErrorCode = keyof typeof ERRORS

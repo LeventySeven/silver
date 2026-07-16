@@ -165,6 +165,50 @@ describe('actuation (real Chromium, Playwright delegation + stale-ref guard)', (
   )
 
   it(
+    'resolves a <totp> in fill to a 6-digit code on the matching domain (D2)',
+    async () => {
+      const S = `${NAME}-totp`
+      await openSession(S, { headed: false })
+      const { browser, page } = await connect(S)
+      const cdp: CDPSession = await page.context().newCDPSession(page)
+      try {
+        await page.route('**/*', (route) =>
+          route.fulfill({ contentType: 'text/html', body: FIXTURE }),
+        )
+        // A TOTP seed is just a domain-scoped secret whose value is the base32 key.
+        const registry = buildSecretRegistry(['MFA@bank.example=JBSWY3DPEHPK3PXP'])
+
+        await page.goto('http://bank.example/login')
+        const map1 = await takeSnapshot(page, 1, null)
+        const inputRef = refFor(map1, 'textbox', 'Name field')
+        const env = await act(page, cdp, 'fill', inputRef, '<totp>MFA</totp>', map1, {
+          secrets: registry,
+        })
+        expect(env.success).toBe(true)
+        // The CURRENT 6-digit code reached the DOM (never the literal token).
+        expect(await page.locator('#inp').inputValue()).toMatch(/^\d{6}$/)
+        // The read-back is force-redacted (a live code is still sensitive).
+        expect(env.data?.value).toBe('[redacted]')
+        expect(JSON.stringify(env)).not.toContain('<totp>')
+
+        // A mismatched domain REFUSES (the anti-exfil guarantee holds for seeds).
+        await page.goto('http://evil.example/steal')
+        const map2 = await takeSnapshot(page, 2, map1)
+        const inputRef2 = refFor(map2, 'textbox', 'Name field')
+        const refused = await act(page, cdp, 'fill', inputRef2, '<totp>MFA</totp>', map2, {
+          secrets: registry,
+        })
+        expect(refused.success).toBe(false)
+        expect(await page.locator('#inp').inputValue()).not.toMatch(/^\d{6}$/)
+      } finally {
+        await cdp.detach().catch(() => {})
+        await browser.close()
+        await closeSession(S).catch(() => {})
+      }
+    },
+  )
+
+  it(
     'coordinate verbs drive page.mouse/keyboard, bypassing refs (B1)',
     async () => {
       const S = `${NAME}-coord`

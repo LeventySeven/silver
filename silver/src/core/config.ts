@@ -5,10 +5,22 @@
  * forgets `--allowed-domains` and runs unrestricted).
  *
  * Merge rules (Vercel `flags.rs` parity):
- *   - LIST fields (allowedDomains / confirmActions / resourceTypes) are
- *     CONCATENATED across layers (a project adds to the user's allowlist; the
- *     CLI adds to both) — never overwritten, so a config allowlist can only ever
- *     TIGHTEN, never be silently dropped by a later layer.
+ *   - SECURITY-SENSITIVE allowlist fields (`allowedDomains`) use TIGHTEN-ONLY
+ *     semantics across the file/env layers: a more-local (lower-trust) layer may
+ *     only NARROW the effective allowlist to a subset of the higher-trust layer,
+ *     never ADD hosts to it. Concretely, across user → project → env the first
+ *     non-empty layer establishes the baseline and each later non-empty layer is
+ *     INTERSECTED with it; a layer that is disjoint (would only widen) is
+ *     rejected and the higher-trust allowlist stands. This is deliberately NOT a
+ *     union: an egress allowlist is a security fence, and a lower-trust project
+ *     `silver.json` in cwd must never be able to punch new holes in a
+ *     higher-trust `~/.silver/config.json` allowlist (an empty effective
+ *     allowlist means UNRESTRICTED downstream, so tightening also never blanks a
+ *     non-empty higher-trust layer). An empty list in a layer is "no opinion".
+ *   - NON-SECURITY LIST fields (`confirmActions` / `resourceTypes`) are
+ *     CONCATENATED across layers. For `confirmActions` more entries = more gated
+ *     actions = a STRICTER confirm fence, so union is itself a tightening; the
+ *     CLI adds to both.
  *   - SCALAR fields are OVERRIDDEN by the more-specific layer, but ONLY when that
  *     layer set them explicitly. The `<field>Explicit` shadow-boolean (Vercel
  *     `cli_*`) records, per scalar, whether the CLI actually supplied it — so a
@@ -54,10 +66,18 @@ export type SilverConfig = {
   resourceTypes?: string[]
 }
 
-/** Config fields whose values CONCATENATE across layers instead of overriding. */
+/** Config fields whose values are lists (merged across layers — see below). */
 const LIST_FIELDS = ['allowedDomains', 'confirmActions', 'resourceTypes'] as const
 type ListField = (typeof LIST_FIELDS)[number]
 const LIST_FIELD_SET: ReadonlySet<string> = new Set(LIST_FIELDS)
+
+/**
+ * Security-sensitive allowlist fields: TIGHTEN-ONLY across layers (a more-local
+ * layer may only narrow to a subset, never widen). All OTHER list fields
+ * concatenate. See the module doc comment for the full precedence rationale.
+ */
+const SECURITY_LIST_FIELDS = ['allowedDomains'] as const
+const SECURITY_LIST_FIELD_SET: ReadonlySet<string> = new Set(SECURITY_LIST_FIELDS)
 
 /** All scalar config fields (everything in SilverConfig that is not a list). */
 const SCALAR_FIELDS = [
@@ -230,10 +250,28 @@ function mergeLayers(layers: SilverConfig[]): SilverConfig {
   for (const layer of layers) {
     for (const [field, val] of Object.entries(layer)) {
       if (val === undefined) continue
-      if (LIST_FIELD_SET.has(field)) {
+      if (SECURITY_LIST_FIELD_SET.has(field)) {
+        // TIGHTEN-ONLY: a more-local (lower-trust) layer may only NARROW the
+        // effective allowlist to a subset of the higher-trust one, never ADD
+        // hosts. An empty list is "no opinion" (kept from the prior layer). A
+        // disjoint layer (would only widen) is rejected so the higher-trust
+        // allowlist stands — and a non-empty baseline is never blanked (empty
+        // downstream == UNRESTRICTED). See the module doc comment.
+        const prev = (out as Record<string, unknown>)[field] as string[] | undefined
+        const next = (val as string[]).filter((d) => d.length > 0)
+        if (next.length === 0) continue
+        if (!prev || prev.length === 0) {
+          ;(out as Record<string, unknown>)[field] = [...new Set(next)]
+        } else {
+          const nextSet = new Set(next)
+          const inter = prev.filter((d) => nextSet.has(d))
+          ;(out as Record<string, unknown>)[field] = inter.length > 0 ? inter : prev
+        }
+      } else if (LIST_FIELD_SET.has(field)) {
         const prev = ((out as Record<string, unknown>)[field] as string[]) ?? []
         const next = val as string[]
-        // Concatenate + dedupe (order-preserving) so an allowlist only tightens.
+        // Concatenate + dedupe (order-preserving). For confirmActions, more
+        // entries = a stricter confirm fence, so union is itself a tightening.
         const seen = new Set(prev)
         const merged = [...prev]
         for (const item of next) if (!seen.has(item)) (seen.add(item), merged.push(item))

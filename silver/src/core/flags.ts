@@ -112,10 +112,21 @@ export type ParsedFlags = {
   echoPlan: boolean
   /** `--no-config` (E3): skip the `~/.silver/config.json` + `silver.json` merge. */
   noConfig: boolean
-  /** `--use-config` (E3): explicitly opt into the config-file merge (the default). */
-  useConfig: boolean
   /** `--message <text>` (K1): the host message `skills resolve` scores keywords over. */
   message?: string
+  /**
+   * `--secret NAME=value[@domain]` (repeatable, E1): register a write-path secret
+   * resolvable via `<secret>NAME</secret>` in a fill/type value. Also merged with
+   * `SILVER_SECRET_<NAME>` env vars. The raw value stays in the CLI process; it
+   * never enters the host context or an envelope. See security/secret.ts.
+   */
+  secrets: string[]
+  /**
+   * `--taint-guard` (opt-in, S1): reject a mutating-verb argument that still
+   * carries the ⟦untrusted⟧ page-content provenance fence (a likely inject-and-act
+   * / exfil vector). OFF by default — see security/taint.ts for why opt-in.
+   */
+  taintGuard: boolean
   // ---- network / storage verb sub-flags (Vercel-parity) ----
   /** `network requests --filter <url-substr>`. */
   filter?: string
@@ -141,10 +152,12 @@ export type ParsedFlags = {
    * network-idle wait instead of the lowered default budget (engine-plan P1b). */
   waitNetworkidle: boolean
   /**
-   * `--engine firefox|webkit|chromium` (default chromium): the Playwright
-   * browser type to LAUNCH for an owned session (H1). Default stays chromium for
-   * CDP/console parity; firefox/webkit are the real fix for TLS/H2-fingerprint
-   * sites that fail under Chromium (cars.com et al). Threaded into openSession.
+   * `--engine chromium` (the only supported value). Silver's perception and
+   * actuation are CDP-only (`context.newCDPSession`), which firefox/webkit do
+   * NOT expose — a non-chromium session could open but never snapshot. So
+   * `--engine firefox|webkit` is REJECTED at session launch with a clear
+   * `engine_unsupported` error (F1); it is not a working fallback for
+   * TLS/H2-fingerprint sites. Threaded into openSession, which enforces this.
    */
   engine?: string
   /**
@@ -245,7 +258,8 @@ const BOOL_FLAGS: Record<string, keyof ParsedFlags> = {
   // T6a / E3 wiring boolean flags.
   'echo-plan': 'echoPlan',
   'no-config': 'noConfig',
-  'use-config': 'useConfig',
+  // S1: opt-in data-provenance (taint) guard on mutating verbs.
+  'taint-guard': 'taintGuard',
   // NOTE: `--wait` is handled explicitly in the parse loop (it is dual-purpose:
   // a bare boolean for `download --wait`, and `--wait networkidle` for the
   // mutating-verb full-settle opt-in), so it is intentionally NOT listed here.
@@ -300,7 +314,8 @@ function defaults(): ParsedFlags {
     tab: false,
     echoPlan: false,
     noConfig: false,
-    useConfig: false,
+    secrets: [],
+    taintGuard: false,
     resourceTypes: [],
     abort: false,
     clear: false,
@@ -374,9 +389,21 @@ export function parseFlags(argv: string[]): ParsedFlags {
         if (Number.isFinite(x) && Number.isFinite(y)) f[key] = [x, y]
         continue
       }
+      // `--secret NAME=value[@domain]` (E1): REPEATABLE — each occurrence appends
+      // one spec. Parsed/validated later by buildSecretRegistry; the parser only
+      // collects the raw specs (never logs/echoes them). F7-guarded: a bare
+      // `--secret --session s` does not swallow `--session`.
+      if (name === 'secret') {
+        const t = takeValue(argv, i, inlineValue)
+        i = t.i
+        if (t.value !== undefined) f.secrets.push(t.value)
+        continue
+      }
       if (name in CSV_FLAGS) {
         const key = CSV_FLAGS[name]
-        const raw = inlineValue ?? argv[++i] ?? ''
+        const t = takeValue(argv, i, inlineValue)
+        i = t.i
+        const raw = t.value ?? ''
         f[key] = raw
           .split(',')
           .map((s) => s.trim())
@@ -398,8 +425,11 @@ export function parseFlags(argv: string[]): ParsedFlags {
         continue
       }
       if (name in VALUE_FLAGS) {
-        const value = inlineValue ?? argv[++i] ?? ''
-        assignValue(f, VALUE_FLAGS[name], value)
+        // F7: do not consume a following token that itself looks like a flag —
+        // leave the field unset rather than eating the next flag as this value.
+        const t = takeValue(argv, i, inlineValue)
+        i = t.i
+        if (t.value !== undefined) assignValue(f, VALUE_FLAGS[name], t.value)
         continue
       }
       // Unknown long flag: record as a bool-ish no-op so it never becomes a
@@ -412,8 +442,16 @@ export function parseFlags(argv: string[]): ParsedFlags {
       const char = body[0]
       if (char in SHORT_VALUE) {
         const key = SHORT_VALUE[char]
-        const value = body.length > 1 ? body.slice(1) : (argv[++i] ?? '')
-        assignValue(f, key, value)
+        if (body.length > 1) {
+          // Attached form `-d5`: the value rides on the same token.
+          assignValue(f, key, body.slice(1))
+        } else {
+          // Detached form `-d 5`: consume the next token ONLY when it is not
+          // itself a flag (F7) — `-d --session s` must not eat `--session`.
+          const t = takeValue(argv, i, undefined)
+          i = t.i
+          if (t.value !== undefined) assignValue(f, key, t.value)
+        }
         continue
       }
       if (char in SHORT_BOOL) {
@@ -450,4 +488,33 @@ function assignValue(f: ParsedFlags, key: keyof ParsedFlags, raw: string): void 
 
 function isNegativeNumber(token: string): boolean {
   return /^-\d/.test(token)
+}
+
+/**
+ * F7: does `token` look like a flag (so a value flag must NOT swallow it)? A
+ * `-`/`--` prefixed token that is not a negative number. Without this guard a
+ * value flag with no value (`-d --session s`) consumes the FOLLOWING flag as its
+ * value, silently dropping `--session`. A negative number (`-1`) is still a
+ * legitimate value, so it is explicitly excluded.
+ */
+function looksLikeFlag(token: string | undefined): boolean {
+  if (token === undefined) return false
+  if (!token.startsWith('-') || token.length < 2) return false
+  return !isNegativeNumber(token)
+}
+
+/**
+ * Resolve the value for a value-flag: the inline `=value`, else the next token —
+ * but ONLY when that token does not itself look like a flag (F7). Returns the
+ * value (or undefined when none is available) and the new loop index.
+ */
+function takeValue(
+  argv: string[],
+  i: number,
+  inlineValue: string | undefined,
+): { value: string | undefined; i: number } {
+  if (inlineValue !== undefined) return { value: inlineValue, i }
+  const next = argv[i + 1]
+  if (next !== undefined && !looksLikeFlag(next)) return { value: next, i: i + 1 }
+  return { value: undefined, i }
 }

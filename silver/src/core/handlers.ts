@@ -21,7 +21,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash, randomBytes } from 'node:crypto'
-import type { Page, Locator, CDPSession, Frame } from 'playwright'
+import type { Page, Locator, CDPSession, Frame, BrowserContext } from 'playwright'
 
 import { ok, fail, type Envelope } from './envelope.js'
 import { ERRORS } from './errors.js'
@@ -90,6 +90,7 @@ import {
   find,
   locate,
   cleanupStamp,
+  resolveWriteValue,
   type ActVerb,
   type ActOptions,
   type FindKind,
@@ -106,6 +107,8 @@ import {
 } from '../actuation/pagechange.js'
 import { withRetries } from './retry.js'
 import { loadPolicy, decideAction } from '../security/policy.js'
+import { buildSecretRegistry, type SecretRegistry } from '../security/secret.js'
+import { taintGuardCheck } from '../security/taint.js'
 import { resolveSkills, type Skill } from './skillmatch.js'
 import { waitFor, WaitError, type WaitSpec, type WaitState } from '../actuation/wait.js'
 import { buildBundle, type JsonSchema } from '../extract/transform.js'
@@ -276,8 +279,75 @@ function newConfirmId(): string {
 }
 
 // ---------------------------------------------------------------------------
+// F8: emulation-override sidecar (emulation.json). `set viewport/offline/
+// color-scheme` mutate emulation state that lives ONLY for the current CDP
+// connection — the stateless per-command reconnect model drops it, so a later
+// command saw the default again and the override was silently lost. We PERSIST
+// each override here and RE-APPLY it inside withConnection on every connect, so
+// `set viewport 800 600` then a later `eval` actually sees width 800.
+// ---------------------------------------------------------------------------
+
+type EmulationState = {
+  viewport?: { width: number; height: number }
+  offline?: boolean
+  colorScheme?: 'dark' | 'light' | 'no-preference'
+}
+
+function emulationPath(name: string): string {
+  return path.join(sessionDir(name), 'emulation.json')
+}
+
+async function loadEmulation(name: string): Promise<EmulationState | null> {
+  try {
+    return await readSidecarObject<EmulationState>(emulationPath(name))
+  } catch {
+    return null
+  }
+}
+
+async function patchEmulation(name: string, patch: Partial<EmulationState>): Promise<void> {
+  const cur = (await loadEmulation(name)) ?? {}
+  await fs.mkdir(sessionDir(name), { recursive: true })
+  await writeSidecar(emulationPath(name), { ...cur, ...patch })
+}
+
+/**
+ * Re-apply the persisted emulation overrides on a fresh connection (F8).
+ * Best-effort per override — a failure to apply one never fails the command.
+ * Runs AFTER `connect` set the default viewport, so a persisted viewport wins.
+ */
+async function applyEmulation(page: Page, context: BrowserContext, name: string): Promise<void> {
+  const emu = await loadEmulation(name)
+  if (!emu) return
+  if (emu.viewport) await page.setViewportSize(emu.viewport).catch(() => {})
+  if (emu.colorScheme) await page.emulateMedia({ colorScheme: emu.colorScheme }).catch(() => {})
+  if (emu.offline !== undefined) await context.setOffline(emu.offline).catch(() => {})
+}
+
+// ---------------------------------------------------------------------------
 // Connection helpers.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// E1/D2: the process-wide write-path secret registry. Built ONCE per CLI run
+// (cli.ts) from `--secret` specs + `SILVER_SECRET_<NAME>` env vars, and read by
+// the write-path handlers (handleAct/handleFind/handleCoordAct) so a
+// `<secret>NAME</secret>` / `<totp>NAME</totp>` token resolves at the actions.ts
+// choke point. The raw values live ONLY here — never in an envelope or the argv
+// the host authored. When unset (no secrets configured) the getter returns a
+// fresh empty registry so callers need no null-guard.
+// ---------------------------------------------------------------------------
+let processSecrets: SecretRegistry | null = null
+
+/** Install the per-run secret registry (called once from cli.ts run()). */
+export function setProcessSecrets(reg: SecretRegistry | null): void {
+  processSecrets = reg
+}
+
+/** The active write-path secret registry (empty when none configured). */
+function currentSecrets(): SecretRegistry {
+  return processSecrets ?? buildSecretRegistry([])
+}
 
 function openOpts(flags: ParsedFlags): OpenOptions {
   // E2: thread `--profile` (an existing user-data-dir) into the launch so an
@@ -289,6 +359,24 @@ function openOpts(flags: ParsedFlags): OpenOptions {
  * idle wait (engine-plan P1b); the common case uses the lowered default budget. */
 function settleModeFor(flags: ParsedFlags): SettleMode {
   return flags.waitNetworkidle ? 'full' : 'default'
+}
+
+/**
+ * F3-policy: the current page URL as recorded in the last snapshot/act
+ * fingerprint (`url|focusedBackendId|domNodeCount`), so an `@host`-scoped action
+ * policy can be evaluated WITHOUT a browser round-trip before the connection is
+ * opened. The url is everything before the final two `|`-segments (a real url is
+ * never split — `|` is percent-encoded in URLs). Undefined when no snapshot has
+ * been taken yet (then `@host` patterns simply don't match, as before).
+ */
+async function lastKnownUrl(session: string): Promise<string | undefined> {
+  const st = await loadState(session).catch(() => null)
+  const fp = st?.fingerprint
+  if (!fp) return undefined
+  const parts = fp.split('|')
+  if (parts.length < 3) return undefined
+  const url = parts.slice(0, parts.length - 2).join('|')
+  return url && url !== 'about:blank' ? url : undefined
 }
 
 /** Connect to the session, auto-spawning the detached browser if none is live.
@@ -328,6 +416,10 @@ async function withConnection<T>(
     const conn = await ensureConnected(flags.session, openOpts(flags))
     // Every verb operates on the ACTIVE tab, not blindly on pages()[0].
     const page = await resolveActivePage(conn.context, flags.session)
+    // F8: re-apply persisted emulation overrides (viewport/offline/color-scheme).
+    // The per-command reconnect otherwise drops them, so a `set viewport` made in
+    // an earlier command would be silently lost by the next command's connect.
+    await applyEmulation(page, conn.context, flags.session).catch(() => {})
     // Register the dialog handler on the active page (fix P0-7): with no
     // listener, Playwright silently CANCELS every alert/confirm/prompt, so a
     // `confirm("delete?")` guard is auto-dismissed while the host still gets ok().
@@ -683,8 +775,15 @@ async function handleClose(flags: ParsedFlags): Promise<Envelope<unknown>> {
 
 async function handleHistory(flags: ParsedFlags): Promise<Envelope<unknown>> {
   return withConnection(flags, async ({ page }) => {
-    if (flags.verb === 'back') await page.goBack(gotoOpts(flags))
-    else if (flags.verb === 'forward') await page.goForward(gotoOpts(flags))
+    // F9: install capture instrumentation BEFORE the navigation (as handleOpen
+    // does) so console/network that fires during the reload/back/forward page
+    // LOAD is captured — otherwise ensureCapture ran only after nav and missed
+    // every request the freshly-loaded document made on load.
+    await ensureCapture(page, flags.session).catch(() => {})
+
+    const isBackForward = flags.verb === 'back' || flags.verb === 'forward'
+    if (flags.verb === 'back') await page.goBack(historyNavOpts(flags))
+    else if (flags.verb === 'forward') await page.goForward(historyNavOpts(flags))
     else await page.reload(gotoOpts(flags))
 
     // Re-hook capture on the new document after a history navigation / reload.
@@ -692,7 +791,16 @@ async function handleHistory(flags: ParsedFlags): Promise<Envelope<unknown>> {
     const prev = await loadState(flags.session)
     const gen = newGeneration(prev?.generation ?? 0)
     await saveRefMap(flags.session, { generation: gen, entries: {} })
-    const fp = await settleAndFingerprint(page, prev?.fingerprint, gen, settleModeFor(flags))
+    // F6: for back/forward, SKIP the settle. A back-forward-cache restore does not
+    // re-fire `DOMContentLoaded` for this fresh CDP client, so the settle's
+    // `waitForLoadState('domcontentloaded')` (in pagechange.ts, no timeout arg)
+    // would block for the FULL default navigation timeout even though the restored
+    // page is already loaded. `fingerprintOnly` observes it as-is (no load-state
+    // wait) — the page is instantly present after a bfcache restore. `reload` fires
+    // the load events normally, so it keeps the bounded settle.
+    const fp = isBackForward
+      ? await fingerprintOnly(page, prev?.fingerprint, gen)
+      : await settleAndFingerprint(page, prev?.fingerprint, gen, settleModeFor(flags))
     await saveState(flags.session, {
       generation: gen,
       prevTree: null,
@@ -704,6 +812,20 @@ async function handleHistory(flags: ParsedFlags): Promise<Envelope<unknown>> {
 
 function gotoOpts(flags: ParsedFlags): { waitUntil: 'domcontentloaded'; timeout?: number } {
   const o: { waitUntil: 'domcontentloaded'; timeout?: number } = { waitUntil: 'domcontentloaded' }
+  if (flags.timeout !== undefined) o.timeout = flags.timeout
+  return o
+}
+
+/**
+ * F6: goBack/goForward wait options. A history navigation that restores a page
+ * from the back-forward cache does NOT fire `domcontentloaded` — the document is
+ * reused, not re-parsed — so `waitUntil:'domcontentloaded'` blocks for the FULL
+ * `--timeout` (30s) and then errors even though the navigation already
+ * succeeded. `commit` resolves as soon as the navigation is committed (which a
+ * bfcache restore does immediately), returning promptly on success.
+ */
+function historyNavOpts(flags: ParsedFlags): { waitUntil: 'commit'; timeout?: number } {
+  const o: { waitUntil: 'commit'; timeout?: number } = { waitUntil: 'commit' }
   if (flags.timeout !== undefined) o.timeout = flags.timeout
   return o
 }
@@ -1192,7 +1314,12 @@ async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
   let policyConfirm = false
   if (flags.actionPolicy) {
     const policy = loadPolicy(flags.actionPolicy)
-    const decision = decideAction(policy, verb)
+    // F3-policy: thread the current page host into the decision so `@host`-scoped
+    // patterns (e.g. `download@*.corp.example`) actually match. Without ctx they
+    // silently failed open. The url comes from the last fingerprint (no browser
+    // round-trip); absent → host-scoped patterns simply don't match (as before).
+    const url = await lastKnownUrl(flags.session)
+    const decision = decideAction(policy, verb, url ? { url } : {})
     if (decision === 'deny') return fail('not_permitted')
     if (decision === 'confirm') policyConfirm = true
   }
@@ -1235,6 +1362,16 @@ async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
   let value = flags.args[1]
   if (flags.stdin) value = await readStdin()
 
+  // F5: data-provenance (taint) guard, OPT-IN via `--taint-guard`. If the value
+  // still carries the ⟦untrusted⟧ page-content fence, the host almost certainly
+  // pasted fenced page output straight back into a mutating verb — an
+  // inject-and-act / exfil vector. Reject with a clear advisory (no page content
+  // echoed). When the flag is off, taintGuardCheck never flags (proceeds).
+  if (value !== undefined) {
+    const taint = taintGuardCheck({ verb, value, enabled: flags.taintGuard })
+    if (taint.flagged) return { success: false, data: null, error: taint.reason ?? '' }
+  }
+
   // Path containment for `upload` (fix P1-SEC4): every file must resolve inside
   // the working directory, or the whole action is refused before we touch the page.
   let uploadFiles: string[] | undefined
@@ -1253,6 +1390,9 @@ async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
       const opts: ActOptions = {}
       if (flags.force) opts.force = true
       if (flags.timeout !== undefined) opts.timeout = flags.timeout
+      // E1/D2: hand the write-path the secret registry so a fill/type value's
+      // `<secret>`/`<totp>` token resolves at the actions.ts choke point.
+      opts.secrets = currentSecrets()
       if (verb === 'select') opts.selectValues = flags.args.slice(1)
       if (verb === 'upload') opts.files = uploadFiles ?? []
       if (verb === 'drag') opts.targetRef = flags.args[1]
@@ -1491,10 +1631,17 @@ async function handleCoordAct(
       data = { clicked: { x, y } }
     } else if (verb === 'type') {
       const [x, y] = flags.at as [number, number]
-      const text = flags.stdin ? await readStdin() : (flags.args[0] ?? '')
-      await coordType(page, x, y, text)
-      // Never echo the typed text (it may be a secret) — report only its length.
-      data = { typed: text.length, at: { x, y } }
+      const raw = flags.stdin ? await readStdin() : (flags.args[0] ?? '')
+      // F5: opt-in taint guard parity with the grounded write-path.
+      const taint = taintGuardCheck({ verb: 'type', value: raw, enabled: flags.taintGuard })
+      if (taint.flagged) return { success: false, data: null, error: taint.reason ?? '' }
+      // E1/D2: resolve `<secret>`/`<totp>` tokens fail-closed before typing.
+      const r = resolveWriteValue(raw, page.url(), currentSecrets())
+      if (r.refused) return fail('not_permitted')
+      await coordType(page, x, y, r.value)
+      // Never echo the typed text (it may be a secret) — report only the length
+      // of the ORIGINAL token (not the resolved secret, to avoid a length leak).
+      data = { typed: raw.length, at: { x, y } }
     } else {
       const [fx, fy] = flags.from as [number, number]
       const [tx, ty] = flags.to as [number, number]
@@ -1526,6 +1673,9 @@ async function handleFind(flags: ParsedFlags): Promise<Envelope<unknown>> {
     if (subValue !== undefined) opts.value = subValue
     if (flags.name !== undefined) opts.name = flags.name
     if (flags.index !== undefined) opts.index = flags.index
+    // E1/D2: thread the secret registry so a `find … fill "<secret>PW</secret>"`
+    // subaction resolves the token at the actions.ts write-path choke point.
+    opts.secrets = currentSecrets()
 
     // Narrowed paid/destructive confirm gate (fix P0-4 parity with handleAct):
     // `find <kind> <value> click` can DISPATCH a click/press activation, so it
@@ -3262,12 +3412,14 @@ async function handleSet(flags: ParsedFlags): Promise<Envelope<unknown>> {
       if (!Number.isInteger(w) || !Number.isInteger(h) || w <= 0 || h <= 0) {
         return badRequest('usage: silver set viewport <width> <height> (positive integers)')
       }
+      // F8: PERSIST the override so it survives the per-command reconnect —
+      // withConnection re-applies it on every later connect.
+      await patchEmulation(flags.session, { viewport: { width: w, height: h } })
       return withConnection(flags, async ({ page }) => {
         await page.setViewportSize({ width: w, height: h })
         // Read back the ACTUAL applied inner size within THIS connection as proof
-        // the resize landed. NOTE (reconnect model): emulation overrides live only
-        // for the current CDP connection, so a LATER command sees the default
-        // viewport again — set it in the same session/command flow that needs it.
+        // the resize landed. The override is now persisted (above), so a LATER
+        // command's connect re-applies it via applyEmulation.
         const applied = (await page
           .evaluate('({ width: window.innerWidth, height: window.innerHeight })')
           .catch(() => ({ width: w, height: h }))) as { width: number; height: number }
@@ -3278,6 +3430,8 @@ async function handleSet(flags: ParsedFlags): Promise<Envelope<unknown>> {
       // Default true (matching the Rust oracle); `false`/`off`/`0` turns it off.
       const arg = (flags.args[1] ?? 'true').toLowerCase()
       const offline = arg !== 'false' && arg !== 'off' && arg !== '0'
+      // F8: persist so the reconnect model does not silently drop it.
+      await patchEmulation(flags.session, { offline })
       return withConnection(flags, async ({ context }) => {
         await context.setOffline(offline)
         return ok({ offline })
@@ -3289,6 +3443,8 @@ async function handleSet(flags: ParsedFlags): Promise<Envelope<unknown>> {
       const raw = (flags.args[1] ?? 'no-preference').toLowerCase()
       const colorScheme: 'dark' | 'light' | 'no-preference' =
         raw === 'dark' ? 'dark' : raw === 'light' ? 'light' : 'no-preference'
+      // F8: persist so a later command re-applies it on connect.
+      await patchEmulation(flags.session, { colorScheme })
       return withConnection(flags, async ({ page }) => {
         await page.emulateMedia({ colorScheme })
         return ok({ colorScheme })

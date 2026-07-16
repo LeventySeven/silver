@@ -26,7 +26,43 @@ import { ok, fail, type Envelope } from '../core/envelope.js'
 import type { ErrorCode } from '../core/errors.js'
 import { redactValue, REDACTED } from '../security/redact.js'
 import type { SecretRegistry } from '../security/secret.js'
+import { resolveTotpTokens, hasTotpToken } from '../security/totp.js'
 import { toLocator, ResolveError, REF_ATTR } from './resolve.js'
+
+/**
+ * WRITE-path token resolution chokepoint (adopt-list E1/D2): resolve any
+ * `<secret>NAME</secret>` then any `<totp>NAME</totp>` token in `value` against
+ * the live `pageUrl`, using the domain-scoped `secrets` registry (a TOTP seed is
+ * just a domain-scoped secret). Order matters: secrets first, then TOTP, so a
+ * seed delivered via `<secret>` is never itself re-interpreted.
+ *
+ * FAIL-CLOSED: on ANY refusal (unknown name, domain-scope mismatch, invalid
+ * seed) the ORIGINAL value is returned with `refused:true` — the caller MUST NOT
+ * dispatch it. `sensitive` is true when a secret OR totp token was resolved, so
+ * the caller force-redacts any read-back.
+ */
+export function resolveWriteValue(
+  value: string,
+  pageUrl: string,
+  secrets: SecretRegistry | undefined,
+): { value: string; sensitive: boolean; refused: boolean } {
+  let out = value
+  let sensitive = false
+  if (secrets === undefined) return { value, sensitive: false, refused: false }
+  if (secrets.hasTokens(out)) {
+    const r = secrets.resolveValue(out, pageUrl)
+    if (r.refused) return { value, sensitive: false, refused: true }
+    out = r.value
+    sensitive = sensitive || r.usedSecret
+  }
+  if (hasTotpToken(out)) {
+    const r = resolveTotpTokens(out, pageUrl, secrets)
+    if (r.refused) return { value, sensitive, refused: true }
+    out = r.value
+    sensitive = sensitive || r.usedTotp
+  }
+  return { value: out, sensitive, refused: false }
+}
 
 /** Ref-based actuation verbs. */
 export type ActVerb =
@@ -154,23 +190,19 @@ export async function act(
     return actFail<ActResult>('element_not_found')
   }
 
-  // 2b. WRITE-path secret indirection (adopt-list E1): resolve any
-  // `<secret>NAME</secret>` token in a fill/type value at the SAME choke point
-  // `redactValue` occupies on the read side (symmetric). Domain-scoped against
-  // the live page URL, so a bank.com secret refuses on evil.com even under
-  // injection. Refusal FAILS CLOSED — the literal token is never dispatched.
+  // 2b. WRITE-path secret + TOTP indirection (adopt-list E1/D2): resolve any
+  // `<secret>NAME</secret>` and `<totp>NAME</totp>` token in a fill/type value at
+  // the SAME choke point `redactValue` occupies on the read side (symmetric).
+  // Domain-scoped against the live page URL, so a bank.com secret/seed refuses on
+  // evil.com even under injection. Refusal FAILS CLOSED — the literal token is
+  // never dispatched.
   let effectiveValue = value
   let usedSecret = false
-  if (
-    value !== undefined &&
-    (verb === 'fill' || verb === 'type') &&
-    opts.secrets !== undefined &&
-    opts.secrets.hasTokens(value)
-  ) {
-    const r = opts.secrets.resolveValue(value, page.url())
+  if (value !== undefined && (verb === 'fill' || verb === 'type')) {
+    const r = resolveWriteValue(value, page.url(), opts.secrets)
     if (r.refused) return actFail<ActResult>('not_permitted')
     effectiveValue = r.value
-    usedSecret = r.usedSecret
+    usedSecret = r.sensitive
   }
 
   // 3. Dispatch to Playwright; cleanup the stamped attribute regardless.
@@ -228,8 +260,19 @@ export async function find(
     return ok(res)
   }
 
+  // WRITE-path secret/TOTP resolution for a fill/type subaction (E1/D2 parity
+  // with `act`): a `find label "Password" fill "<secret>PW</secret>"` must
+  // resolve the token against the live URL, fail-closed on refusal, and never
+  // dispatch the literal token. Other subactions carry no secret value.
+  let subValue = opts.value
+  if ((subaction === 'fill' || subaction === 'type') && subValue !== undefined) {
+    const r = resolveWriteValue(subValue, page.url(), opts.secrets)
+    if (r.refused) return actFail<FindResult>('not_permitted')
+    subValue = r.value
+  }
+
   try {
-    await applyVerb(locator, subaction, opts.value, opts)
+    await applyVerb(locator, subaction, subValue, opts)
     return ok({ kind, val, matched: count, verb: subaction })
   } catch (err) {
     return actFail<FindResult>(mapActionError(err))
@@ -455,12 +498,9 @@ export async function coordType(
   text: string,
   opts: CoordOptions = {},
 ): Promise<Envelope<CoordResult>> {
-  let effective = text
-  if (opts.secrets !== undefined && opts.secrets.hasTokens(text)) {
-    const r = opts.secrets.resolveValue(text, page.url())
-    if (r.refused) return actFail<CoordResult>('not_permitted')
-    effective = r.value
-  }
+  const resolved = resolveWriteValue(text, page.url(), opts.secrets)
+  if (resolved.refused) return actFail<CoordResult>('not_permitted')
+  const effective = resolved.value
   try {
     await page.mouse.click(x, y)
     await page.keyboard.type(effective)

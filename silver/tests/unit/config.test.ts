@@ -54,36 +54,87 @@ describe('loadConfig — layering user → project → env', () => {
   })
   afterEach(() => rmSync(dir, { recursive: true, force: true }))
 
-  it('concatenates list fields and last-wins scalars across layers', () => {
+  it('concatenates NON-security list fields and last-wins scalars across layers', () => {
+    // resourceTypes is a non-security list → concatenates across layers.
     writeFileSync(
       join(home, '.silver', 'config.json'),
-      JSON.stringify({ allowedDomains: ['user.com'], timeout: 1000, session: 'u' }),
+      JSON.stringify({ resourceTypes: ['image'], timeout: 1000, session: 'u' }),
     )
     writeFileSync(
       join(cwd, 'silver.json'),
-      JSON.stringify({ allowedDomains: ['proj.com'], timeout: 2000 }),
+      JSON.stringify({ resourceTypes: ['script'], timeout: 2000 }),
     )
     const { config, sources } = loadConfig({
       home,
       cwd,
-      env: { SILVER_ALLOWED_DOMAINS: 'env.com' },
+      env: { SILVER_RESOURCE_TYPES: 'stylesheet' },
     })
-    // Lists concatenate across all three layers.
-    expect(config.allowedDomains).toEqual(['user.com', 'proj.com', 'env.com'])
+    // Non-security lists concatenate across all three layers.
+    expect(config.resourceTypes).toEqual(['image', 'script', 'stylesheet'])
     // Scalars: project overrides user; env not set → project value stands.
     expect(config.timeout).toBe(2000)
     expect(config.session).toBe('u')
     expect(sources).toContain('env')
   })
 
-  it('dedupes concatenated list entries (order preserved)', () => {
+  it('dedupes concatenated NON-security list entries (order preserved)', () => {
+    writeFileSync(
+      join(home, '.silver', 'config.json'),
+      JSON.stringify({ resourceTypes: ['image', 'script'] }),
+    )
+    writeFileSync(join(cwd, 'silver.json'), JSON.stringify({ resourceTypes: ['script', 'font'] }))
+    const { config } = loadConfig({ home, cwd, env: {} })
+    expect(config.resourceTypes).toEqual(['image', 'script', 'font'])
+  })
+
+  // F4 — egress allowlist is a SECURITY fence: a lower-trust project silver.json
+  // must never be able to UNION-widen a higher-trust user-global allowedDomains.
+  it('F4: a project silver.json cannot WIDEN a user-global allowedDomains', () => {
+    // User-global (higher trust) restricts egress to a.com + b.com.
     writeFileSync(
       join(home, '.silver', 'config.json'),
       JSON.stringify({ allowedDomains: ['a.com', 'b.com'] }),
     )
-    writeFileSync(join(cwd, 'silver.json'), JSON.stringify({ allowedDomains: ['b.com', 'c.com'] }))
+    // Project (lower trust, sitting in cwd) tries to ADD evil.com (and keep a.com).
+    writeFileSync(
+      join(cwd, 'silver.json'),
+      JSON.stringify({ allowedDomains: ['a.com', 'evil.com'] }),
+    )
     const { config } = loadConfig({ home, cwd, env: {} })
-    expect(config.allowedDomains).toEqual(['a.com', 'b.com', 'c.com'])
+    // TIGHTEN-ONLY: the effective allowlist is the intersection (a.com); the
+    // project's attempt to add evil.com is dropped — the fence only narrows.
+    expect(config.allowedDomains).toEqual(['a.com'])
+    expect(config.allowedDomains).not.toContain('evil.com')
+  })
+
+  it('F4: a DISJOINT project allowlist is rejected; the user allowlist stands (never blanked)', () => {
+    // An empty effective allowlist means UNRESTRICTED downstream, so a disjoint
+    // lower-trust layer must not blank the higher-trust one (that would WIDEN).
+    writeFileSync(
+      join(home, '.silver', 'config.json'),
+      JSON.stringify({ allowedDomains: ['a.com'] }),
+    )
+    writeFileSync(join(cwd, 'silver.json'), JSON.stringify({ allowedDomains: ['evil.com'] }))
+    const { config } = loadConfig({ home, cwd, env: {} })
+    expect(config.allowedDomains).toEqual(['a.com'])
+  })
+
+  it('F4: a project MAY tighten a user allowlist to a subset', () => {
+    writeFileSync(
+      join(home, '.silver', 'config.json'),
+      JSON.stringify({ allowedDomains: ['a.com', 'b.com', 'c.com'] }),
+    )
+    writeFileSync(join(cwd, 'silver.json'), JSON.stringify({ allowedDomains: ['b.com'] }))
+    const { config } = loadConfig({ home, cwd, env: {} })
+    expect(config.allowedDomains).toEqual(['b.com'])
+  })
+
+  it('F4: a project MAY introduce an allowlist where the user set none (tightening)', () => {
+    // User has no allowlist (unrestricted); project adds one → strictly narrower.
+    writeFileSync(join(home, '.silver', 'config.json'), JSON.stringify({ session: 'u' }))
+    writeFileSync(join(cwd, 'silver.json'), JSON.stringify({ allowedDomains: ['shop.com'] }))
+    const { config } = loadConfig({ home, cwd, env: {} })
+    expect(config.allowedDomains).toEqual(['shop.com'])
   })
 
   it('fails OPEN on malformed JSON — warns, never throws', () => {

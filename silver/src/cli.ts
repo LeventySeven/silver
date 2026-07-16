@@ -27,7 +27,8 @@ import { parseFlags, type ParsedFlags } from './core/flags.js'
 import { loadConfig, mergeConfig } from './core/config.js'
 import { suggestVerb } from './core/suggest.js'
 import { buildRegistry } from './security/registry.js'
-import { handle } from './core/handlers.js'
+import { buildSecretRegistry } from './security/secret.js'
+import { handle, setProcessSecrets } from './core/handlers.js'
 import { setNamespace, setFetchEgressPolicy } from './core/session.js'
 import { setStateEncryption } from './core/state-crypto.js'
 // Task-artifact / memory / subagent layers — dispatched here (NOT in
@@ -123,6 +124,13 @@ export async function run(argv: string[]): Promise<RunResult> {
   // opts out (plaintext JSON) for debugging. Reads accept both forms, so this is
   // safe to toggle per-invocation. `SILVER_NO_ENCRYPT_STATE=1` is the env opt-out.
   if (flags.noEncryptState) setStateEncryption(false)
+
+  // E1/D2: build the write-path secret registry ONCE per run from `--secret`
+  // specs + `SILVER_SECRET_<NAME>` env vars, and install it for the write-path
+  // handlers. The raw values live only in this process — a `<secret>NAME</secret>`
+  // / `<totp>NAME</totp>` token in a fill/type value resolves at the actions.ts
+  // choke point, so the credential never enters the host context or an envelope.
+  setProcessSecrets(buildSecretRegistry(flags.secrets, process.env))
 
   if (flags.verb === '' || flags.verb === 'help' || flags.verb === '--help') {
     return { env: usage(), code: 0, json }

@@ -56,3 +56,59 @@ describe('flags: G5 --list', () => {
     expect(parseFlags(['skill', '--list']).list).toBe(true)
   })
 })
+
+describe('flags: F7 value flags do not swallow a following flag', () => {
+  it('a bare -d does not eat the next --session token', () => {
+    const f = parseFlags(['snapshot', '-d', '--session', 's'])
+    expect(f.session).toBe('s')
+    // depth is left UNSET rather than consuming `--session` as its value
+    expect(f.depth).toBeUndefined()
+    expect(f.verb).toBe('snapshot')
+  })
+  it('a bare --timeout does not eat the next --session token', () => {
+    const f = parseFlags(['snapshot', '--timeout', '--session', 's'])
+    expect(f.session).toBe('s')
+    expect(f.timeout).toBeUndefined()
+  })
+  it('still consumes a real detached value (-d 3) and the attached form (-d3)', () => {
+    expect(parseFlags(['snapshot', '-d', '3']).depth).toBe(3)
+    expect(parseFlags(['snapshot', '-d3']).depth).toBe(3)
+  })
+  it('still consumes a negative-number value (not a flag)', () => {
+    expect(parseFlags(['snapshot', '--timeout', '-1']).timeout).toBe(-1)
+  })
+})
+
+describe('flags: F2 --secret (repeatable)', () => {
+  it('collects each --secret spec, defaulting to []', () => {
+    expect(parseFlags(['fill', '@e1', 'x']).secrets).toEqual([])
+    const f = parseFlags([
+      'fill', '@e1', 'x',
+      '--secret', 'PW@bank.com=abc',
+      '--secret', 'MFA=JBSWY3DP',
+    ])
+    expect(f.secrets).toEqual(['PW@bank.com=abc', 'MFA=JBSWY3DP'])
+  })
+  it('a bare --secret does not swallow the following flag (F7-guarded)', () => {
+    const f = parseFlags(['fill', '@e1', 'x', '--secret', '--session', 's'])
+    expect(f.secrets).toEqual([])
+    expect(f.session).toBe('s')
+  })
+})
+
+describe('flags: F5 --taint-guard', () => {
+  it('is a boolean, OFF by default', () => {
+    expect(parseFlags(['fill', '@e1', 'x']).taintGuard).toBe(false)
+    expect(parseFlags(['fill', '@e1', 'x', '--taint-guard']).taintGuard).toBe(true)
+  })
+})
+
+describe('flags: F10 --use-config removed', () => {
+  it('no longer exposes a useConfig field, and --use-config is an inert no-op', () => {
+    const f = parseFlags(['open', 'x', '--use-config'])
+    expect('useConfig' in f).toBe(false)
+    // --no-config still works and is unaffected.
+    expect(f.noConfig).toBe(false)
+    expect(parseFlags(['open', 'x', '--no-config']).noConfig).toBe(true)
+  })
+})
