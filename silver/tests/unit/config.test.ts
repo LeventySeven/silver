@@ -177,12 +177,48 @@ describe('mergeConfig — CLI over config, shadow-boolean precedence', () => {
     expect(explicit.timeout).toBe(true)
   })
 
-  it('list fields are config ∪ CLI (config first), deduped', () => {
-    const config: SilverConfig = { allowedDomains: ['a.com', 'b.com'] }
-    const cli = parseFlags(['open', '--allowed-domains', 'b.com,c.com'])
+  it('NON-security list fields are config ∪ CLI (config first), deduped', () => {
+    // resourceTypes is a non-security list → union (more entries = stricter).
+    const config: SilverConfig = { resourceTypes: ['image', 'script'] }
+    const cli = parseFlags(['open', '--resource-types', 'script,font'])
     const { flags, explicit } = mergeConfig(config, cli)
-    expect(flags.allowedDomains).toEqual(['a.com', 'b.com', 'c.com'])
-    expect(explicit.allowedDomains).toBe(true)
+    expect(flags.resourceTypes).toEqual(['image', 'script', 'font'])
+    expect(explicit.resourceTypes).toBe(true)
+  })
+
+  // BUG #3 — mergeConfig() must NOT widen the egress allowlist. A lower-trust
+  // project silver.json / SILVER_ALLOWED_DOMAINS (which arrive via `config`) may
+  // only TIGHTEN the operator's --allowed-domains (the CLI layer), never ADD hosts.
+  describe('allowedDomains is TIGHTEN-ONLY across the config→CLI merge', () => {
+    it('a config allowlist cannot ADD a host past the CLI --allowed-domains', () => {
+      const config: SilverConfig = { allowedDomains: ['evil.com'] }
+      const cli = parseFlags(['open', '--allowed-domains', 'good.com'])
+      const { flags } = mergeConfig(config, cli)
+      // Disjoint config would only WIDEN → rejected; the CLI fence stands.
+      expect(flags.allowedDomains).toEqual(['good.com'])
+      expect(flags.allowedDomains).not.toContain('evil.com')
+    })
+
+    it('a config subset tightens the CLI allowlist to the intersection', () => {
+      const config: SilverConfig = { allowedDomains: ['good.com'] }
+      const cli = parseFlags(['open', '--allowed-domains', 'good.com,x.com'])
+      const { flags } = mergeConfig(config, cli)
+      expect(flags.allowedDomains).toEqual(['good.com'])
+    })
+
+    it('an empty config allowlist leaves the CLI allowlist unchanged', () => {
+      const config: SilverConfig = {}
+      const cli = parseFlags(['open', '--allowed-domains', 'good.com'])
+      const { flags } = mergeConfig(config, cli)
+      expect(flags.allowedDomains).toEqual(['good.com'])
+    })
+
+    it('a config allowlist applies when the CLI set none (operator unrestricted)', () => {
+      const config: SilverConfig = { allowedDomains: ['a.com'] }
+      const cli = parseFlags(['open'])
+      const { flags } = mergeConfig(config, cli)
+      expect(flags.allowedDomains).toEqual(['a.com'])
+    })
   })
 
   it('config-supplied confirmActions engages the gate (confirmActionsProvided)', () => {

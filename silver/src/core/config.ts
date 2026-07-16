@@ -342,10 +342,15 @@ function isListExplicit(cli: ParsedFlags, field: ListField): boolean {
  * Merge a loaded {@link SilverConfig} UNDER a parsed CLI {@link ParsedFlags}.
  *
  * Precedence: CLI beats config for every SCALAR the CLI set explicitly; config
- * fills the rest. LIST fields are the config values FOLLOWED BY the CLI values
- * (config allowlist ∪ CLI allowlist), deduped. Returns the effective flags plus
- * the `<field>Explicit` shadow-boolean map so downstream code never re-derives
- * "did this come from config or the CLI?".
+ * fills the rest. NON-SECURITY LIST fields are the config values FOLLOWED BY the
+ * CLI values (union), deduped. SECURITY-sensitive allowlist fields
+ * (`allowedDomains`) are TIGHTEN-ONLY, exactly as across the file/env layers: the
+ * CLI list is the higher-trust baseline and the config list may only NARROW it to
+ * a subset (intersection), never ADD egress hosts — a lower-trust `silver.json` /
+ * `SILVER_ALLOWED_DOMAINS` must not punch new holes in the operator's
+ * `--allowed-domains` fence. Returns the effective flags plus the
+ * `<field>Explicit` shadow-boolean map so downstream code never re-derives "did
+ * this come from config or the CLI?".
  */
 export function mergeConfig(config: SilverConfig, cli: ParsedFlags): MergedConfig {
   const flags: ParsedFlags = { ...cli }
@@ -364,10 +369,33 @@ export function mergeConfig(config: SilverConfig, cli: ParsedFlags): MergedConfi
     explicit[field] = cliExplicit
     const fromConfig = (config[field] as string[] | undefined) ?? []
     const fromCli = ((cli as Record<string, unknown>)[field] as string[] | undefined) ?? []
-    const seen = new Set<string>()
-    const merged: string[] = []
-    for (const item of [...fromConfig, ...fromCli]) {
-      if (!seen.has(item)) (seen.add(item), merged.push(item))
+    let merged: string[]
+    if (SECURITY_LIST_FIELD_SET.has(field)) {
+      // TIGHTEN-ONLY (mirrors mergeLayers): the CLI allowlist is the higher-trust
+      // baseline; a lower-trust config/env layer may only NARROW it to a subset,
+      // never ADD egress hosts. Drop empties (an empty list is "no opinion").
+      const cliList = fromCli.filter((d) => d.length > 0)
+      const cfgList = fromConfig.filter((d) => d.length > 0)
+      if (cfgList.length === 0) {
+        merged = cliList // config has no opinion → CLI stands
+      } else if (cliList.length === 0) {
+        merged = [...new Set(cfgList)] // operator unrestricted → config only tightens
+      } else {
+        // Intersection (CLI order preserved). A disjoint config would only WIDEN,
+        // so it is rejected and the CLI list stands — never blanked, since an
+        // empty effective allowlist means UNRESTRICTED downstream.
+        const cfgSet = new Set(cfgList)
+        const inter = cliList.filter((d) => cfgSet.has(d))
+        merged = inter.length > 0 ? inter : cliList
+      }
+    } else {
+      // NON-SECURITY lists (confirmActions / resourceTypes): UNION — more entries
+      // = a stricter fence, so concatenation is itself a tightening.
+      const seen = new Set<string>()
+      merged = []
+      for (const item of [...fromConfig, ...fromCli]) {
+        if (!seen.has(item)) (seen.add(item), merged.push(item))
+      }
     }
     ;(flags as Record<string, unknown>)[field] = merged
     // Keep the paired `confirmActionsProvided` truthful post-merge: the gate

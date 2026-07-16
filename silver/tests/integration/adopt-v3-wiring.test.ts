@@ -44,12 +44,14 @@ describe('E3: config merge is wired into run() before dispatch', () => {
     expect(currentFetchEgressPolicy().allowedDomains).toContain('config-only.example')
   })
 
-  it('list fields concat: CLI allowlist is UNIONED with the config allowlist', async () => {
+  it('allowedDomains is TIGHTEN-ONLY: a config layer cannot WIDEN the CLI fence', async () => {
+    // BUG #3: a lower-trust config/env allowlist must never ADD egress hosts past
+    // the operator's --allowed-domains. Disjoint config → rejected, CLI stands.
     process.env.SILVER_ALLOWED_DOMAINS = 'config-only.example'
     await run(['--allowed-domains', 'cli-only.example', 'version'])
     const pol = currentFetchEgressPolicy()
-    expect(pol.allowedDomains).toContain('config-only.example')
-    expect(pol.allowedDomains).toContain('cli-only.example')
+    expect(pol.allowedDomains).toEqual(['cli-only.example'])
+    expect(pol.allowedDomains).not.toContain('config-only.example')
   })
 
   it('--no-config opts out of the merge entirely', async () => {
