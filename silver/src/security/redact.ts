@@ -28,6 +28,13 @@ export const REDACTED = '[redacted]'
  */
 const CARD_RE = /\b(?:\d[ -]?){13,19}\b/
 
+/**
+ * Global variant of {@link CARD_RE} for masking EVERY card-shaped run in a blob
+ * of markup (`redactValue` only needs a single boolean test). Kept in lock-step
+ * with `CARD_RE` — same pattern, `g` flag.
+ */
+const CARD_RE_G = /\b(?:\d[ -]?){13,19}\b/g
+
 /** Case-insensitive hint that a field is a password field. */
 const PASSWORD_HINT_RE = /password|passwd|pwd/i
 
@@ -51,4 +58,56 @@ export function redactValue(
   if (PASSWORD_HINT_RE.test(role) || PASSWORD_HINT_RE.test(name)) return REDACTED
   if (rawValue !== '' && CARD_RE.test(rawValue)) return REDACTED
   return rawValue
+}
+
+/**
+ * Read one attribute's value out of a single serialized tag. Returns `''` when
+ * the attribute is absent. Handles double-quoted, single-quoted, and unquoted
+ * forms. Used by {@link redactHtml} to inspect a password field's hint
+ * attributes (`name`/`id`/`autocomplete`).
+ */
+function tagAttr(tag: string, attr: string): string {
+  const m = tag.match(
+    new RegExp(`\\b${attr}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]*))`, 'i'),
+  )
+  if (!m) return ''
+  return m[1] ?? m[2] ?? m[3] ?? ''
+}
+
+/**
+ * Redact secrets out of a blob of element HTML — the `get html` read path, the
+ * one read surface that emits raw serialized markup rather than a single node
+ * value. Two masks, mirroring `redactValue`'s two signals but applied to HTML:
+ *
+ *   1. The `value` ATTRIBUTE of a PASSWORD input. A server-prefilled
+ *      `value="…"` on a `type=password` field IS serialized into `outerHTML`
+ *      (unlike a live-typed value, which lives only on the `.value` DOM
+ *      property and never reaches the markup) and would otherwise leak
+ *      verbatim. Belt-and-suspenders, mirroring `redactValue`: a field is also
+ *      treated as a password field when its `name`/`id`/`autocomplete`
+ *      attribute matches {@link PASSWORD_HINT_RE}. Processed PER `<input>` tag
+ *      so ONLY password inputs have their value masked — a normal text input
+ *      keeps its value.
+ *   2. Any card-shaped digit run ANYWHERE in the markup (attribute, text node,
+ *      inline handler) → {@link REDACTED}, via the global card variant.
+ *
+ * Runs BEFORE `presentPageText` (neutralize + cap). Over-redaction is safe; a
+ * leak is not. Purely local (keyless) — no model, no network.
+ */
+export function redactHtml(html: string): string {
+  const masked = html.replace(/<input\b[^>]*>/gi, (tag) => {
+    const isPassword =
+      /\btype\s*=\s*(['"]?)password\1/i.test(tag) ||
+      PASSWORD_HINT_RE.test(tagAttr(tag, 'name')) ||
+      PASSWORD_HINT_RE.test(tagAttr(tag, 'id')) ||
+      PASSWORD_HINT_RE.test(tagAttr(tag, 'autocomplete'))
+    if (!isPassword) return tag
+    // Mask the value attribute (double-quoted, single-quoted, or unquoted) on
+    // THIS password tag only — not every input on the page.
+    return tag.replace(
+      /(\bvalue\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s>]*)/i,
+      `$1"${REDACTED}"`,
+    )
+  })
+  return masked.replace(CARD_RE_G, REDACTED)
 }

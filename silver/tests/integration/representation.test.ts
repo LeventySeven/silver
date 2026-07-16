@@ -40,6 +40,20 @@ const CANVAS_BUSY_PAGE = `<!doctype html>
   <button>b5</button><button>b6</button><button>b7</button><button>b8</button>
 </body></html>`
 
+// A form whose serialized markup carries secrets `get html` must NOT leak (S3):
+// a server-PREFILLED password value (survives into outerHTML, unlike a live-typed
+// one), a password-HINTED input (name=pwd, type=text — caught by the belt-and-
+// suspenders hint), a visible card number, and a plain input whose value must be
+// KEPT (proves the per-<input> mask does not over-redact normal fields).
+const REDACT_PAGE = `<!doctype html>
+<html><head><title>Redact</title></head><body>
+  <h1>Sign up</h1>
+  <input type="password" value="prefilled-secret" aria-label="secretpass">
+  <input type="text" name="pwd" value="hinted-secret" aria-label="hintedfield">
+  <input type="text" value="4111 1111 1111 1111" aria-label="cardfield">
+  <input type="text" value="keepme" aria-label="plainfield">
+</body></html>`
+
 let server: Server
 let base: string
 
@@ -50,6 +64,13 @@ function firstRefWithRole(map: RefMap, role: string): string {
   throw new Error(`no ref with role ${role} in refmap`)
 }
 
+function refByName(map: RefMap, name: string): string {
+  for (const [ref, entry] of Object.entries(map.entries)) {
+    if (entry.name === name) return ref
+  }
+  throw new Error(`no ref with name ${name} in refmap`)
+}
+
 describe('representation phase-1: get html / get box / sparse_tree', () => {
   beforeAll(async () => {
     server = createServer((req, res) => {
@@ -58,7 +79,9 @@ describe('representation phase-1: get html / get box / sparse_tree', () => {
         ? NORMAL_PAGE
         : url.startsWith('/busy')
           ? CANVAS_BUSY_PAGE
-          : CANVAS_PAGE
+          : url.startsWith('/redact')
+            ? REDACT_PAGE
+            : CANVAS_PAGE
       res.writeHead(200, { 'content-type': 'text/html' })
       res.end(body)
     })
@@ -162,5 +185,63 @@ describe('representation phase-1: get html / get box / sparse_tree', () => {
     await run(['open', `${base}/busy`, '--session', NAME])
     const snap = await run(['snapshot', '-i', '--session', NAME])
     expect(snap.env.warning ?? '').not.toContain('sparse_tree')
+  })
+
+  // S3: `get html` is NOT a redaction hole. It must route the element's
+  // outerHTML through the same redaction choke point as get text/value/attr.
+  it('get html redacts a server-prefilled password value (not just live-typed)', async () => {
+    await run(['open', `${base}/redact`, '--session', NAME])
+    await run(['snapshot', '-i', '--session', NAME])
+    const map = await loadRefMap(NAME)
+    const ref = refByName(map!, 'secretpass')
+
+    const res = await run(['get', 'html', ref, '--session', NAME])
+    expect(res.env.success).toBe(true)
+    const html = res.env.data as string
+    expect(html).toContain('[redacted]')
+    expect(html).not.toContain('prefilled-secret')
+    // The masked value belongs to THIS password input.
+    expect(html).toContain('type="password"')
+  })
+
+  it('get html redacts a password-HINTED input value (name=pwd, type=text)', async () => {
+    await run(['open', `${base}/redact`, '--session', NAME])
+    await run(['snapshot', '-i', '--session', NAME])
+    const map = await loadRefMap(NAME)
+    const ref = refByName(map!, 'hintedfield')
+
+    const res = await run(['get', 'html', ref, '--session', NAME])
+    expect(res.env.success).toBe(true)
+    const html = res.env.data as string
+    expect(html).toContain('[redacted]')
+    expect(html).not.toContain('hinted-secret')
+  })
+
+  it('get html redacts a card-shaped digit run anywhere in the markup', async () => {
+    await run(['open', `${base}/redact`, '--session', NAME])
+    await run(['snapshot', '-i', '--session', NAME])
+    const map = await loadRefMap(NAME)
+    const ref = refByName(map!, 'cardfield')
+
+    const res = await run(['get', 'html', ref, '--session', NAME])
+    expect(res.env.success).toBe(true)
+    const html = res.env.data as string
+    expect(html).toContain('[redacted]')
+    expect(html).not.toContain('4111')
+  })
+
+  it('get html KEEPS a normal input value and still strips data-silver-ref', async () => {
+    await run(['open', `${base}/redact`, '--session', NAME])
+    await run(['snapshot', '-i', '--session', NAME])
+    const map = await loadRefMap(NAME)
+    const ref = refByName(map!, 'plainfield')
+
+    const res = await run(['get', 'html', ref, '--session', NAME])
+    expect(res.env.success).toBe(true)
+    const html = res.env.data as string
+    // Per-<input> masking must not over-redact a non-password, non-card field.
+    expect(html).toContain('keepme')
+    // The grounding stamp is still stripped (existing behavior preserved).
+    expect(html).not.toContain('data-silver-ref')
   })
 })

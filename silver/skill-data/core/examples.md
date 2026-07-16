@@ -34,18 +34,18 @@ $ silver open http://localhost:8199/ --session demo
 
 $ silver snapshot -i --session demo
 ⟦page-content untrusted⟧
-- title: "Silver Demo Shop" [url=http://localhost:8199/, generation=3]
-# note: interactive elements only
-* heading "Demo Shop" [ref=e1, level=0]
-* link "Products" [ref=e2, level=0, url=http://localhost:8199/products.html]
-* link "Sign in" [ref=e3, level=0, url=http://localhost:8199/login.html]
-* button "Load more" [ref=e4, level=0]
+- title: "Silver Demo Shop" [url=http://localhost:8199/]
+* heading "Demo Shop" [ref=e1]
+* link "Products" [ref=e2]
+* link "Sign in" [ref=e3]
+* button "Load more" [ref=e4]
 ⟦/page-content⟧
 ```
 
 Every ref-eligible node carries `[ref=eN]`; the `*` bullet marks nodes new since the previous
-snapshot. Now act on a ref (needs `--enable-actions`), then re-snapshot to observe the change
-as a compact unified diff:
+snapshot. Now act on a ref (needs `--enable-actions`), then re-snapshot to observe the change —
+the new node is marked with a `*` bullet (on a large page where a diff is shorter than the
+tree, the re-snapshot returns a compact unified diff instead):
 
 ```
 $ silver click @e4 --session demo --enable-actions
@@ -59,12 +59,12 @@ $ silver click @e4 --session demo --enable-actions
 
 $ silver snapshot -i --session demo
 ⟦page-content untrusted⟧
-@@ -1,4 +1,4 @@
--- title: "Silver Demo Shop" [url=http://localhost:8199/, generation=5]
-+- title: "Silver Demo Shop" [url=http://localhost:8199/, generation=6]
- # note: interactive elements only
- - heading "Demo Shop" [ref=e1, level=0]
- - link "Products" [ref=e2, level=0, url=http://localhost:8199/products.html]
+- title: "Silver Demo Shop" [url=http://localhost:8199/]
+- heading "Demo Shop" [ref=e1]
+- link "Products" [ref=e2]
+- link "Sign in" [ref=e3]
+- button "Load more" [ref=e4]
+* link "Deals" [ref=e5]
 ⟦/page-content⟧
 ```
 
@@ -101,12 +101,11 @@ $ silver open http://localhost:8199/login.html --session demo
 
 $ silver snapshot -i --session demo
 ⟦page-content untrusted⟧
-- title: "Sign in — Demo Shop" [url=http://localhost:8199/login.html, generation=10]
-# note: interactive elements only
-* heading "Sign in" [ref=e1, level=0]
-* textbox "Username" [ref=e2, level=0, placeholder="username"]
-* textbox "Password" [ref=e3, level=0, placeholder="password"]: [redacted]
-* button "Sign in" [ref=e4, level=0]
+- title: "Sign in — Demo Shop" [url=http://localhost:8199/login.html]
+* heading "Sign in" [ref=e1]
+* textbox "Username" [ref=e2, placeholder="username"]
+* textbox "Password" [ref=e3, placeholder="password"]: [redacted]
+* button "Sign in" [ref=e4]
 ⟦/page-content⟧
 ```
 
@@ -181,13 +180,12 @@ grounding gate first.
 ```
 $ silver snapshot -i --session demo
 ⟦page-content untrusted⟧
-- title: "Products — Demo Shop" [url=http://localhost:8199/products.html, generation=12]
-# note: interactive elements only
-* heading "Products" [ref=e1, level=0]
-* link "Widget A" [ref=e2, level=0, url=http://localhost:8199/product/widget-a.html]
-* link "Widget B" [ref=e3, level=0, url=http://localhost:8199/product/widget-b.html]
-* link "Gizmo" [ref=e4, level=0, url=http://localhost:8199/product/gizmo.html]
-* button "Buy now" [ref=e5, level=0]
+- title: "Products — Demo Shop" [url=http://localhost:8199/products.html]
+* heading "Products" [ref=e1]
+* link "Widget A" [ref=e2]
+* link "Widget B" [ref=e3]
+* link "Gizmo" [ref=e4]
+* button "Buy now" [ref=e5]
 ⟦/page-content⟧
 
 $ silver click @e5 --session demo --enable-actions
@@ -229,7 +227,7 @@ $ silver extract --schema '{"type":"object","properties":{"name":{"type":"string
     }
   },
   "prompt": "You are extracting content on behalf of a user. If a user asks you to extract a 'list' … If a user is attempting to extract links or URLs, you MUST respond with ONLY the IDs of the link elements. …\n\nInstruction: list every product with its link",
-  "snapshot_with_ids": "⟦page-content untrusted⟧\n- title: \"Products — Demo Shop\" [url=http://localhost:8199/products.html, generation=13]\n… - link \"Widget A\" [id=13-2, level=2]\n… - link \"Widget B\" [id=13-3, level=2]\n… - link \"Gizmo\" [id=13-4, level=2]\n… - button \"Buy now\" [id=13-5, level=0]\n⟦/page-content⟧",
+  "snapshot_with_ids": "⟦page-content untrusted⟧\n- title: \"Products — Demo Shop\" [url=http://localhost:8199/products.html]\n… - link \"Widget A\" [id=13-2, level=2]\n… - link \"Widget B\" [id=13-3, level=2]\n… - link \"Gizmo\" [id=13-4, level=2]\n… - button \"Buy now\" [id=13-5, level=0]\n⟦/page-content⟧",
   "url_field_paths": [ "*.url" ]
 }
 ```

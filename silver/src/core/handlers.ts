@@ -88,7 +88,7 @@ import { render } from '../perception/serialize.js'
 import { observe } from '../perception/diff.js'
 import { assertNavigableResolved, assertContainedPath, isLoopbackLiteralHost } from '../security/egress.js'
 import { neutralize, capOutput } from '../security/injection.js'
-import { redactValue } from '../security/redact.js'
+import { redactValue, redactHtml } from '../security/redact.js'
 import { requiresConfirm, confirmGateDecision, isDestructivePaidName } from '../security/confirm.js'
 import {
   act,
@@ -1876,7 +1876,11 @@ async function handleGet(flags: ParsedFlags): Promise<Envelope<unknown>> {
           // a synthetic attribute, not part of the real page, so it must not leak
           // into the HTML the host inspects (it would poison a hand-written selector).
           const html = (raw ?? '').replace(/\s*data-silver-ref="[^"]*"/g, '')
-          return ok(presentPageText(html, flags))
+          // Route through the SAME redaction choke point as get-text/value/attr
+          // (fix S3): outerHTML carries a server-prefilled password `value="…"`
+          // attribute and any card-shaped digit run verbatim. redactHtml masks
+          // both BEFORE presentPageText's neutralize + cap.
+          return ok(presentPageText(redactHtml(html), flags))
         })
       }
       case 'box': {
