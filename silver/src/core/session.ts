@@ -21,7 +21,7 @@ import { decodeStateBuffer, encryptJson, isStateEncryptionEnabled } from './stat
 import { classifyEngineError } from './errors.js'
 import {
   containedFilename,
-  subresourceEgressDecision,
+  createSubresourceEgressGuard,
   type EgressOptions,
 } from '../security/egress.js'
 
@@ -192,9 +192,12 @@ const FETCH_GUARD_PATTERNS = FETCH_GUARD_RESOURCE_TYPES.map((resourceType) => ({
  * (adopt-list S2 — closes the exfil hole where a page on an allowed domain
  * beacons to any host via `fetch()`/`<img>`/XHR). For each page (and any page
  * opened later this command) a `Fetch.enable` interceptor holds every subresource
- * request to `subresourceEgressDecision` (the same policy `assertNavigable` uses);
- * a denied request is `Fetch.failRequest`'d with `BlockedByClient`, everything
- * else `Fetch.continueRequest`'d. Best-effort and non-blocking: a target that
+ * request to a per-guard `createSubresourceEgressGuard` decider — the same policy
+ * the nav path uses (`assertNavigableResolved`), so a DNS-rebind host that resolves
+ * to loopback/link-local/private/metadata is blocked here too (fix C1), with each
+ * host's verdict cached so a burst to one host resolves it at most once. A denied
+ * request is `Fetch.failRequest`'d with `BlockedByClient`, everything else
+ * `Fetch.continueRequest`'d. Best-effort and non-blocking: a target that
  * cannot be armed (gone / non-CDP engine) is skipped rather than failing the
  * command. Chromium-only (CDP); firefox/webkit have no `Fetch` domain.
  */
@@ -202,6 +205,13 @@ export async function enableFetchEgressGuard(
   context: BrowserContext,
   opts: EgressOptions = fetchEgressPolicy,
 ): Promise<void> {
+  // ONE stateful decider per armed guard (fix C1): it resolves DNS like the nav
+  // path (`assertNavigableResolved`) so a rebind host that lexically looks public
+  // but RESOLVES to loopback/link-local/private/metadata is blocked here too, and
+  // it caches each host's verdict so a page firing hundreds of subresources at the
+  // same host resolves that host at most once. Shared across every page armed by
+  // this guard (host→verdict is deterministic under a fixed policy).
+  const decide = createSubresourceEgressGuard(opts)
   const arm = async (page: Page): Promise<void> => {
     let cdp: import('playwright').CDPSession
     try {
@@ -213,14 +223,19 @@ export async function enableFetchEgressGuard(
       const requestId = evt.requestId
       const url = evt.request?.url ?? ''
       const resourceType = String(evt.resourceType ?? '')
-      const decision = subresourceEgressDecision(url, resourceType, opts)
-      if (decision === 'block') {
-        void cdp
-          .send('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' })
-          .catch(() => {})
-      } else {
-        void cdp.send('Fetch.continueRequest', { requestId }).catch(() => {})
-      }
+      // The decision now RESOLVES DNS (async). Hold the paused request until the
+      // verdict lands, then fail-closed block or continue. `decide` never throws
+      // (it blocks on any resolution error), so this listener cannot reject.
+      void (async () => {
+        const decision = await decide(url, resourceType)
+        if (decision === 'block') {
+          await cdp
+            .send('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' })
+            .catch(() => {})
+        } else {
+          await cdp.send('Fetch.continueRequest', { requestId }).catch(() => {})
+        }
+      })()
     })
     try {
       // Intercept every SUBRESOURCE type but deliberately NOT `Document`:
@@ -477,6 +492,15 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
   // Whichever is chosen is recorded in the sidecar and REUSED on every reconnect.
   const userDataDir = opts.profile ?? opts.userDataDir ?? path.join(dir, 'profile')
   await fs.mkdir(userDataDir, { recursive: true })
+
+  // BUG #9: delete any STALE `DevToolsActivePort` left in the profile dir. Chromium
+  // removes this file on clean exit but LEAVES it on crash/SIGKILL/OOM/sleep. When
+  // the auto-respawn (ensureConnected → openSession) reuses the same userDataDir,
+  // `waitForDevToolsPort` polls this file immediately and would read the DEAD
+  // browser's old port before the freshly-spawned one overwrites it — targeting a
+  // dead endpoint and permanently wedging the session. Removing it first guarantees
+  // the port we read belongs to the browser we are about to spawn.
+  await fs.rm(path.join(userDataDir, 'DevToolsActivePort'), { force: true })
 
   // F1: firefox/webkit are rejected HERE, at launch — before any browser is
   // spawned or any sidecar is written. Silver's snapshot/act stack is CDP-only

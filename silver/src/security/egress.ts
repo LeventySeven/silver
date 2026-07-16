@@ -164,6 +164,93 @@ export function subresourceEgressDecision(
   return assertNavigable(url, opts).ok ? 'continue' : 'block'
 }
 
+/**
+ * DNS-resolving twin of `subresourceEgressDecision` (fix C1 for subresources).
+ *
+ * The sync version above defers to the LEXICAL `assertNavigable`, which never
+ * resolves DNS — so a hostname that lexically looks public but RESOLVES to a
+ * loopback/link-local/private/metadata address (classic DNS rebinding, e.g.
+ * `127.0.0.1.nip.io` / `169.254.169.254.nip.io`) is blocked as a top-level
+ * navigation (which uses `assertNavigableResolved`) yet slipped through as a
+ * subresource `fetch()`/`<img>`/beacon. This variant mirrors the sync one's
+ * `resourceType` handling (`Document` navigations continue — the nav path owns
+ * them) but routes every subresource through `assertNavigableResolved`, so a
+ * rebind target is denied at the Fetch layer too. Fails CLOSED: an unresolvable
+ * host yields `assertNavigableResolved`'s DENY → 'block'. Never throws.
+ *
+ * @param lookup injectable resolver (tests pass a stub; prod uses OS DNS).
+ */
+export async function subresourceEgressDecisionResolved(
+  url: string,
+  resourceType: string,
+  opts: EgressOptions,
+  lookup?: DnsLookupAll,
+): Promise<FetchEgressDecision> {
+  // Navigations are guarded on the nav path — do not re-block/re-resolve them.
+  if (resourceType === 'Document') return 'continue'
+  return (await assertNavigableResolved(url, opts, lookup)).ok ? 'continue' : 'block'
+}
+
+/**
+ * Cap on the per-guard host-decision cache. A single page rarely touches this
+ * many distinct hosts; past the cap we simply stop caching (still correct, just
+ * un-amortized) so a hostile page cannot grow the map without bound.
+ */
+const SUBRESOURCE_HOST_CACHE_MAX = 4096
+
+/**
+ * The cacheable hostname for a paused request, or `null` when the target must not
+ * be cached: `Document` navigations (owned by the nav path) and non-http(s) /
+ * unparseable targets (decided lexically with no DNS cost, so nothing to
+ * amortize). Only http(s) subresources carry a resolvable host worth caching.
+ */
+function cacheableHost(url: string, resourceType: string): string | null {
+  if (resourceType === 'Document') return null
+  let u: URL
+  try {
+    u = new URL(url)
+  } catch {
+    return null
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return null
+  const host = u.hostname.toLowerCase()
+  return host.length > 0 ? host : null
+}
+
+/**
+ * Build a STATEFUL subresource egress decider that resolves each unique host at
+ * most once. The CDP Fetch guard (session.ts) creates ONE per armed guard: a page
+ * can fire hundreds of subresources at the same host, and under a fixed policy the
+ * `block`/`continue` verdict is host-deterministic, so we cache the resolved
+ * decision per hostname (bounded by `SUBRESOURCE_HOST_CACHE_MAX`) rather than
+ * re-resolving DNS on every request. Non-cacheable targets (`Document` / non-http /
+ * unparseable) fall straight through to `subresourceEgressDecisionResolved`. Fails
+ * CLOSED: any unexpected error decides 'block'. The returned decider never throws.
+ *
+ * @param lookup injectable resolver (tests pass a stub; prod uses OS DNS).
+ */
+export function createSubresourceEgressGuard(
+  opts: EgressOptions,
+  lookup?: DnsLookupAll,
+): (url: string, resourceType: string) => Promise<FetchEgressDecision> {
+  const cache = new Map<string, FetchEgressDecision>()
+  return async (url: string, resourceType: string): Promise<FetchEgressDecision> => {
+    const host = cacheableHost(url, resourceType)
+    if (host !== null) {
+      const cached = cache.get(host)
+      if (cached !== undefined) return cached
+    }
+    let decision: FetchEgressDecision
+    try {
+      decision = await subresourceEgressDecisionResolved(url, resourceType, opts, lookup)
+    } catch {
+      decision = 'block' // fail closed on any unexpected error
+    }
+    if (host !== null && cache.size < SUBRESOURCE_HOST_CACHE_MAX) cache.set(host, decision)
+    return decision
+  }
+}
+
 /** true iff `host === d` or `host` ends with `"." + d` for some `d` in list. */
 function matchesAnySuffix(host: string, domains: readonly string[]): boolean {
   for (const d of domains) {

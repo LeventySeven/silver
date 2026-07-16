@@ -215,3 +215,60 @@ describe('E2: --profile launches against an existing user-data-dir', () => {
     },
   )
 })
+
+// ---------------------------------------------------------------------------
+// BUG #9: a browser SIGKILL/crash leaves a STALE DevToolsActivePort in the
+// profile dir. `openSession` must delete it BEFORE spawn so `waitForDevToolsPort`
+// only ever reads the freshly-spawned browser's port (not the dead one), else the
+// auto-respawn reconnects to a dead port and permanently wedges the session.
+// ---------------------------------------------------------------------------
+describe('BUG #9: openSession clears a stale DevToolsActivePort before spawn', () => {
+  const RNAME = `${NAME}-stale-port`
+  const profileDir = path.join(sessionDir(RNAME), 'profile')
+
+  afterAll(async () => {
+    try {
+      await closeSession(RNAME)
+    } catch {
+      /* ignore */
+    }
+  })
+
+  it(
+    'reopens cleanly against a userDataDir that already holds a dead port file',
+    async () => {
+      // Simulate a crashed browser: the profile dir survives with a DevToolsActivePort
+      // pointing at a now-dead port (Chromium leaves this file on SIGKILL).
+      await fs.mkdir(profileDir, { recursive: true })
+      const stalePortFile = path.join(profileDir, 'DevToolsActivePort')
+      const STALE_PORT = 1 // privileged + unbound: no CDP endpoint will ever answer
+      await fs.writeFile(stalePortFile, `${STALE_PORT}\n/devtools/browser/stale-uuid`)
+
+      // Without the fix, waitForDevToolsPort reads the stale port first and the
+      // ws-endpoint wait times out → openSession throws. With the fix it removes the
+      // stale file, so the port read is the freshly-spawned browser's real port.
+      const info = await openSession(RNAME, { headed: false })
+      expect(info.port).toBeGreaterThan(0)
+      expect(info.port).not.toBe(STALE_PORT)
+      expect(info.wsEndpoint.startsWith('ws')).toBe(true)
+
+      // The on-disk port file now reflects the LIVE browser, not the stale value.
+      const written = await fs.readFile(stalePortFile, 'utf8')
+      const firstLine = Number.parseInt(written.split('\n', 1)[0]?.trim() ?? '', 10)
+      expect(firstLine).toBe(info.port)
+      expect(firstLine).not.toBe(STALE_PORT)
+
+      // And the session is actually reconnectable (not wedged on a dead port).
+      const { browser, page } = await connect(RNAME)
+      try {
+        await page.goto('data:text/html,<h1>ok</h1>')
+        const text = await page.evaluate(() => document.querySelector('h1')?.textContent ?? '')
+        expect(text).toBe('ok')
+      } finally {
+        await browser.close()
+      }
+
+      await closeSession(RNAME)
+    },
+  )
+})

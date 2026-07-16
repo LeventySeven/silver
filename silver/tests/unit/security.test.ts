@@ -4,6 +4,8 @@ import {
   assertNavigableResolved,
   assertContainedPath,
   subresourceEgressDecision,
+  subresourceEgressDecisionResolved,
+  createSubresourceEgressGuard,
   containedFilename,
   isLoopbackLiteralHost,
   type DnsLookupAll,
@@ -790,6 +792,126 @@ describe('egress: subresourceEgressDecision', () => {
         allowedDomains: ['example.com'],
       }),
     ).toBe('continue')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// egress: subresourceEgressDecisionResolved + createSubresourceEgressGuard
+// (BUG #7 — DNS-rebinding close on the CDP Fetch subresource path)
+// ---------------------------------------------------------------------------
+describe('egress: subresourceEgressDecisionResolved (DNS-rebinding subresource guard)', () => {
+  const base = { allowFile: false }
+  /** Injectable resolver stub: return these addresses for any host. */
+  const lookupTo =
+    (addrs: string[]): DnsLookupAll =>
+    async () =>
+      addrs.map((address) => ({ address, family: address.includes(':') ? 6 : 4 }))
+
+  it('BLOCKS a public-looking host that RESOLVES to the metadata IP (rebind exfil)', async () => {
+    // Lexically public (`assertNavigable` would allow it) but resolves to the
+    // cloud-metadata link-local — the exact hole the sync path left open.
+    const d = await subresourceEgressDecisionResolved(
+      'http://169-254-169-254.nip.io/latest/meta-data/',
+      'XHR',
+      base,
+      lookupTo(['169.254.169.254']),
+    )
+    expect(d).toBe('block')
+  })
+
+  it('BLOCKS a public-looking host that resolves to loopback (127.0.0.1 rebind)', async () => {
+    const d = await subresourceEgressDecisionResolved(
+      'http://127-0-0-1.nip.io/beacon',
+      'Fetch',
+      base,
+      lookupTo(['127.0.0.1']),
+    )
+    expect(d).toBe('block')
+  })
+
+  it('CONTINUES a public-looking host that resolves to a public IP', async () => {
+    const d = await subresourceEgressDecisionResolved(
+      'https://cdn.example.com/app.js',
+      'Script',
+      base,
+      lookupTo(['93.184.216.34']),
+    )
+    expect(d).toBe('continue')
+  })
+
+  it('never resolves or blocks a Document (nav path owns navigations)', async () => {
+    let called = false
+    const d = await subresourceEgressDecisionResolved(
+      'https://anything.example/',
+      'Document',
+      base,
+      async () => {
+        called = true
+        return []
+      },
+    )
+    expect(d).toBe('continue')
+    expect(called).toBe(false)
+  })
+
+  it('fails CLOSED: lexically-blocked file:/raw-IP block without any DNS lookup', async () => {
+    let called = false
+    const stub: DnsLookupAll = async () => {
+      called = true
+      return [{ address: '93.184.216.34', family: 4 }]
+    }
+    expect(await subresourceEgressDecisionResolved('file:///etc/passwd', 'Fetch', base, stub)).toBe(
+      'block',
+    )
+    expect(await subresourceEgressDecisionResolved('http://127.0.0.1/x', 'Image', base, stub)).toBe(
+      'block',
+    )
+    expect(called).toBe(false)
+  })
+
+  it('fails CLOSED: a DNS resolution error blocks', async () => {
+    const d = await subresourceEgressDecisionResolved(
+      'http://broken.example/',
+      'Fetch',
+      base,
+      async () => {
+        throw new Error('ENOTFOUND')
+      },
+    )
+    expect(d).toBe('block')
+  })
+})
+
+describe('egress: createSubresourceEgressGuard (per-host resolution cache)', () => {
+  const base = { allowFile: false }
+
+  it('resolves each unique host at most once — a same-host 2nd request hits the cache', async () => {
+    let calls = 0
+    const lookup: DnsLookupAll = async () => {
+      calls++
+      return [{ address: '93.184.216.34', family: 4 }]
+    }
+    const decide = createSubresourceEgressGuard(base, lookup)
+    // Two requests to the SAME host (different paths / resource types) — the DNS
+    // lookup must run exactly once; the second is served from the cache.
+    expect(await decide('https://cdn.example.com/a.js', 'Script')).toBe('continue')
+    expect(await decide('https://cdn.example.com/b.png', 'Image')).toBe('continue')
+    expect(calls).toBe(1)
+    // A DIFFERENT host does resolve again.
+    expect(await decide('https://other.example/c.js', 'Script')).toBe('continue')
+    expect(calls).toBe(2)
+  })
+
+  it('caches a rebind BLOCK verdict too (host resolving to metadata IP)', async () => {
+    let calls = 0
+    const lookup: DnsLookupAll = async () => {
+      calls++
+      return [{ address: '169.254.169.254', family: 4 }]
+    }
+    const decide = createSubresourceEgressGuard(base, lookup)
+    expect(await decide('http://rebind.example/1', 'Fetch')).toBe('block')
+    expect(await decide('http://rebind.example/2', 'XHR')).toBe('block')
+    expect(calls).toBe(1)
   })
 })
 
