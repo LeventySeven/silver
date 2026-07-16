@@ -1,7 +1,7 @@
 {
   "name": "silver",
   "version": "0.1.0",
-  "description": "Silver — the keyless browser for AI agents. One CLI to perceive + act on live web pages (grounded @refs, ID-grounded extract, long-running tasks, parallel sessions/subagents), synthesized from Vercel agent-browser, Aside, Webwright, Browser Use, Stagehand, AgentQL. Keyless: never calls a model.",
+  "description": "Silver is a keyless browser for AI agents: a CLI that runs a real headless Chromium and hands the agent a compact, grounded view of the page (stable @refs, ID-grounded extraction, long-running tasks, parallel sessions and subagents). The agent decides; Silver acts. It never calls a model.",
   "author": "LeventySeven",
   "license": "MIT",
   "type": "module",

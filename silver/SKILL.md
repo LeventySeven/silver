@@ -8,8 +8,8 @@ allowed-tools: Bash(silver:*)
 
 The keyless browser for AI agents: a local headless Chromium (Playwright) driven by
 accessibility-tree snapshots with stable `@eN` refs. silver **never calls a model** — you are
-the brain. It synthesizes fast quick tasks + an ergonomic CLI (Vercel), long-running durable
-tasks (Webwright), and subagents + memory (Aside).
+the brain. It handles quick lookups, long-running durable tasks that survive a crashed agent,
+and parallel subagents with grep-first memory.
 
 **This is a discovery stub, not the guide. The deep content is served two ways** — run
 `silver skill --full` (works with only the binary installed), OR read the linked

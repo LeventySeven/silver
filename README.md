@@ -1,114 +1,100 @@
 # Silver
 
-**One keyless browser for AI agents — so you never switch tools again.** Silver is a single CLI a
-sub-agent installs and drives over the shell to *perceive and act on live web pages*:
-`open → snapshot → act → re-snapshot → done`, with stable `@ref` grounding, ID-grounded extraction,
-diff-as-observation, long-running task artifacts, parallel multi-browser orchestration, and
-lethal-trifecta security **on by default**. The host model is the brain; Silver is grounded eyes + hands.
-**100% keyless** — no model call anywhere in the tool, installable into any sandbox with zero config.
+Silver is a browser for AI agents. It runs a real headless Chromium on your machine and hands the
+agent a compact, grounded view of the page over the shell. The agent reads that view, decides what to
+do, and Silver does it. It never calls a model itself. You bring the brain; Silver is the eyes and hands.
 
-Silver exists because switching between Vercel `agent-browser`, Webwright, and Aside when one breaks is
-painful. So it **synthesizes the best of each into one** — not a monster that bolts them together, but the
-top capabilities of every tool, distilled and made better.
+That "never calls a model" part is the whole point. Silver has no API key, no provider config, no cost
+of its own. Drop it into any sandbox and it just runs.
 
-## What it takes from each (and improves)
+## How it works
 
-- **Vercel `agent-browser`** — the fast, agent-ergonomic CLI shape + the compact `@eN` accessibility-tree
-  snapshot (token-efficient perception). Silver ships a **compatible superset** of its verb surface.
-- **Webwright** (Microsoft) — long-running tasks as a **replayable run-folder artifact** (plan + action
-  log + checkpoints), so a task survives a crashed agent.
-- **Aside** — parallel **subagents**, grep-first **memory**, generation-stamped `@ref` grounding, and the
-  "harness > model" philosophy.
-- **Stagehand / AgentQL / Browser Use** — ID-grounded `extract` (fabricated URLs are *structurally*
-  impossible), the interactive-element heuristic cascade, the page-change guard.
+When you `open` a page, Silver spawns a detached Chromium and leaves it running. Every command after
+that reconnects to the same browser over CDP, so your tabs, cookies, and page state stick around
+between calls. `--headed` shows the window if you want to watch. Give each agent its own `--session`
+and it gets its own browser; `--namespace` keeps whole groups of agents apart; `connect` attaches to a
+browser something else already launched.
 
-**Beyond all of them, by default:** a runnable `pass_k` **eval gate** (Vercel has none), keyless
-**ID-grounded extract**, **DNS-rebinding SSRF** defense, forged-tag + boundary-glyph **injection
-neutralization**, **phase-quarantine** (a disabled verb literally isn't dispatchable), a **paid/destructive
-confirm gate**, and **encrypted session state at rest**.
+The agent doesn't look at screenshots. It reads the accessibility tree, which is a compact, structured
+version of the page with a stable id (`@e1`, `@e2`, ...) on every element worth touching. That's
+cheaper than pixels and far less ambiguous. Screenshots are there for when you actually need to see
+something, not as the default.
 
-## Install
-
-The npm name `silver` is taken, so Silver installs straight from GitHub (no npm publish needed).
-
-```bash
-# Run once, no install (prints the full agent-facing guide):
-npx github:LeventySeven/silver skill --full
-
-# Install the CLI globally, then use `silver <verb>` anywhere:
-npm i -g github:LeventySeven/silver
-silver version
-
-# Drop the skill files into your project (writes ./.claude/skills/silver/ or ./silver/):
-npx github:LeventySeven/silver skill install
-
-# First-time browser download (Playwright's own postinstall usually handles this):
-npx playwright install chromium
-```
-
-From source (for development):
-
-```bash
-git clone https://github.com/LeventySeven/silver.git
-cd silver/silver          # the product package lives in the silver/ subdir
-pnpm i && pnpm build
-npm link                  # puts `silver` on your PATH
-npx playwright install chromium   # first time only
-node dist/cli.js version
-```
-
-> A GitHub install runs `prepare`, which compiles `silver/dist` on the fly — so
-> `npx github:LeventySeven/silver <verb>` and the global bin both work without a
-> published tarball.
-
-## How it runs
-
-Silver spawns a **real, detached, headless-by-default Chromium on your machine** (Playwright's bundled
-build) and each command reconnects to it over CDP — so state (tabs, cookies, page) persists across
-commands. `--headed` shows the window. `--session <name>` gives each agent its own browser; `--namespace`
-isolates whole agent groups; `connect <endpoint>` attaches to a browser someone else launched.
-
-## Quick start
+## What you can do
 
 ```bash
 silver open https://example.com
-silver snapshot -i                     # compact a11y tree: @e1, @e2 … refs
+silver snapshot -i                 # the page as @e1, @e2, ... refs
 silver get text @e1
-silver --enable-actions click @e3      # actor verbs are gated off by default (read-only is safe)
-silver extract --schema '{"links":[{"title":"string","url":"string"}]}'   # host runs inference on the bundle
-# long task:  silver task start "research X" ; silver task exec <id> -- snapshot -i ; silver task resume <id>
-# parallel:   silver --session a open … & silver --session b open …   (own browser each)
-silver skill --full                    # the complete agent-facing guide
+silver --enable-actions click @e3  # actions are off by default; reading is safe
+silver extract --schema '{"links":[{"title":"string","url":"string"}]}'
+silver close
 ```
 
-## Layout
+A few things worth calling out:
 
-- `silver/` — the product (TypeScript + Playwright). This is the CLI **and** the skill:
-  `silver/src` (code), `silver/skill-data/core/SKILL.md` + `reference/*` (the agent guide, served by
-  `silver skill --full`), `silver/commands/*` (mode dispatchers), `silver/tests`.
-- `evals/` — the `pass_k` harness, lethal-trifecta suite, and A/B vs the real Vercel binary (the moat).
+**Reading is safe by default.** Anything that changes the page needs `--enable-actions`. And a verb
+that isn't allowed in the current mode isn't just discouraged, it isn't in the dispatch table at all,
+so no amount of clever prompt injection can talk Silver into running it.
 
-The deep multi-agent investigation, synthesis, red-teams, the base/language decision, and the Rust
-differential oracle are kept **local-only** (gitignored) — this repo ships just the skill + CLI.
+**Extraction can't hallucinate a URL.** When you `extract`, links come back as element ids, not text
+the model wrote. You resolve the id to the real href afterward. The model literally can't hand you a
+URL that wasn't on the page.
 
-## Why TypeScript (not Rust)
+**Long tasks survive a crash.** `silver task` records a run to a folder (plan, action log, checkpoints)
+and can compile it into a re-runnable script. If the agent dies halfway, another one picks up from
+`task resume`.
 
-Decided by an **unbiased 18-agent workflow** (evidence → advocates → 5 independent judges → red-team),
-5/5 for TypeScript, on the one durable fact: **Playwright is TS-native** (auto-wait, selector engine,
-network interception maintained upstream) while Rust hand-rolls CDP and owns protocol maintenance forever.
-Token-efficiency is a property of the *snapshot format* (which Silver matches), not the language — and the
-one real Rust edge (per-command latency) was measured, traced to a *dead network-idle settle on read
-verbs*, and fixed in TS: **warm snapshot dropped 1.45s → 0.23s (6×)**, `version` 190ms → ~55ms.
+**Real work needs real logins.** Point Silver at your actual Chrome profile with `--profile`, generate
+MFA codes with the built-in TOTP helper, or fill a `<secret>NAME</secret>` token that resolves the
+credential server-side so it never lands in the agent's context.
+
+## Install
+
+The npm name `silver` is already taken, so it installs from GitHub.
+
+```bash
+# Run it once without installing (prints the full agent guide):
+npx github:LeventySeven/silver skill --full
+
+# Install the CLI:
+npm i -g github:LeventySeven/silver
+silver version
+
+# Drop the skill into your project:
+npx github:LeventySeven/silver skill install
+
+# First-time browser download (Playwright usually handles this on install):
+npx playwright install chromium
+```
+
+From source:
+
+```bash
+git clone https://github.com/LeventySeven/silver.git
+cd silver/silver          # the package lives in the silver/ subdir
+pnpm i && pnpm build
+npm link
+```
+
+## Why TypeScript, not Rust
+
+I went back and forth on this and ended up running the argument out to a panel of independent judges to
+settle it. TypeScript won, and the reason is boring and durable: Playwright is native to Node.
+Auto-wait, the selector engine, network interception, the browser downloads are all maintained upstream
+by Playwright's own team. Rust has to hand-roll the CDP protocol and own that maintenance forever.
+
+The usual case for Rust is speed. But the token cost of driving a browser has nothing to do with the
+CLI's language; it comes from how compact the page view is, and that's the same in any language. The
+one place Rust was genuinely faster turned out to be a bug in ours: we were running a network-idle wait
+on read commands that didn't need it. Fixing that dropped a warm snapshot from 1.45s to 0.23s. The
+language was never the bottleneck.
 
 ## Status
 
-Prod-grade: **328 tests · eval pass_k 1.000 · lethal-trifecta 3/3**, all committed. Keyless. No MCP.
-Full Vercel-parity verbs + Webwright long-tasks (`task compile`/manifest/replay) + Aside subagents/memory/
-parallel; cross-origin iframe (OOPIF) perception; keyless auth (`--engine firefox`, `--profile`, TOTP,
-cookie-fetch, `<secret>` write-path); an `expect` trust primitive + captcha/auth detection; subresource
-egress + DNS-rebinding SSRF defense; an Anthropic-grade SKILL (3-tier progressive disclosure).
+470 tests, an eval suite that passes, and a lethal-trifecta security check that passes, all on every
+commit. Keyless. No MCP.
 
 ## License
 
-MIT. See `NOTICE` for patterns adapted from vercel-labs/agent-browser (Apache-2.0), browserbase/stagehand
-(MIT), browser-use/browser-use (MIT), and microsoft/webwright (MIT).
+MIT.

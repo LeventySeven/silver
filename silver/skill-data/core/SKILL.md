@@ -6,11 +6,10 @@ ever. It hands you a compact accessibility tree with stable `@eN` element refs, 
 what to do, and it executes. Every "smart" step is a deterministic heuristic or a bundle
 handed back to you.
 
-silver synthesizes three proven designs: **fast quick tasks + an ergonomic CLI** (Vercel
-agent-browser) — `open → snapshot → act → extract`, a uniform JSON envelope, real Playwright
-(network, PDF, frames, storage, no stubs); **long-running tasks** (Webwright) — a durable *run
-folder* that survives a crashed agent; and **subagents + memory** (Aside) — scoped child units
-of work and grep-first markdown, both keyless.
+silver covers three shapes of work. Quick tasks run `open → snapshot → act → extract` over a
+uniform JSON envelope on real Playwright (network, PDF, frames, storage, no stubs). Long-running
+tasks get a durable run folder that survives a crashed agent. And for parallel work there are
+scoped subagents plus grep-first markdown memory, all keyless.
 
 **Decompose before you drive:** combine dependent steps into one sequential session; split
 independent steps into parallel sessions. Don't reach for parallelism below ~3 genuinely
