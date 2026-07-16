@@ -78,7 +78,12 @@ import {
   findFrame,
   type RouteRule,
 } from './capture.js'
-import { snapshotNodes, type SnapNode } from '../perception/walk.js'
+import {
+  snapshotNodes,
+  isSparseTree,
+  type SnapNode,
+  type SparseTreeMetrics,
+} from '../perception/walk.js'
 import { render } from '../perception/serialize.js'
 import { observe } from '../perception/diff.js'
 import { assertNavigableResolved, assertContainedPath } from '../security/egress.js'
@@ -1048,7 +1053,11 @@ async function handleSnapshot(flags: ParsedFlags): Promise<Envelope<unknown>> {
     const prevRefmap = await loadRefMap(flags.session)
     const gen = newGeneration(prev?.generation ?? 0)
 
-    const snapOpts: Parameters<typeof snapshotNodes>[1] = { interactive: flags.interactive }
+    // sparse_tree metrics ride the walk's in-page scan (zero extra round-trip) and
+    // are filled in place; they are NEVER stored on any RefEntry (geometry stays
+    // lazy — red-team #3), so the default serialize path is untouched.
+    const metrics: SparseTreeMetrics = { canvasCoverage: 0, canvasCount: 0, refEligibleCount: 0 }
+    const snapOpts: Parameters<typeof snapshotNodes>[1] = { interactive: flags.interactive, metrics }
     if (flags.depth !== undefined) snapOpts.maxDepth = flags.depth
     if (flags.selector !== undefined) snapOpts.selectorScope = flags.selector
     const nodes = await snapshotNodes(page, snapOpts)
@@ -1086,7 +1095,7 @@ async function handleSnapshot(flags: ParsedFlags): Promise<Envelope<unknown>> {
     // R5a: empty-DOM advisory on the snapshot path too (a snapshot of a blank
     // shell tells the host to reload rather than parse an empty tree).
     const empty = await detectEmptyPage(page)
-    return ok(presentPageText(obsv.output, flags), hazardWarning(hz, fp.page_changed, empty))
+    return ok(presentPageText(obsv.output, flags), hazardWarning(hz, fp.page_changed, empty, metrics))
   })
 }
 
@@ -1144,13 +1153,32 @@ async function detectHazards(page: Page): Promise<Hazards> {
 
 /** Compose the advisory warning for a read/nav path from detected hazards +
  * the page-changed flag. `captcha_detected` / `auth_required` code tokens are
- * embedded so the host can branch on them; messages come from the ERRORS table. */
-function hazardWarning(hz: Hazards, pageChanged = false, empty = false): string | undefined {
+ * embedded so the host can branch on them; messages come from the ERRORS table.
+ * `sparse` (snapshot path only) surfaces the `sparse_tree` advisory when the page
+ * is canvas-dominant with few refs; it is SILENT (appends nothing) when it does
+ * not fire, so the default clean path stays clean (red-team #4). */
+function hazardWarning(
+  hz: Hazards,
+  pageChanged = false,
+  empty = false,
+  sparse?: { canvasCoverage: number; refEligibleCount: number },
+): string | undefined {
   const parts: string[] = []
   if (hz.captcha) parts.push(`captcha_detected: ${ERRORS.captcha_detected.message}`)
   if (hz.auth) parts.push(`auth_required: ${ERRORS.auth_required.message}`)
   // R5a: page_empty advisory (blank shell / interstitial / unrendered bundle).
   if (empty) parts.push(`page_empty: ${ERRORS.page_empty.message}`)
+  // sparse_tree advisory: canvas-dominant + interactive-ref-poor. The percentage
+  // is a harmless page-derived integer (no path/secret — the no-leak invariant is
+  // about filesystem/host/secret leaks, not a coverage number); the fixed recovery
+  // text comes from the ERRORS table.
+  if (sparse && isSparseTree(sparse)) {
+    const pct = Math.round(sparse.canvasCoverage * 100)
+    const n = sparse.refEligibleCount
+    parts.push(
+      `sparse_tree: this page is canvas-dominant (~${pct}% canvas, ${n} interactive ref${n === 1 ? '' : 's'}); ${ERRORS.sparse_tree.message}`,
+    )
+  }
   const pc = warnIf(pageChanged)
   if (pc) parts.push(pc)
   return parts.length > 0 ? parts.join(' | ') : undefined
@@ -1793,8 +1821,47 @@ async function handleGet(flags: ParsedFlags): Promise<Envelope<unknown>> {
           return ok({ attribute: attrName, value: presentPageText(redacted, flags) })
         })
       }
+      case 'html': {
+        // Element-scoped code escape hatch (repr phase-1 #4): the outerHTML of one
+        // ALREADY-GROUNDED ref — for a blind/nameless custom widget whose a11y
+        // role+name is insufficient. NOT a whole-page DOM dump (that's the rejected
+        // 38% path). The HTML is page-derived UNTRUSTED content (carries attribute
+        // values / data-* / inline-handler text — a bigger payload than get-text),
+        // so it MUST go through presentPageText (neutralize + cap) like every other
+        // page-derived read.
+        const ref = rest[0]
+        if (!ref) return badRequest('usage: silver get html @eN')
+        return withLocator(page, flags.session, ref, async (loc) => {
+          // `el` is Playwright's SVGElement|HTMLElement; no DOM lib is loaded, so
+          // avoid naming a DOM type in-source — outerHTML is present on both.
+          const raw = (await loc.evaluate((el) => el.outerHTML)) as string
+          // Strip the `data-silver-ref` grounding stamp toLocator injected — it is
+          // a synthetic attribute, not part of the real page, so it must not leak
+          // into the HTML the host inspects (it would poison a hand-written selector).
+          const html = (raw ?? '').replace(/\s*data-silver-ref="[^"]*"/g, '')
+          return ok(presentPageText(html, flags))
+        })
+      }
+      case 'box': {
+        // LAZY coordinates (repr phase-1 #3): the bounding box of one grounded ref,
+        // computed ON DEMAND here — geometry is NEVER stored on RefEntry or the
+        // default walk (red-team #3: that would tax every snapshot across hundreds
+        // of refs). Pairs with `click --at <x> <y>`: the host does `get box @eN` ->
+        // `click --at <cx> <cy>` for a canvas/coordinate target (center = x+w/2,
+        // y+h/2). The values are numbers (no injection payload), so — like
+        // `get count` — they are returned raw, not routed through the text scrubber.
+        const ref = rest[0]
+        if (!ref) return badRequest('usage: silver get box @eN')
+        return withLocator(page, flags.session, ref, async (loc) => {
+          const box = await loc.boundingBox()
+          // A grounded ref with no box (display:contents / zero-size / not
+          // rendered) is NOT "not found" — re-snapshotting won't give it one.
+          if (!box) return fail('no_layout_box')
+          return ok({ x: box.x, y: box.y, width: box.width, height: box.height })
+        })
+      }
       default:
-        return badRequest('usage: silver get text|value|attr|title|url|count [ref]')
+        return badRequest('usage: silver get text|value|attr|html|box|title|url|count [ref]')
     }
   })
 }

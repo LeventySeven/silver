@@ -60,6 +60,25 @@ export const ERRORS = {
     message:
       'the page loaded but its DOM is (near-)empty — likely a blank shell, an anti-bot interstitial, or a throttled response; wait and reload, or try a different entry point',
   },
+  // The a11y tree is likely BLIND on this page: a `<canvas>`/WebGL surface
+  // dominates the viewport and there are few interactive refs. ADVISORY only
+  // (never blocks) — the a11y tree cannot see into a canvas, so the host should
+  // fall back to pixels + coordinates rather than trust an empty-looking tree.
+  sparse_tree: {
+    retryableByHost: false,
+    message:
+      'the accessibility tree may be blind here (a canvas/WebGL surface dominates the viewport with few interactive refs) — take a `screenshot` for the visual, then `get box @eN` and act via `click --at <x> <y>` on the coordinate target',
+  },
+  // `get box` grounded the ref, but the element has no layout box — it is
+  // `display:contents`, zero-size, or not rendered, so it has no coordinates to
+  // return. DISTINCT from `element_not_found` (whose "re-snapshot" advice is
+  // wrong here: the ref DID match; a fresh snapshot won't give a contents-box a
+  // geometry). The host should target a rendered node instead, or use pixels.
+  no_layout_box: {
+    retryableByHost: false,
+    message:
+      'the element matched but has no layout box (display:contents, zero-size, or not rendered) — it has no coordinates; target a rendered ancestor/child ref, or take a `screenshot` and act on pixel coordinates',
+  },
   // R5b: the SAME (verb, ref, page-fingerprint) has recurred K times with no
   // observable change — a stuck loop. ADVISORY only (never blocks the action):
   // retrying the identical action unchanged will not progress.

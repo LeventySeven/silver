@@ -126,6 +126,8 @@ or stop; don't retry.
 | `get text [@ref]` | Element text, or the whole body — neutralized + capped. |
 | `get value @ref` | Input value — **passwords/cards render `[redacted]`**. |
 | `get attr @ref <name>` | One attribute — redacted + neutralized + capped. |
+| `get html @ref` | The grounded element's **outerHTML** — neutralized + capped. The code escape hatch for a *nameless/ambiguous* ref (custom widget, icon button) whose role+name isn't enough. Element-scoped, **not** a whole-page dump. |
+| `get box @ref` | The grounded element's bounding box `{x, y, width, height}`, computed **on demand** (never on the snapshot). Pair with `click --at`: center = `x+width/2, y+height/2`. For canvas/coordinate targets. |
 | `is visible @ref` / `is enabled @ref` / `is checked @ref` | Boolean state of a grounded ref. |
 | `wait @ref` | Wait until a ref is visible. |
 | `wait <ms>` | Sleep N milliseconds (`wait 500`). |
@@ -298,9 +300,11 @@ independent reads.** Touching one shared account is not "independent."
   (precedence deny > confirm > allow > default) no confirmation can lift. Full: `reference/security.md`.
 - **Detectors are advisory, not blockers** (a read path never blocks): `captcha_detected` /
   `auth_required` (now emitted — stop and hand off), `page_empty` (blank/interstitial shell),
-  `repetition_detected` (you're looping — re-plan). `navigation_failed` (site-side `net::ERR_*`,
-  may retry) is distinct from policy `navigation_blocked` (never retry). `retries_exhausted` means
-  silver already spent its bounded internal retries — **do not loop again.**
+  `sparse_tree` (canvas-dominant page, few refs — the a11y tree is blind; use `screenshot` +
+  `get box`/`click --at`, see §4), `repetition_detected` (you're looping — re-plan).
+  `navigation_failed` (site-side `net::ERR_*`, may retry) is distinct from policy
+  `navigation_blocked` (never retry). `retries_exhausted` means silver already spent its bounded
+  internal retries — **do not loop again.**
 - **Secrets go on `--stdin`, never argv.** The `fill` echo is NOT redacted (snapshots/`get value`
   are) — treat it as sensitive.
 - **Navigation is egress-guarded; file paths are contained; output never silently truncates**
@@ -319,13 +323,25 @@ independent reads.** Touching one shared account is not "independent."
 
 ## 4. Perception escalation ladder (cheap → expensive)
 
-1. **`snapshot -i`** — the default. Cheapest; re-observations diff against the prior snapshot.
+The accessibility tree covers **~90%** of pages outright. Climb this ladder only for the residual
+a11y-blind elements (canvas/WebGL, nameless icon buttons, custom widgets) — never by default.
+
+1. **`snapshot -i`** — the default. Cheapest; whole-page; re-observations diff against the prior
+   snapshot. **Start here every time.**
 2. **full `snapshot`** — when you need structural/text nodes the interactive filter dropped. Add
    `-c` (compact) or `-s <css>` / `-d <n>` to keep it small.
-3. **`wait …` then re-`snapshot`** — when the page is still settling (`wait --load networkidle`,
+3. **`get html @eN`** — when a ref's role+name is **uninformative or ambiguous** (a nameless icon
+   button `button [ref=e4]`, a custom widget). Reads that one element's outerHTML so you can see
+   its `id`/`class`/`data-*`/handlers and decide what it is — the honest "code mode", scoped to one
+   already-grounded ref (never a whole-page DOM dump — that representation is heavier *and* worse).
+4. **`wait …` then re-`snapshot`** — when the page is still settling (`wait --load networkidle`,
    `wait --text …`, `wait @ref`).
-4. **`screenshot`** — **last resort**, only to disambiguate a visual-only / canvas / WebGL
-   target. silver never auto-attaches pixels and never runs a vision model — YOU read the image.
+5. **`screenshot` → `get box @eN` → `click --at <x> <y>`** — for a **canvas/WebGL or
+   coordinate-only** target with no useful ref. silver flags these pages with a **`sparse_tree`**
+   advisory (canvas-dominant, few refs — the a11y tree is blind there). Take a `screenshot` to see
+   it (YOU read the pixels — silver never runs a vision model), get a ref's `get box` for
+   coordinates, then act with `click --at`. Center of a box = `x+width/2, y+height/2`. **Last
+   resort — never screenshot every step.**
 
 Custom widgets: `select` works on a **native** `<select>` only. For a `div[role=listbox]` or
 custom dropdown, `click` to open → re-`snapshot` → `click` the option.

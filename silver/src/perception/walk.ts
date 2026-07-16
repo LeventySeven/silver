@@ -65,6 +65,40 @@ export type SnapNode = {
   options?: string[]
 }
 
+/**
+ * Sparse-tree signal metrics (the `sparse_tree` advisory). Written INTO an
+ * `opts.metrics` object the caller supplies — never on any `RefEntry`, so the
+ * default snapshot/serialize hot path is byte-for-byte unchanged (red-team #3:
+ * geometry stays lazy). Canvas coverage rides the SAME in-page scan the walk
+ * already runs (SCAN_JS), so there is ZERO extra round-trip.
+ */
+export type SparseTreeMetrics = {
+  /** Fraction [0,1] of the viewport covered by (visible) `<canvas>` elements. */
+  canvasCoverage: number
+  /** Number of `<canvas>` elements found on the page. */
+  canvasCount: number
+  /** Count of ref-eligible nodes the walk produced — the interactive-ref density. */
+  refEligibleCount: number
+}
+
+/**
+ * `sparse_tree` trigger (red-team correction #4): fire ONLY when the page is
+ * canvas-DOMINANT *and* the a11y tree yields few interactive refs. NOT ref-count
+ * alone — a healthy small page (example.com: 2 refs, no canvas) must never
+ * false-positive. A canvas-dominant game with a couple of overlaid buttons DOES
+ * fire (the tree is blind there); a rich dashboard with a big chart canvas but
+ * many controls does NOT (the host has plenty of refs to act on).
+ */
+export const SPARSE_TREE_CANVAS_COVERAGE = 0.5
+export const SPARSE_TREE_MAX_REFS = 5
+
+/** True iff the page is canvas-dominant AND interactive-ref-poor (see above). */
+export function isSparseTree(m: { canvasCoverage: number; refEligibleCount: number }): boolean {
+  return (
+    m.canvasCoverage > SPARSE_TREE_CANVAS_COVERAGE && m.refEligibleCount <= SPARSE_TREE_MAX_REFS
+  )
+}
+
 export type SnapshotOptions = {
   /** Interactive mode: fall a cursor-interactive node's name back to its text. */
   interactive?: boolean
@@ -72,6 +106,13 @@ export type SnapshotOptions = {
   maxDepth?: number
   /** CSS selector to scope the walk to a subtree. */
   selectorScope?: string
+  /**
+   * OPTIONAL out-param for the `sparse_tree` signal. When supplied, snapshotNodes
+   * fills it from the in-page scan (canvas coverage) + the walk (ref density).
+   * Absent for every non-snapshot caller (resolve.ts re-snapshots) so nothing on
+   * the actuation path pays for it. Populated in place; never returned.
+   */
+  metrics?: SparseTreeMetrics
 }
 
 /** Hard cap on semantic depth (spec §5: max 50 semantic levels). */
@@ -219,7 +260,12 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
     //    data-__uab-idx). Child frames rely on the AX tree for ref-eligibility
     //    (real controls: button/link/input/…), which the cursor cascade is not
     //    needed for — keeping the scan single-frame avoids idx collisions.
-    const scan = (await page.evaluate(SCAN_JS)) as { bail: boolean; records: ScanRecord[] }
+    const scan = (await page.evaluate(SCAN_JS)) as {
+      bail: boolean
+      records: ScanRecord[]
+      canvasCoverage?: number
+      canvasCount?: number
+    }
 
     // 2. DOM tree (pierced) -> attribute map + idx->backendNodeId. `pierce:true`
     //    already descends into every iframe's contentDocument, so child-frame
@@ -281,7 +327,17 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
     }
 
     // Walk the main frame, then recursively splice child frames inline.
-    return await walkFrame(MAIN_FRAME_ID, 0, 0, cdp, domByBackend, false)
+    const nodes = await walkFrame(MAIN_FRAME_ID, 0, 0, cdp, domByBackend, false)
+
+    // sparse_tree signal (opt-in out-param; never stored on any RefEntry, so the
+    // default hot path is untouched). Canvas coverage rode the scan above;
+    // ref density is counted from the walk output here.
+    if (opts.metrics) {
+      opts.metrics.canvasCoverage = typeof scan.canvasCoverage === 'number' ? scan.canvasCoverage : 0
+      opts.metrics.canvasCount = typeof scan.canvasCount === 'number' ? scan.canvasCount : 0
+      opts.metrics.refEligibleCount = nodes.reduce((a, n) => a + (n.refEligible ? 1 : 0), 0)
+    }
+    return nodes
 
     /**
      * Walk ONE frame's accessibility subtree into a flat SnapNode list, splicing
@@ -731,7 +787,33 @@ export function cleanUrl(href: string, base?: string): string {
 const SCAN_JS = `(function () {
   var out = [];
   var all = document.querySelectorAll('*');
-  if (all.length > ${SCAN_ELEMENT_LIMIT}) return { bail: true, records: out };
+
+  // sparse_tree signal: fraction of the viewport covered by visible <canvas>
+  // surfaces. Computed here (zero extra round-trip) and returned alongside the
+  // scan records. Cheap — O(#canvas), not O(#elements) — and independent of the
+  // element-cap bail below, so a canvas-dominant page is flagged even when the
+  // full cursor scan is skipped. Overlapping canvases can over-count; clamped to 1.
+  var canvasCoverage = 0, canvasCount = 0;
+  (function () {
+    var vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    var vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    var vArea = vw * vh;
+    if (!vArea) return;
+    var cs = document.getElementsByTagName('canvas');
+    canvasCount = cs.length;
+    var covered = 0;
+    for (var ci = 0; ci < cs.length; ci++) {
+      var cst = getComputedStyle(cs[ci]);
+      if (cst.visibility === 'hidden' || cst.display === 'none' || cst.opacity === '0') continue;
+      var cr = cs[ci].getBoundingClientRect();
+      var ix = Math.max(0, Math.min(cr.right, vw) - Math.max(cr.left, 0));
+      var iy = Math.max(0, Math.min(cr.bottom, vh) - Math.max(cr.top, 0));
+      covered += ix * iy;
+    }
+    canvasCoverage = Math.min(1, covered / vArea);
+  })();
+
+  if (all.length > ${SCAN_ELEMENT_LIMIT}) return { bail: true, records: out, canvasCoverage: canvasCoverage, canvasCount: canvasCount };
   var interactiveRoles = {button:1,link:1,textbox:1,checkbox:1,radio:1,combobox:1,listbox:1,menuitem:1,menuitemcheckbox:1,menuitemradio:1,option:1,searchbox:1,slider:1,spinbutton:1,switch:1,tab:1,treeitem:1};
   var interactiveTags = {a:1,button:1,input:1,select:1,textarea:1,details:1,summary:1};
   for (var i = 0; i < all.length; i++) {
@@ -813,7 +895,7 @@ const SCAN_JS = `(function () {
       out.push({ cur: cur, kind: kind, hints: hints, text: text, hiddenInputType: hiddenInputType, hiddenInputChecked: hiddenInputChecked, prune: prune, formHint: fh, roleText: roleText });
     }
   }
-  return { bail: false, records: out };
+  return { bail: false, records: out, canvasCoverage: canvasCoverage, canvasCount: canvasCount };
 })()`
 
 const CLEANUP_JS = `(function () {
