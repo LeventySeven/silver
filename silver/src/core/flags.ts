@@ -83,6 +83,17 @@ export type ParsedFlags = {
   ids?: string
   text?: string
   load?: string
+  /**
+   * `wait --ready` (S5): dual-quiet page-ready wait — resolve when the page is
+   * BOTH DOM-quiet (MutationObserver) AND network-quiet (pending requests == 0).
+   * Read-only; more robust than `--load networkidle` on never-idling SPAs.
+   */
+  ready: boolean
+  /**
+   * `read --links` (S6): emit `[text](url)` markdown links in the `read <url>`
+   * output. OFF by default (token-lean — just the link text).
+   */
+  links: boolean
   fn?: string
   name?: string
   index?: number
@@ -239,6 +250,9 @@ const BOOL_FLAGS: Record<string, keyof ParsedFlags> = {
   compact: 'compact',
   interactive: 'interactive',
   urls: 'urls',
+  // S5: `wait --ready` dual-quiet page-ready. S6: `read --links` markdown links.
+  ready: 'ready',
+  links: 'links',
   full: 'full',
   all: 'all',
   stdin: 'stdin',
@@ -305,6 +319,8 @@ function defaults(): ParsedFlags {
     compact: false,
     interactive: false,
     urls: false,
+    ready: false,
+    links: false,
     full: false,
     all: false,
     stdin: false,

@@ -103,6 +103,23 @@ describe('flags: F5 --taint-guard', () => {
   })
 })
 
+describe('flags: S5 --ready / S6 --links (adopt Batch 5)', () => {
+  it('--ready is a boolean, OFF by default', () => {
+    expect(parseFlags(['wait']).ready).toBe(false)
+    expect(parseFlags(['wait', '--ready']).ready).toBe(true)
+  })
+  it('--links is a boolean, OFF by default', () => {
+    expect(parseFlags(['read', 'http://x']).links).toBe(false)
+    expect(parseFlags(['read', 'http://x', '--links']).links).toBe(true)
+  })
+  it('wait --ready leaves no stray positional and honors --timeout', () => {
+    const f = parseFlags(['wait', '--ready', '--timeout', '2000'])
+    expect(f.ready).toBe(true)
+    expect(f.timeout).toBe(2000)
+    expect(f.args).toEqual([])
+  })
+})
+
 describe('flags: F10 --use-config removed', () => {
   it('no longer exposes a useConfig field, and --use-config is an inert no-op', () => {
     const f = parseFlags(['open', 'x', '--use-config'])

@@ -86,6 +86,7 @@ import {
 } from '../perception/walk.js'
 import { render } from '../perception/serialize.js'
 import { observe } from '../perception/diff.js'
+import { htmlToMarkdown } from '../perception/markdown.js'
 import { assertNavigableResolved, assertContainedPath, isLoopbackLiteralHost } from '../security/egress.js'
 import { neutralize, capOutput } from '../security/injection.js'
 import { redactValue, redactHtml } from '../security/redact.js'
@@ -1246,7 +1247,13 @@ async function handleRead(flags: ParsedFlags): Promise<Envelope<unknown>> {
     if (!fetched.ok) return navBlocked(url)
     if (!fetched.res.ok) return fail('page_crash')
     const html = await fetched.res.text()
-    return ok(presentPageText(htmlToText(html), flags))
+    // S6: landmark-skipped markdown (headings/lists/links) — fewer tokens and far
+    // more useful than the old bare tag-strip. STRING-based (no browser round-trip,
+    // so `read <url>` stays a cheap raw fetch) and it NEVER executes fetched
+    // scripts. `--links` emits `[text](url)`; relative hrefs resolve against `url`.
+    // Still routed through presentPageText so neutralize + the output cap apply.
+    const md = htmlToMarkdown(html, { links: flags.links, baseUrl: url })
+    return ok(presentPageText(md, flags))
   }
   return withConnection(flags, async ({ page }) => {
     const text = (await page.evaluate(
@@ -2134,7 +2141,10 @@ async function handleWait(flags: ParsedFlags): Promise<Envelope<unknown>> {
     try {
       const spec = await buildWaitSpec(flags, page, cdp)
       if ('error' in spec) return spec.error
-      await waitFor(page, spec.spec)
+      const result = await waitFor(page, spec.spec)
+      // S5: a `--ready` spec resolves to a {ready,reason} result; every other wait
+      // form returns void. Surface the readiness verdict (advisory — never a throw).
+      if (result) return ok({ waited: true, ready: result.ready, reason: result.reason })
       return ok({ waited: true })
     } catch (err) {
       if (err instanceof WaitError) return fail(err.code)
@@ -2152,6 +2162,9 @@ async function buildWaitSpec(
   cdp: CDPSession,
 ): Promise<{ spec: WaitSpec } | { error: Envelope<unknown> }> {
   const timeout = flags.timeout
+  // S5: `wait --ready` (dual-quiet page-ready) resolves BEFORE the positional-arg
+  // handling — it takes no positional and is the most robust settle signal.
+  if (flags.ready) return { spec: { ready: true, timeout } }
   if (flags.text !== undefined) return { spec: { text: flags.text, timeout } }
   if (flags.url !== undefined) return { spec: { url: flags.url, timeout } }
   if (flags.fn !== undefined) return { spec: { fn: flags.fn, timeout } }
@@ -3847,20 +3860,3 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString('utf8')
 }
 
-/** Minimal HTML → text: drop script/style, strip tags, decode a few entities. */
-function htmlToText(html: string): string {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/[ \t]+\n/g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .replace(/[ \t]{2,}/g, ' ')
-    .trim()
-}

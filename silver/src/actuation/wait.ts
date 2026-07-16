@@ -18,6 +18,7 @@
 import type { Page, Locator, CDPSession } from 'playwright'
 import type { RefMap } from '../perception/refmap.js'
 import { groundRef } from '../perception/refmap.js'
+import { waitForReady, type ReadyResult } from '../perception/pageready.js'
 import { toLocator } from './resolve.js'
 import { cleanupStamp } from './actions.js'
 
@@ -30,6 +31,8 @@ export type WaitSpec =
   | { text: string; timeout?: number }
   | { url: string; timeout?: number }
   | { load: 'load' | 'domcontentloaded' | 'networkidle'; timeout?: number }
+  // S5: dual-quiet page-ready — resolves via waitForReady (DOM + network quiet).
+  | { ready: true; timeout?: number }
   | { fn: string; timeout?: number }
 
 /**
@@ -46,7 +49,12 @@ export class WaitError extends Error {
   }
 }
 
-export async function waitFor(page: Page, spec: WaitSpec): Promise<void> {
+export async function waitFor(page: Page, spec: WaitSpec): Promise<void | ReadyResult> {
+  if ('ready' in spec) {
+    // S5: dual-quiet page-ready. Returns the {ready,reason} result (all other
+    // wait forms return void). Advisory — never throws, never hangs past the cap.
+    return waitForReady(page, { timeout: spec.timeout })
+  }
   if ('ms' in spec) {
     // LAST RESORT — a bare fixed delay (see module doc).
     await page.waitForTimeout(spec.ms)
