@@ -18,7 +18,6 @@ import * as path from 'node:path'
 import type { Browser, BrowserContext, Page } from 'playwright'
 import type { RefMap } from '../perception/refmap.js'
 import { decodeStateBuffer, encryptJson, isStateEncryptionEnabled } from './state-crypto.js'
-import { classifyEngineError } from './errors.js'
 import {
   containedFilename,
   createSubresourceEgressGuard,
@@ -662,30 +661,6 @@ export async function connect(name: string): Promise<Connection> {
   // blocks the connect itself — a failure to arm is swallowed.
   await enableFetchEgressGuard(context, fetchEgressPolicy).catch(() => {})
   return { browser, context, page }
-}
-
-/**
- * R6: connect with a SINGLE crash-reconnect. A `page_crash`-class transport drop
- * (`Target closed` / `websocket closed` / `browser has been closed`) on the
- * connect attempt gets exactly ONE retry before failing — a browser that dropped
- * its CDP transport between commands is often reachable again immediately, and a
- * bounded single retry closes that flake without risking an unbounded loop.
- *
- * A NON-crash failure (e.g. a dead-pid `previous browser process is gone`, or a
- * policy/engine error) is rethrown immediately — this helper only papers over a
- * transport drop, never a genuine "reopen the session" condition. The hub can use
- * this in place of `connect` where a crash-resilient attach is wanted.
- */
-export async function connectWithCrashReconnect(name: string): Promise<Connection> {
-  try {
-    return await connect(name)
-  } catch (err) {
-    if (classifyEngineError(err) !== 'page_crash') throw err
-    // One-shot reconnect: a brief settle, then a single retry. If this also
-    // fails the error propagates (mapThrow surfaces page_crash → retryable).
-    await delay(150)
-    return await connect(name)
-  }
 }
 
 /**
