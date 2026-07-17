@@ -80,19 +80,6 @@ pnpm i && pnpm build
 npm link
 ```
 
-## Why TypeScript, not Rust
-
-I went back and forth on this and ended up running the argument out to a panel of independent judges to
-settle it. TypeScript won, and the reason is boring and durable: Playwright is native to Node.
-Auto-wait, the selector engine, network interception, the browser downloads are all maintained upstream
-by Playwright's own team. Rust has to hand-roll the CDP protocol and own that maintenance forever.
-
-The usual case for Rust is speed. But the token cost of driving a browser has nothing to do with the
-CLI's language; it comes from how compact the page view is, and that's the same in any language. The
-one place Rust was genuinely faster turned out to be a bug in ours: we were running a network-idle wait
-on read commands that didn't need it. Fixing that dropped a warm snapshot from 1.45s to 0.23s. The
-language was never the bottleneck.
-
 ## Status
 
 575 tests, an eval suite that passes, and a lethal-trifecta security check that passes, all on every
