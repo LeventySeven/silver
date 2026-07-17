@@ -377,6 +377,43 @@ async function applyVerb(
       return undefined
     case 'select': {
       const values = opts.selectValues ?? (value !== undefined ? [value] : [])
+      // FIX #4: enumerate the native <select> options in ONE keyless DOM read and
+      // fail FAST when a requested value matches none. Playwright's selectOption()
+      // otherwise WAITS the full timeout (default 30s) for a matching option to
+      // appear, then throws TimeoutError → mapped to `timeout`, whose "increase
+      // --timeout" advice is actively WRONG (a longer wait can never conjure a
+      // missing option). Every other type/target mismatch fails in <1s; select was
+      // the lone 30s outlier. `el` is untyped (tsconfig has no DOM lib; mirror the
+      // `get html` `el.outerHTML` / scroll `el.scrollBy` convention).
+      const options = (await locator.evaluate((el) =>
+        el.options
+          ? Array.from(el.options as ArrayLike<any>).map((o) => ({
+              value: o.value,
+              label: o.label,
+              text: (o.textContent || '').trim(),
+            }))
+          : null,
+      )) as { value: string; label: string; text: string }[] | null
+      // No `.options` → not a <select>: wrong element type. Do NOT selectOption
+      // (which would itself wait/throw); surface the non-destructive advisory.
+      if (options === null) throw new ActionError('wrong_element_type')
+      // Mirror Playwright's string match (an option's value OR label — `.label`
+      // already falls back to the option text) plus a trimmed text compare. EVERY
+      // requested value must hit SOME option; a multi-value select fails fast if
+      // ANY requested value is absent.
+      const present = (req: string): boolean => {
+        const trimmed = req.trim()
+        return options.some(
+          (o) =>
+            o.value === req ||
+            o.label === req ||
+            o.text === req ||
+            o.value === trimmed ||
+            o.label === trimmed ||
+            o.text === trimmed,
+        )
+      }
+      if (!values.every(present)) throw new ActionError('no_matching_option')
       await locator.selectOption(values, { timeout })
       return undefined
     }
@@ -419,7 +456,7 @@ async function fillVerb(locator: Locator, text: string, opts: ActOptions): Promi
   return readback
 }
 
-async function readInputValue(locator: Locator, timeout: number | undefined): Promise<string> {
+export async function readInputValue(locator: Locator, timeout: number | undefined): Promise<string> {
   try {
     return await locator.inputValue({ timeout })
   } catch {

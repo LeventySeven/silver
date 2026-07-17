@@ -318,6 +318,73 @@ describe('actuation (real Chromium, Playwright delegation + stale-ref guard)', (
       }
     },
   )
+
+  it(
+    'select fails FAST (not the 30s timeout) on a nonexistent option, still selects a real one (FIX #4)',
+    async () => {
+      const S = `${NAME}-select`
+      await openSession(S, { headed: false })
+      const { browser, page } = await connect(S)
+      const cdp: CDPSession = await page.context().newCDPSession(page)
+      try {
+        await page.setContent(
+          `<!doctype html><html><body>
+             <select aria-label="Fruit">
+               <option value="apple">Apple</option>
+               <option value="banana">Banana</option>
+             </select>
+           </body></html>`,
+          { waitUntil: 'load' },
+        )
+        const map1 = await takeSnapshot(page, 1, null)
+        // A native single <select> maps to role=combobox; find by name so the test
+        // does not hard-code the AX role.
+        let selRef = ''
+        for (const [ref, entry] of Object.entries(map1.entries)) {
+          if (entry.name === 'Fruit') selRef = ref
+        }
+        expect(selRef).not.toBe('')
+
+        // BAD option: before the fix Playwright's selectOption() WAITED the full
+        // 30s for "Cherry" to appear, then threw TimeoutError → the `timeout`
+        // advice ("increase --timeout") that can NEVER succeed. Now we enumerate
+        // the options in one keyless DOM read and fail fast with a non-timeout
+        // advisory that does not mention --timeout.
+        const t0 = Date.now()
+        const bad = await act(page, cdp, 'select', selRef, undefined, map1, {
+          selectValues: ['Cherry'],
+        })
+        const elapsed = Date.now() - t0
+        expect(bad.success).toBe(false)
+        expect(bad.error).toBe(ERRORS.no_matching_option.message)
+        expect(bad.error).not.toBe(ERRORS.timeout.message)
+        expect(bad.error).not.toContain('--timeout')
+        // Nowhere near the 30s Playwright default (generous 5s ceiling).
+        expect(elapsed).toBeLessThan(5000)
+
+        // GOOD option still selects (fast path preserved).
+        const good = await act(page, cdp, 'select', selRef, undefined, map1, {
+          selectValues: ['Apple'],
+        })
+        expect(good.success).toBe(true)
+        expect(await page.locator('select').inputValue()).toBe('apple')
+
+        // MULTI-value with one absent value fails fast — ALL requested values must
+        // match; the single present "Apple" does not rescue the missing "Cherry".
+        const t1 = Date.now()
+        const multi = await act(page, cdp, 'select', selRef, undefined, map1, {
+          selectValues: ['Apple', 'Cherry'],
+        })
+        expect(multi.success).toBe(false)
+        expect(multi.error).toBe(ERRORS.no_matching_option.message)
+        expect(Date.now() - t1).toBeLessThan(5000)
+      } finally {
+        await cdp.detach().catch(() => {})
+        await browser.close()
+        await closeSession(S).catch(() => {})
+      }
+    },
+  )
 })
 
 describe('mapActionError classification via coord verbs (S2)', () => {

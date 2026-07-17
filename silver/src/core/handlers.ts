@@ -97,6 +97,7 @@ import {
   locate,
   cleanupStamp,
   resolveWriteValue,
+  readInputValue,
   type ActVerb,
   type ActOptions,
   type FindKind,
@@ -1858,7 +1859,14 @@ async function handleGet(flags: ParsedFlags): Promise<Envelope<unknown>> {
         // injection scrub. isPassword is read from the live DOM `type`; role/name
         // come from the grounded ref (RefEntry) for the redactValue hint check.
         return withLocator(page, flags.session, ref, async (loc, entry) => {
-          const raw = await loc.inputValue()
+          // FIX #5: inputValue() THROWS on a contenteditable (it only works on
+          // <input>/<textarea>/<select>), which errored this verb even though the
+          // snapshot advertises the element's content as a value and `fill` already
+          // reads it back. REUSE readInputValue's fallback (innerText/textContent
+          // for a contenteditable) so `get value` is symmetric with `fill`. Real
+          // inputs still hit inputValue() first — behavior unchanged — and the
+          // fallback text runs through the SAME redact + present choke below.
+          const raw = await readInputValue(loc, undefined)
           const type = ((await loc.getAttribute('type')) ?? '').toLowerCase()
           const isPassword = type === 'password'
           const redacted = redactValue(entry.role, entry.name, raw, isPassword)

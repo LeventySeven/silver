@@ -149,6 +149,18 @@ export const ERRORS = {
     message:
       'Silver requires the Chromium engine (its perception/actuation use the CDP protocol); firefox/webkit are not supported. Re-run without --engine (or with --engine chromium).',
   },
+  // FIX #4: `select @ref <value>` named an option the native <select> does not
+  // have. DISTINCT from `timeout` (whose "increase --timeout" advice is actively
+  // WRONG here — a longer wait can NEVER make a nonexistent option appear, so the
+  // host wastes an even longer dead turn retrying). Playwright's selectOption()
+  // would otherwise WAIT the full timeout for a matching option to materialize;
+  // we enumerate the options in one keyless DOM read and fail FAST instead. Not
+  // retryable unchanged — the host must re-snapshot and choose a listed option.
+  no_matching_option: {
+    retryableByHost: false,
+    message:
+      'none of the requested options exist on that <select>; a longer wait cannot make a missing option appear — re-snapshot and choose one of the options the element actually lists',
+  },
   // S4: the verb does not apply to the target's element TYPE — e.g. `is checked`
   // on a non-checkbox/radio, `select` on a non-<select>, `fill` on a non-input.
   // DISTINCT from `page_crash` (whose `reload` advice is destructive and wrong

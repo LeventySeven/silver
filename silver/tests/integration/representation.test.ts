@@ -68,6 +68,17 @@ const CARD_TEXT_PAGE = `<!doctype html>
   <button aria-label="4111 1111 1111 1111 pay">Buy</button>
 </body></html>`
 
+// FIX #5: contenteditable elements. `get value` used to call inputValue(), which
+// THROWS on a contenteditable → the verb errored, even though the snapshot
+// advertises the element's content as a value and `fill` already reads it back.
+// One box carries plain text (readable), one carries a card (must stay redacted).
+const CONTENTEDITABLE_PAGE = `<!doctype html>
+<html><head><title>Editor</title></head><body>
+  <div contenteditable="true" role="textbox" aria-label="editorbox">hello world</div>
+  <div contenteditable="true" role="textbox" aria-label="cardbox">4111 1111 1111 1111</div>
+  <input type="text" aria-label="plaininput" value="keepme">
+</body></html>`
+
 let server: Server
 let base: string
 
@@ -97,7 +108,9 @@ describe('representation phase-1: get html / get box / sparse_tree', () => {
             ? REDACT_PAGE
             : url.startsWith('/cardtext')
               ? CARD_TEXT_PAGE
-              : CANVAS_PAGE
+              : url.startsWith('/editable')
+                ? CONTENTEDITABLE_PAGE
+                : CANVAS_PAGE
       res.writeHead(200, { 'content-type': 'text/html' })
       res.end(body)
     })
@@ -307,5 +320,46 @@ describe('representation phase-1: get html / get box / sparse_tree', () => {
     // a surface redactValue does not touch. maskCards at presentPageText masks it.
     expect(tree).toContain('[redacted]')
     expect(tree).not.toContain('4111')
+  })
+
+  it('get value @eN on a contenteditable returns its text, not an error (FIX #5)', async () => {
+    await run(['open', `${base}/editable`, '--session', NAME])
+    await run(['snapshot', '-i', '--session', NAME])
+    const map = await loadRefMap(NAME)
+    const editorRef = refByName(map!, 'editorbox')
+
+    // inputValue() THROWS on a contenteditable; before the fix this verb errored.
+    // Now it falls back to the element text (symmetric with `fill`) and succeeds.
+    const res = await run(['get', 'value', `@${editorRef}`, '--session', NAME])
+    expect(res.env.success).toBe(true)
+    const value = (res.env.data as { value: string }).value
+    expect(value).toContain('hello world')
+  })
+
+  it('get value @eN on a contenteditable still redacts a card (FIX #5, no-leak)', async () => {
+    await run(['open', `${base}/editable`, '--session', NAME])
+    await run(['snapshot', '-i', '--session', NAME])
+    const map = await loadRefMap(NAME)
+    const cardRef = refByName(map!, 'cardbox')
+
+    // The fallback text runs through the SAME redactValue + presentPageText choke
+    // as a real input, so a card in a contenteditable is masked, never echoed.
+    const res = await run(['get', 'value', `@${cardRef}`, '--session', NAME])
+    expect(res.env.success).toBe(true)
+    const value = (res.env.data as { value: string }).value
+    expect(value).toContain('[redacted]')
+    expect(value).not.toContain('4111')
+  })
+
+  it('get value @eN on a real input is unchanged (FIX #5 does not regress inputs)', async () => {
+    await run(['open', `${base}/editable`, '--session', NAME])
+    await run(['snapshot', '-i', '--session', NAME])
+    const map = await loadRefMap(NAME)
+    const inputRef = refByName(map!, 'plaininput')
+
+    const res = await run(['get', 'value', `@${inputRef}`, '--session', NAME])
+    expect(res.env.success).toBe(true)
+    const value = (res.env.data as { value: string }).value
+    expect(value).toContain('keepme')
   })
 })
