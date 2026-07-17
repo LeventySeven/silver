@@ -22,7 +22,7 @@ export const ERRORS = {
   element_obscured: {
     retryableByHost: true,
     message:
-      'another element covers the target; re-snapshot, scroll it into view, or pass --force',
+      'another element covers the target — usually a consent/cookie/GDPR banner or a modal; dismiss THAT first (find + click its accept/close, or press Escape), then re-snapshot and retry. Else scroll it into view or pass --force',
   },
   timeout: {
     retryableByHost: true,

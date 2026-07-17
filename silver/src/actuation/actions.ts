@@ -374,7 +374,46 @@ async function dispatch(
     const g = groundRef(refmap, opts.targetRef)
     if (!g.ok) throw new ActionError(g.code)
     const target = await toLocator(page, cdp, g.entry, g.ref)
-    await locator.dragTo(target, withForce(opts))
+    // Aside-alignment: Playwright's `dragTo` fires only a source-hover + target-hover
+    // (two endpoint moves), so drag-and-drop libraries (SortableJS, React-DnD, range
+    // sliders, drag-based captchas) that require INTERMEDIATE `mousemove` events
+    // between down and up silently no-op — exactly the controls that most need `drag`.
+    // Drive a stepped page.mouse path (the same interpolation `coordDrag` uses),
+    // using the grounded locators for actionability. Scroll BOTH into view (target
+    // then source, so the source anchors the final viewport), read both boxes, and
+    // if EITHER box is unavailable OR its center is OUTSIDE the viewport (a drag
+    // across a scroll boundary the flat interpolation can't reach), FALL BACK to
+    // Playwright's `dragTo` (which auto-scrolls during the drag) — never a silent
+    // no-op on an off-screen target.
+    await target.scrollIntoViewIfNeeded({ timeout: opts.timeout }).catch(() => {})
+    await locator.scrollIntoViewIfNeeded({ timeout: opts.timeout }).catch(() => {})
+    const sb = await locator.boundingBox({ timeout: opts.timeout }).catch(() => null)
+    const tb = await target.boundingBox({ timeout: opts.timeout }).catch(() => null)
+    const vp = page.viewportSize()
+    const inViewport = (b: { x: number; y: number; width: number; height: number }): boolean => {
+      if (vp === null) return true
+      const cx = b.x + b.width / 2
+      const cy = b.y + b.height / 2
+      return cx >= 0 && cx <= vp.width && cy >= 0 && cy <= vp.height
+    }
+    if (!sb || !tb || !inViewport(sb) || !inViewport(tb)) {
+      await locator.dragTo(target, withForce(opts))
+      return { verb, ref }
+    }
+    const x1 = sb.x + sb.width / 2
+    const y1 = sb.y + sb.height / 2
+    const x2 = tb.x + tb.width / 2
+    const y2 = tb.y + tb.height / 2
+    const steps = Math.round(Math.min(20, Math.max(5, Math.hypot(x2 - x1, y2 - y1) / 40)))
+    await page.mouse.move(x1, y1)
+    await page.mouse.down()
+    try {
+      await page.mouse.move(x2, y2, { steps })
+    } finally {
+      // Always release: a throw mid-move must not leave the virtual button pressed
+      // (it would corrupt the next command's pointer state).
+      await page.mouse.up().catch(() => {})
+    }
     return { verb, ref }
   }
   const readback = await applyVerb(locator, verb, value, opts)

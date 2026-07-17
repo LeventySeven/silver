@@ -106,7 +106,7 @@ import {
 } from '../actuation/actions.js'
 import * as actionsMod from '../actuation/actions.js'
 import * as confirmMod from '../security/confirm.js'
-import { toLocator, ResolveError } from '../actuation/resolve.js'
+import { toLocator, ResolveError, stampByBackendNode } from '../actuation/resolve.js'
 import {
   settleAndFingerprint,
   fingerprintOnly,
@@ -532,7 +532,12 @@ function currentSecrets(): SecretRegistry {
 function openOpts(flags: ParsedFlags): OpenOptions {
   // E2: thread `--profile` (an existing user-data-dir) into the launch so an
   // owned session can reuse the user's real logged-in Chrome profile.
-  return { headed: flags.headed, engine: normalizeEngine(flags.engine), profile: flags.profile }
+  return {
+    headed: flags.headed,
+    engine: normalizeEngine(flags.engine),
+    profile: flags.profile,
+    proxy: flags.proxy,
+  }
 }
 
 /** Settle policy for MUTATING verbs: `--wait networkidle` opts into the full
@@ -1570,6 +1575,47 @@ async function sessionCookieHeader(flags: ParsedFlags, url: string): Promise<str
   }
 }
 
+/**
+ * The set-of-marks overlay drawer (Aside-alignment, faithful to Aside's `LHt`).
+ * In-page string JS (tsconfig has no DOM lib). Reads every `[data-silver-ref]`
+ * element (stamped just before), draws a red box + the eN number label at page
+ * coords, and returns the count drawn. `position:absolute` + page coords (rect +
+ * scroll) so the boxes align with both a viewport and a `--full` capture; the
+ * container is `pointer-events:none` and `z-index` max so it never intercepts.
+ */
+const ANNOTATE_OVERLAY_JS = `(function(){
+  var OID='__silver_annotations__';
+  var old=document.getElementById(OID); if(old)old.remove();
+  var els=document.querySelectorAll('[data-silver-ref]');
+  var boxes=[];
+  for(var i=0;i<els.length;i++){
+    var el=els[i];
+    var m=(el.getAttribute('data-silver-ref')||'').match(/e(\\d+)$/); if(!m)continue;
+    var r=el.getBoundingClientRect();
+    if(r.width<=0||r.height<=0)continue;
+    boxes.push({n:parseInt(m[1],10),x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)});
+  }
+  if(boxes.length===0)return 0;
+  boxes.sort(function(a,b){return a.n-b.n});
+  var sx=window.scrollX||0, sy=window.scrollY||0;
+  var c=document.createElement('div'); c.id=OID;
+  c.style.cssText='position:absolute;top:0;left:0;width:0;height:0;pointer-events:none;z-index:2147483647;';
+  for(var j=0;j<boxes.length;j++){
+    var b=boxes[j], bx=b.x+sx, by=b.y+sy;
+    var box=document.createElement('div');
+    box.style.cssText='position:absolute;left:'+bx+'px;top:'+by+'px;width:'+b.w+'px;height:'+b.h+'px;border:2px solid rgba(255,0,0,0.8);box-sizing:border-box;pointer-events:none;';
+    var lab=document.createElement('div');
+    lab.textContent=String(b.n);
+    var lt=by<14?'2px':'-14px';
+    lab.style.cssText='position:absolute;top:'+lt+';left:-2px;background:rgba(255,0,0,0.9);color:#fff;font:bold 11px/14px monospace;padding:0 4px;border-radius:2px;white-space:nowrap;';
+    box.appendChild(lab); c.appendChild(box);
+  }
+  document.documentElement.appendChild(c);
+  return boxes.length;
+})()`
+
+const ANNOTATE_REMOVE_JS = `(function(){var o=document.getElementById('__silver_annotations__');if(o)o.remove();return 1;})()`
+
 async function handleScreenshot(flags: ParsedFlags): Promise<Envelope<unknown>> {
   // Item #5: an @ref first arg captures ONLY that grounded element (rung 5 of the
   // perception ladder — a chart / captcha tile / one card), else the whole page.
@@ -1600,6 +1646,37 @@ async function handleScreenshot(flags: ParsedFlags): Promise<Envelope<unknown>> 
     if (resolvedOut) baseOpts.path = resolvedOut
     if (type) baseOpts.type = type
     if (quality !== undefined) baseOpts.quality = quality
+
+    // Aside-alignment: set-of-marks overlay. Draw a numbered red box over EVERY
+    // current @eN ref (the SAME ids as the text tree), capture, tear down — the
+    // vision-fallback bridge that lets the host correlate a pixel region back to a
+    // ref it can ACT on (stays @ref-grounded, not coordinate-based). Keyless: Silver
+    // only draws boxes; the HOST reads the pixels. Requires a prior snapshot (the refmap).
+    if (flags.annotated) {
+      const refmap = await loadRefMap(flags.session)
+      if (!refmap || Object.keys(refmap.entries).length === 0) {
+        return badRequest('run `snapshot` first — --annotated draws boxes over the current @eN refs')
+      }
+      const cdp = await page.context().newCDPSession(page)
+      try {
+        // Stamp data-silver-ref="eN" onto each ref's live element (reusing the same
+        // backendNodeId→attr bridge the actuation path uses). Main-frame refs only —
+        // a page.evaluate cannot see child-frame DOM (faithful to Aside's overlay).
+        let stamped = 0
+        for (const [ref, entry] of Object.entries(refmap.entries)) {
+          const ok = await stampByBackendNode(cdp, entry.backendNodeId, ref).catch(() => false)
+          if (ok) stamped++
+        }
+        const drawn = (await page.evaluate(ANNOTATE_OVERLAY_JS).catch(() => 0)) as number
+        const buf = await page.screenshot({ ...baseOpts, fullPage: flags.full })
+        if (resolvedOut) return ok({ saved: true, annotated: drawn })
+        return ok({ encoding: 'base64', image: buf.toString('base64'), annotated: drawn })
+      } finally {
+        await page.evaluate(ANNOTATE_REMOVE_JS).catch(() => {})
+        await cleanupStamp(page).catch(() => {}) // strip the data-silver-ref stamps
+        await cdp.detach().catch(() => {})
+      }
+    }
 
     // Element-scoped: ground the ref → screenshot its Locator (no fullPage).
     if (refArg) {
@@ -2216,8 +2293,40 @@ async function handleGet(flags: ParsedFlags): Promise<Envelope<unknown>> {
           return ok({ x: box.x, y: box.y, width: box.width, height: box.height })
         })
       }
+      case 'styles': {
+        // Aside/Vercel-alignment: the computed CSS of one grounded ref — the third
+        // leg beside `get box`/`get html` for an a11y-blind widget whose role+name
+        // doesn't reveal its STATE (is it really hidden? what color/z-index/cursor?).
+        // Read-only, element-scoped. `get styles @eN [prop...]`: named props, else a
+        // small useful default set. Values route through presentPageText (low
+        // injection surface, but safe like every page-derived read).
+        const ref = rest[0]
+        if (!ref) return badRequest('usage: silver get styles @eN [prop...]')
+        const wanted = rest.slice(1).filter((p) => p.length > 0)
+        const props =
+          wanted.length > 0
+            ? wanted
+            : ['display', 'visibility', 'opacity', 'position', 'z-index', 'color', 'background-color', 'font-size', 'cursor', 'overflow', 'pointer-events']
+        return withLocator(page, flags.session, ref, async (loc) => {
+          const styles = (await loc.evaluate((el, names: string[]) => {
+            const cs = (globalThis as unknown as { getComputedStyle(e: unknown): Record<string, string> }).getComputedStyle(el)
+            const out: Record<string, string> = {}
+            for (const n of names) {
+              try {
+                out[n] = String((cs as unknown as { getPropertyValue(p: string): string }).getPropertyValue(n) ?? '')
+              } catch {
+                /* unknown property — skip */
+              }
+            }
+            return out
+          }, props)) as Record<string, string>
+          const safe: Record<string, string> = {}
+          for (const [k, v] of Object.entries(styles)) safe[k] = presentPageText(v, flags)
+          return ok(safe)
+        })
+      }
       default:
-        return badRequest('usage: silver get text|value|attr|html|box|title|url|count [ref]')
+        return badRequest('usage: silver get text|value|attr|html|box|styles|title|url|count [ref]')
     }
   })
 }

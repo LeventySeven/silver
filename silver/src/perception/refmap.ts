@@ -16,6 +16,16 @@ export type RefEntry = {
   name: string
   nth: number
   frameId: string
+  /**
+   * The interactive-filter MODE this ref was minted under. Load-bearing for the
+   * slow-path re-match: a cursor-interactive / scrollable nameless `generic` carries
+   * a DIFFERENT accessible name in interactive vs. full mode (the text fallback is
+   * fed only in interactive mode — walk.ts), which shifts its `(role,name,nth)`
+   * bucket. The resolver must re-snapshot in the SAME mode this ref was minted in,
+   * or a nameless generic can misground. Optional for back-compat (absent → the
+   * historical hardcoded interactive re-match).
+   */
+  interactive?: boolean
 }
 
 /** key = bare "e12" (no `@`, no `ref=`). */

@@ -57,7 +57,7 @@ function refSelector(ref: string): string {
  * Stamp `data-silver-ref="<ref>"` onto the node with the given backendNodeId.
  * Returns false if the node could not be resolved to a RemoteObject.
  */
-async function stampByBackendNode(
+export async function stampByBackendNode(
   cdp: CDPSession,
   backendNodeId: number,
   ref: string,
@@ -77,7 +77,12 @@ async function stampByBackendNode(
 
 /** Slow-path re-match: find the backendNodeId of the (role,name,nth) node. */
 async function rematchByShape(page: Page, entry: RefEntry): Promise<number | null> {
-  const nodes = await snapshotNodes(page, { interactive: true })
+  // Re-snapshot in the SAME interactive mode the ref was MINTED in (high-severity
+  // fix): a nameless cursor/scrollable `generic` carries its text name only in
+  // interactive mode, so re-matching in a different mode shifts its (role,name,nth)
+  // bucket and can misground onto a sibling. `?? true` preserves the historical
+  // behavior for any pre-fix refmap that lacks the field.
+  const nodes = await snapshotNodes(page, { interactive: entry.interactive ?? true })
   const bounded = nodes.length > REMATCH_LIMIT ? nodes.slice(0, REMATCH_LIMIT) : nodes
   // Recompute `nth` the SAME way serialize.ts mints it: only over ref-eligible
   // nodes, in document order, keyed by `${role} ${name}` (globally, across all

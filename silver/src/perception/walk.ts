@@ -44,6 +44,10 @@ export type SnapNode = {
     disabled?: boolean
     required?: boolean
     focused?: boolean
+    /** Aside-alignment: the element is its own scroll container (overflow scroll/auto
+     * with real overflow). Makes a NAMELESS scroll box (chat pane, modal body,
+     * virtualized list) ref-eligible so the host can `scroll @ref --by` it. */
+    scrollable?: boolean
     placeholder?: string
   }
   frameId: string
@@ -209,6 +213,9 @@ type ScanRecord = {
   hiddenInputType: string | null
   hiddenInputChecked: string | null
   prune: boolean
+  /** Aside-alignment: this element is a real scroll container (overflow scroll/auto
+   * with content overflow), so it should get a ref + a `[scrollable]` enrichment. */
+  scroll: boolean
   /** C1: present iff this element is a hint-bearing form control (select / typed input). */
   formHint: FormHint | null
   /** P1 (ARIA-paradox): text of an element whose ARIA `role` is interactive, used
@@ -255,6 +262,11 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
     await cdp.send('DOM.enable').catch(() => {})
     await cdp.send('Accessibility.enable').catch(() => {})
     await cdp.send('Page.enable').catch(() => {})
+    // Aside-alignment: force focus emulation so `:focus` / document.activeElement
+    // (and thus the AX `focused` property the `[focused]` enrichment renders) stays
+    // valid even when this headless tab is not the OS-foreground window. One-time,
+    // best-effort — Aside sends the same at CDP bring-up "so [focused] is meaningful".
+    await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {})
 
     // 1. Cursor + hidden scan (main frame only; tags matched elements with
     //    data-__uab-idx). Child frames rely on the AX tree for ref-eligibility
@@ -283,6 +295,7 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
     // Build cursor + prune + form-hint maps keyed by backendNodeId.
     const cursorByBackend = new Map<number, CursorInfo>()
     const pruneSet = new Set<number>()
+    const scrollableSet = new Set<number>()
     const hintByBackend = new Map<number, FormHint>()
     // P1 (ARIA-paradox): backendNodeId -> synthesizable text for an
     // interactive-ARIA-role node whose accessible name is empty.
@@ -301,6 +314,7 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
           })
         }
         if (rec.prune) pruneSet.add(backend)
+        if (rec.scroll) scrollableSet.add(backend)
         if (rec.formHint) hintByBackend.set(backend, rec.formHint)
         if (rec.roleText) roleTextByBackend.set(backend, rec.roleText)
       })
@@ -403,8 +417,11 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
         // Chrome may mark such a nameless node `ignored`. When we captured its
         // text, keep it from being pruned so that text can name it below.
         const hasRoleText = isMain && backend >= 0 && roleTextByBackend.has(backend)
+        // Aside-alignment: a real scroll container (often a nameless generic div)
+        // must survive pruning + get a ref so the host can `scroll @ref --by` it.
+        const isScrollable = isMain && backend >= 0 && scrollableSet.has(backend)
         const keepException =
-          cursorInteractive || role === 'checkbox' || role === 'radio' || hasRoleText
+          cursorInteractive || role === 'checkbox' || role === 'radio' || hasRoleText || isScrollable
         const ignored = node.ignored === true
         const hiddenPruned = isMain && backend >= 0 && pruneSet.has(backend)
         const prune = (ignored || hiddenPruned) && !keepException
@@ -447,6 +464,7 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
         if (props.has('disabled')) flags.disabled = truthy(props.get('disabled'))
         if (props.has('required')) flags.required = truthy(props.get('required'))
         if (props.has('focused')) flags.focused = truthy(props.get('focused'))
+        if (isScrollable) flags.scrollable = true
         if (attrs['placeholder']) flags.placeholder = attrs['placeholder']
 
         const nodeName = (dom?.nodeName ?? '').toLowerCase()
@@ -455,7 +473,8 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
 
         const isInteractive = INTERACTIVE_ROLES.has(role)
         const isContent = CONTENT_ROLES.has(role)
-        const refEligible = isInteractive || (isContent && name !== '') || cursorInteractive
+        const refEligible =
+          isInteractive || (isContent && name !== '') || cursorInteractive || isScrollable
 
         const snap: SnapNode = {
           backendNodeId: backend,
@@ -825,6 +844,21 @@ const SCAN_JS = `(function () {
     var isHidden = style.visibility === 'hidden' || style.opacity === '0';
     var prune = isHidden && !isRadioCheck;
 
+    // Aside-alignment: a real scroll container = overflow(x|y) auto/scroll/overlay AND
+    // actual content overflow. Exclude the root scrollers (html/body — that's page
+    // scroll, not an inner box) and hidden ones. Cheap: element props, no extra reflow.
+    var scroll = false;
+    var scrollHiddenSubtree = el.closest && el.closest('[hidden], [aria-hidden="true"]');
+    if (!isHidden && !scrollHiddenSubtree && tag !== 'html' && tag !== 'body') {
+      var ox = style.overflowX, oy = style.overflowY;
+      var canX = ox === 'auto' || ox === 'scroll' || ox === 'overlay';
+      var canY = oy === 'auto' || oy === 'scroll' || oy === 'overlay';
+      if ((canY && el.scrollHeight > el.clientHeight + 1) || (canX && el.scrollWidth > el.clientWidth + 1)) {
+        var sr = el.getBoundingClientRect();
+        if (sr.width > 0 && sr.height > 0) scroll = true;
+      }
+    }
+
     var cur = false, kind = '', hints = [], text = '', hiddenInputType = null, hiddenInputChecked = null;
     (function () {
       if (interactiveTags[tag]) return;
@@ -890,9 +924,9 @@ const SCAN_JS = `(function () {
       }
     }
 
-    if (cur || prune || fh || roleText) {
+    if (cur || prune || fh || roleText || scroll) {
       el.setAttribute('data-__uab-idx', String(out.length));
-      out.push({ cur: cur, kind: kind, hints: hints, text: text, hiddenInputType: hiddenInputType, hiddenInputChecked: hiddenInputChecked, prune: prune, formHint: fh, roleText: roleText });
+      out.push({ cur: cur, kind: kind, hints: hints, text: text, hiddenInputType: hiddenInputType, hiddenInputChecked: hiddenInputChecked, prune: prune, scroll: scroll, formHint: fh, roleText: roleText });
     }
   }
   return { bail: false, records: out, canvasCoverage: canvasCoverage, canvasCount: canvasCount };

@@ -36,6 +36,10 @@ export type ParsedFlags = {
   /** E2: launch an owned session against an EXISTING user-data-dir (the user's
    * real logged-in Chrome profile) instead of a throwaway per-session dir. */
   profile?: string
+  /** Vercel-alignment: `--proxy <scheme://host:port>` routes the session's browser
+   * through a proxy. Applied at LAUNCH (Chromium `--proxy-server`), so it only takes
+   * effect on a FRESH session (like `--profile`/`--engine`); unauthenticated proxies. */
+  proxy?: string
   maxOutput?: number
   /** ON by default; `--no-content-boundaries` disables. */
   contentBoundaries: boolean
@@ -98,6 +102,10 @@ export type ParsedFlags = {
    * output. OFF by default (token-lean — just the link text).
    */
   links: boolean
+  /** `screenshot --annotated` (Aside-alignment): draw a set-of-marks overlay of
+   * numbered red boxes over EVERY current `@eN` ref, then capture — the vision-fallback
+   * bridge that lets the host correlate a pixel region back to a ref it can act on. */
+  annotated: boolean
   fn?: string
   name?: string
   index?: number
@@ -257,6 +265,9 @@ const VALUE_FLAGS: Record<string, keyof ParsedFlags> = {
   engine: 'engine',
   // E2: existing user-data-dir (real Chrome profile) to launch against.
   profile: 'profile',
+  // Vercel-alignment: route the session's browser through an (unauthenticated)
+  // proxy — applied at LAUNCH, so it takes effect on a FRESH session only.
+  proxy: 'proxy',
   // network / storage verb sub-flags.
   filter: 'filter',
   type: 'type',
@@ -309,6 +320,7 @@ const BOOL_FLAGS: Record<string, keyof ParsedFlags> = {
   // S5: `wait --ready` dual-quiet page-ready. S6: `read --links` markdown links.
   ready: 'ready',
   links: 'links',
+  annotated: 'annotated',
   full: 'full',
   all: 'all',
   stdin: 'stdin',
@@ -385,6 +397,7 @@ function defaults(): ParsedFlags {
     urls: false,
     ready: false,
     links: false,
+    annotated: false,
     full: false,
     all: false,
     stdin: false,

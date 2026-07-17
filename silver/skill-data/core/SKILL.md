@@ -117,6 +117,7 @@ or stop; don't retry.
 | `screenshot @ref [path]` | **Element-scoped** capture — just that grounded element's pixels (a chart, a captcha tile, one card). Rung 5 of the perception ladder; YOU read the pixels (keyless). |
 | `screenshot --full [path]` | Full-page capture (default is the 1280×900 viewport). |
 | `screenshot --type jpeg [--quality <0-100>]` | Byte-lean JPEG instead of PNG — shrinks the base64 you hand a vision model (PNG ignores `--quality`). |
+| `screenshot --annotated` | **Set-of-marks**: draws a numbered red box over every current `@eN` ref (same ids as the tree), so you look at one grounded image and act by **`click @eN`** — no coordinate guessing. Run `snapshot` first. The vision-fallback bridge that stays ref-based. |
 | `console [--clear] [--level <log\|info\|warn\|error\|debug>]` | Captured console messages (page-derived, neutralized). `--level` keeps only that level (token-lean selection at the source). |
 | `errors [--clear]` | Captured page errors (uncaught exceptions). |
 
@@ -131,6 +132,7 @@ or stop; don't retry.
 | `get attr @ref <name>` | One attribute — redacted + neutralized + capped. |
 | `get html @ref` | The grounded element's **outerHTML** — neutralized + capped. The code escape hatch for a *nameless/ambiguous* ref (custom widget, icon button) whose role+name isn't enough. Element-scoped, **not** a whole-page dump. |
 | `get box @ref` | The grounded element's bounding box `{x, y, width, height}`, computed **on demand** (never on the snapshot). Pair with `click --at`: center = `x+width/2, y+height/2`. For canvas/coordinate targets. |
+| `get styles @ref [prop…]` | The grounded element's **computed CSS** (named props, else a useful default set: display/visibility/opacity/position/z-index/color/cursor/…). The third leg beside `get html`/`get box` — reveals a widget's real *state* (is it truly hidden? what z-index/cursor?) the a11y tree can't express. |
 | `is visible @ref` / `is enabled @ref` / `is checked @ref` | Boolean state of a grounded ref. |
 | `wait @ref` | Wait until a ref is visible. |
 | `wait <ms>` | Sleep N milliseconds (`wait 500`). |
@@ -226,6 +228,7 @@ generation, tabs) lives in `~/.silver/[<ns>/]sessions/<name>/`.
 | Command | What it does |
 |---|---|
 | `--session <name>` | Target/create a named browser. **One detached browser per name.** Default: `default`. |
+| `--proxy <scheme://host:port>` | Route this session's browser through a proxy (unauthenticated). Applied at **launch** — pass it on the FIRST `open` of a session (like `--profile`/`--engine`); the egress guard still governs which hosts navigation may reach. |
 | `--namespace <ns>` | Isolate an entire agent-GROUP under `~/.silver/<ns>/…`. Two groups both using `--session default` never collide. |
 | `session id [--scope worktree] [--prefix <p>]` | A deterministic session name derived from the cwd (stable per project). |
 | `session list` | This namespace's sessions: name, `alive`, pid, tab count, age. |
@@ -334,7 +337,8 @@ independent reads.** Touching one shared account is not "independent."
 | Thought | What to do instead |
 |---|---|
 | "`success:true` — I'm done." | It means the command *ran*, not that the goal is met. Verify with `snapshot`/`get`/`is`. |
-| "I'll just retry the click on this ref." | The ref may be stale. Re-`snapshot` first — retrying blind burns a whole turn. |
+| "It looks done — I'll report success." | **Your narration is not evidence.** Gate "done" on a grounded `expect` (or `get`) of the *actual* result — read the tool's real output, not what you think happened. If the app exposes a `data-*` contract attribute (`get attr @ref data-…`), assert on THAT. Verification is the gate; self-judging cheats. |
+| "I'll just retry the click on this ref." | The ref may be stale, or a consent/cookie banner covers it (`element_obscured`). Dismiss the overlay + re-`snapshot` first — retrying blind burns a whole turn. |
 | "I'll widen `--allowed-domains` to get past this block." | That's an egress bypass. `navigation_blocked` is not retryable — confirm with the user. |
 
 ---
@@ -354,15 +358,28 @@ a11y-blind elements (canvas/WebGL, nameless icon buttons, custom widgets) — ne
    already-grounded ref (never a whole-page DOM dump — that representation is heavier *and* worse).
 4. **`wait …` then re-`snapshot`** — when the page is still settling (`wait --load networkidle`,
    `wait --text …`, `wait @ref`).
-5. **`screenshot` → `get box @eN` → `click --at <x> <y>`** — for a **canvas/WebGL or
-   coordinate-only** target with no useful ref. silver flags these pages with a **`sparse_tree`**
-   advisory (canvas-dominant, few refs — the a11y tree is blind there). Take a `screenshot` to see
-   it (YOU read the pixels — silver never runs a vision model), get a ref's `get box` for
-   coordinates, then act with `click --at`. Center of a box = `x+width/2, y+height/2`. **Last
-   resort — never screenshot every step.**
+5. **`screenshot --annotated`** — when you need to SEE the page but stay ref-based: draws a numbered
+   red box over every current `@eN` ref (the same ids as the tree), so you look at ONE grounded image,
+   pick the target, and act by **`click @eN`** — no coordinate guessing. The set-of-marks bridge; run
+   `snapshot` first (it draws over the current refs). YOU read the pixels — silver never runs a model.
+6. **`screenshot` / `screenshot @eN` → `get box @eN` → `click --at <x> <y>`** — for a **canvas/WebGL
+   or coordinate-only** target with **no** useful ref. silver flags these pages with a **`sparse_tree`**
+   advisory (canvas-dominant, few refs — the a11y tree is blind there). Screenshot (element-scoped
+   `@eN` or `--type jpeg` to stay byte-lean), `get box` a ref for coordinates, then `click --at`.
+   Center of a box = `x+width/2, y+height/2`. **Last resort — never screenshot every step.**
 
 Custom widgets: `select` works on a **native** `<select>` only. For a `div[role=listbox]` or
 custom dropdown, `click` to open → re-`snapshot` → `click` the option.
+
+**Recovery ladder — when an action fails, don't just retry.** In order:
+1. **A blocking overlay is the #1 cause of `element_obscured` and no-op clicks.** A consent/cookie/GDPR
+   banner or a modal is sitting over your target — **dismiss THAT first** (`find text "Accept"`/`find
+   role button --name "Close"` then `click … --enable-actions`, or `press @ref Escape`), then re-`snapshot`.
+2. **Re-`snapshot` before retrying** — the ref may be stale; a blind retry burns a turn.
+3. **After 2–3 fails, switch strategy** — a different ref, `find` by text, or the vision rung above;
+   don't repeat the same failing action.
+4. **`wait --ready`** if the page is still settling; **dismiss any auto-accepted `dialog`** you didn't expect.
+5. **Verify you *accomplished* the goal, not just that a command ran** — check with `snapshot`/`get`/`expect`.
 
 ---
 

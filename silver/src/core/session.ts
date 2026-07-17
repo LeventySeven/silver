@@ -102,6 +102,9 @@ export type OpenOptions = {
    * profile for unattended runs; use the live profile only for interactive auth.
    */
   profile?: string
+  /** Vercel-alignment: route the browser through a proxy (Chromium `--proxy-server`),
+   * applied at launch. Unauthenticated proxies only. */
+  proxy?: string
 }
 
 /**
@@ -603,6 +606,11 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
     // own is accepted and documented (see egress.ts).
     // stealth: never advertise automation (spec §7) — note: NO --enable-automation
     ...(opts.headed ? [] : ['--headless=new']),
+    // Vercel-alignment: route through a proxy (unauthenticated). Applied at launch,
+    // so it only affects a FRESH session. The value is operator-supplied argv, not
+    // page-derived, so it is safe to pass verbatim; the egress guard still governs
+    // which hosts navigation may reach (the proxy is transport, not a policy bypass).
+    ...(opts.proxy ? [`--proxy-server=${opts.proxy}`] : []),
     'about:blank',
   ]
 
