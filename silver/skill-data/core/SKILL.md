@@ -112,7 +112,7 @@ or stop; don't retry.
 | `snapshot -d <n>` | Cap tree depth to `n`. |
 | `snapshot -s <css>` | Scope the snapshot to a CSS subtree. |
 | `snapshot -u` / `--urls` | Emit inline `url=<href>` on link nodes (OFF by default — token-lean; pass it only when you need raw hrefs). |
-| `read [url]` | Plain-text page body. With a URL, fetches it (redirect-guarded, every hop re-checked). |
+| `read [url]` | No URL: plain-text body (innerText) of the live page. With a URL: fetches it (redirect-guarded, every hop re-checked) and returns landmark-skipped **Markdown** (`#` headings, `-` lists); add `--links` for inline `[text](url)` (relative hrefs resolved). |
 | `screenshot [path]` | PNG: base64 in `data.image`, or `{saved:true}` if a (contained) path is given. |
 | `screenshot --full [path]` | Full-page capture (default is the 1280×900 viewport). |
 | `console [--clear]` | Captured console messages (page-derived, neutralized). |
@@ -242,6 +242,8 @@ each worker does `tab new` and drives its own tab; cheaper on RAM, tabs share co
 | `task log <id> <event-json>` | Append a custom event. |
 | `task checkpoint <id> [--note "<t>"]` | Snapshot progress + a best-effort screenshot. |
 | `task status <id>` · `task resume <id>` · `task list` | Progress / pick up after a crash / all tasks. |
+| `task compile <id>` | Compile the run into a re-runnable `run_N/compiled.sh` (+ `replay_cache.json`) with detected parameters (override via env var). |
+| `task replay <id> [<current-dom-hash>]` | Replay the compiled script; a per-step DOM-hash gate re-resolves against the live page. |
 
 ### Subagents (scoped child units of work, keyless) — full: `reference/agents-memory.md`
 

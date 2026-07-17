@@ -47,7 +47,10 @@ and can compile it into a re-runnable script. If the agent dies halfway, another
 
 **Real work needs real logins.** Point Silver at your actual Chrome profile with `--profile`, generate
 MFA codes with the built-in TOTP helper, or fill a `<secret>NAME</secret>` token that resolves the
-credential server-side so it never lands in the agent's context.
+credential server-side so it never lands in the agent's context. For targets gated behind a custom
+header or an HTTP Basic Auth wall, `set headers` (Bearer, `X-Api-Key`, `x-vercel-protection-bypass`)
+and `set credentials` both take the same `<secret>` tokens, so nothing sensitive touches the agent
+or the disk.
 
 ## Install
 
@@ -92,7 +95,7 @@ language was never the bottleneck.
 
 ## Status
 
-483 tests, an eval suite that passes, and a lethal-trifecta security check that passes, all on every
+575 tests, an eval suite that passes, and a lethal-trifecta security check that passes, all on every
 commit. Keyless. No MCP.
 
 ## License
