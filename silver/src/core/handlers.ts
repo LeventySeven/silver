@@ -725,7 +725,15 @@ export async function handle(flags: ParsedFlags): Promise<Envelope<unknown>> {
       return handleSet(flags)
     case 'scrollintoview':
     case 'scrollinto':
-      return handleScrollIntoView(flags)
+      // FIX #3: the explicit INTO-VIEW aliases. Route them through the SAME
+      // grounded `handleAct` pipeline as `scroll` (confirm-gate, taint guard,
+      // refmap grounding, fingerprint capture, generation bump, repetition
+      // detection — and the §6 page_changed/stale_refs/generation stamping) that
+      // the old bespoke handler silently skipped. Both are already ACTOR_VERBS
+      // gated identically upstream, so no permission behavior changes. `by:undefined`
+      // keeps them into-view even if a stray `--by` delta rides along (that delta
+      // form belongs to bare `scroll`).
+      return handleAct({ ...flags, verb: 'scroll', by: undefined })
     case 'eval':
       return handleEval(flags)
     case 'batch':
@@ -1486,6 +1494,9 @@ async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
       if (verb === 'select') opts.selectValues = flags.args.slice(1)
       if (verb === 'upload') opts.files = uploadFiles ?? []
       if (verb === 'drag') opts.targetRef = flags.args[1]
+      // FIX #6: the `scroll @ref --by dx dy` delta form scrolls the grounded
+      // element's own scroll box (else scroll = scroll-into-view, as before).
+      if (verb === 'scroll' && flags.by) opts.by = flags.by
 
       const env = await act(page, cdp, verb, ref, value, refmap, opts)
 
@@ -3627,21 +3638,6 @@ async function handleSet(flags: ParsedFlags): Promise<Envelope<unknown>> {
     default:
       return badRequest(`usage: silver set <${SET_SUBCOMMANDS}> [args…]`)
   }
-}
-
-// ---------------------------------------------------------------------------
-// scrollintoview <@ref> — scroll a grounded ref into view (actor).
-// ---------------------------------------------------------------------------
-
-async function handleScrollIntoView(flags: ParsedFlags): Promise<Envelope<unknown>> {
-  const ref = flags.args[0]
-  if (!ref) return badRequest('usage: silver scrollintoview @eN')
-  return withConnection(flags, async ({ page }) =>
-    withLocator(page, flags.session, ref, async (loc) => {
-      await loc.scrollIntoViewIfNeeded({ timeout: flags.timeout })
-      return ok({ scrolled: true, ref })
-    }),
-  )
 }
 
 // ---------------------------------------------------------------------------

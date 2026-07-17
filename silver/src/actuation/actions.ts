@@ -87,6 +87,14 @@ export type ActOptions = {
   timeout?: number
   /** `drag`: the destination ref (grounded against the same refmap). */
   targetRef?: string
+  /**
+   * `scroll`: an optional `[dx, dy]` delta (FIX #6). When present, `scroll @ref`
+   * scrolls the grounded element's OWN scroll box by (dx, dy) via `el.scrollBy`
+   * (keyless inner-container scroll — chat pane / modal body / virtualized list)
+   * instead of scrolling the ref into view. Absent → the into-view behavior is kept
+   * (also the `scrollintoview`/`scrollinto` alias path).
+   */
+  by?: [number, number]
   /** `select`: option values/labels (multiple). Falls back to `value`. */
   selectValues?: string[]
   /** `upload`: file paths (multiple). Falls back to `value`. */
@@ -378,6 +386,15 @@ async function applyVerb(
       return undefined
     }
     case 'scroll':
+      // DELTA form (`scroll @ref --by dx dy`, FIX #6): scroll the element's OWN
+      // scroll box by (dx, dy). Keyless — the host's numeric delta applied to the
+      // already-grounded Locator. `el` is untyped (tsconfig has no DOM lib; mirror
+      // the `get html` `loc.evaluate((el) => el.outerHTML)` convention).
+      if (opts.by) {
+        await locator.evaluate((el, d) => el.scrollBy(d[0], d[1]), opts.by)
+        return undefined
+      }
+      // Default: scroll the ref INTO VIEW (also the scrollintoview/scrollinto path).
       await locator.scrollIntoViewIfNeeded({ timeout })
       return undefined
     case 'fill':

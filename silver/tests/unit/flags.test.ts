@@ -41,6 +41,16 @@ describe('flags: B1 coordinate pairs', () => {
   it('a non-numeric pair leaves the field undefined (no partial coordinate)', () => {
     expect(parseFlags(['click', '--at', 'foo', 'bar']).at).toBeUndefined()
   })
+  // FIX #6: `scroll @ref --by dx dy` reuses the same pair machinery.
+  it('scroll --by dx dy consumes two numeric tokens into a delta pair', () => {
+    const f = parseFlags(['scroll', '@e2', '--by', '0', '500', '--enable-actions'])
+    expect(f.by).toEqual([0, 500])
+    expect(f.verb).toBe('scroll')
+    expect(f.args).toEqual(['@e2'])
+  })
+  it('scroll --by accepts a negative delta (scroll up/left)', () => {
+    expect(parseFlags(['scroll', '@e2', '--by', '0', '-300']).by).toEqual([0, -300])
+  })
 })
 
 describe('flags: E4 --grant-permissions', () => {

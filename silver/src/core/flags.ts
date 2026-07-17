@@ -185,6 +185,14 @@ export type ParsedFlags = {
   from?: [number, number]
   /** `drag --from <x> <y> --to <x> <y>`: drag end point. */
   to?: [number, number]
+  /**
+   * `scroll @ref --by <dx> <dy>` (FIX #6): scroll the grounded element's OWN
+   * scroll box by the given delta (keyless inner-container scroll — chat pane,
+   * modal body, virtualized list). Consumes TWO following numeric tokens; a
+   * negative value scrolls up/left. Absent → `scroll @ref` keeps its
+   * scroll-into-view behavior.
+   */
+  by?: [number, number]
   // ---- positionals ----
   verb: string
   args: string[]
@@ -282,11 +290,13 @@ const BOOL_FLAGS: Record<string, keyof ParsedFlags> = {
 /** `--load` (and `--load networkidle`): optional-value flag. */
 const OPTIONAL_VALUE_FLAGS = new Set(['load'])
 
-/** Coordinate-pair flags (B1): each consumes TWO following numeric tokens. */
-const PAIR_FLAGS: Record<string, 'at' | 'from' | 'to'> = {
+/** Coordinate-pair flags (B1): each consumes TWO following numeric tokens.
+ * `by` (FIX #6) is a delta-pair on the same machinery: `scroll @ref --by dx dy`. */
+const PAIR_FLAGS: Record<string, 'at' | 'from' | 'to' | 'by'> = {
   at: 'at',
   from: 'from',
   to: 'to',
+  by: 'by',
 }
 
 const SHORT_BOOL: Record<string, keyof ParsedFlags> = {

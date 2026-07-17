@@ -51,9 +51,21 @@ const BUY_PAGE = `<!doctype html>
   <button id="buy" onclick="document.body.setAttribute('data-bought','1')">Buy now</button>
 </body></html>`
 
+// FIX #6 fixture: a scrollable INNER container (`role=listbox` so it grounds as a
+// ref) whose 3000px content overflows a 100px box — `scroll @ref --by 0 500` must
+// move the container's OWN scrollTop while the window stays put.
+const SCROLL_PAGE = `<!doctype html>
+<html><head><title>Scroll box</title></head><body>
+  <div id="box" role="listbox" aria-label="items" tabindex="0"
+       style="overflow:auto;height:100px;width:200px">
+    <div style="height:3000px">tall content</div>
+  </div>
+</body></html>`
+
 let server: Server
 let pageUrl: string
 let mouseUrl: string
+let scrollUrl: string
 let baseUrl: string
 
 function firstRefWithRole(map: RefMap, role: string): string {
@@ -80,6 +92,11 @@ describe('vercel-parity verbs (real Chromium via the run() entry)', () => {
       if (url.startsWith('/mouse')) {
         res.writeHead(200, { 'content-type': 'text/html' })
         res.end(MOUSE_PAGE)
+        return
+      }
+      if (url.startsWith('/scroll')) {
+        res.writeHead(200, { 'content-type': 'text/html' })
+        res.end(SCROLL_PAGE)
         return
       }
       if (url.startsWith('/captcha')) {
@@ -112,6 +129,7 @@ describe('vercel-parity verbs (real Chromium via the run() entry)', () => {
     baseUrl = `http://localhost:${port}`
     pageUrl = `http://localhost:${port}/`
     mouseUrl = `http://localhost:${port}/mouse`
+    scrollUrl = `http://localhost:${port}/scroll`
   })
 
   afterAll(async () => {
@@ -320,7 +338,61 @@ describe('vercel-parity verbs (real Chromium via the run() entry)', () => {
       'scrollintoview', `@${btnRef}`, '--enable-actions', '--session', NAME,
     ])
     expect(scrolled.env.success).toBe(true)
-    expect((scrolled.env.data as { scrolled: boolean }).scrolled).toBe(true)
+    // FIX #3: scrollintoview/scrollinto now route through the SAME grounded
+    // handleAct pipeline as `scroll` (they used to run a bespoke handler that
+    // returned only `{scrolled:true}` and SKIPPED the spec-§6 grounding contract).
+    // This is a correction, not a weakening: the alias envelope must now carry
+    // page_changed / stale_refs / generation like every other action envelope.
+    const sdata = scrolled.env.data as {
+      verb: string
+      ref: string
+      generation: number
+      page_changed: boolean
+      stale_refs: boolean
+    }
+    expect(sdata.verb).toBe('scroll')
+    expect(sdata.generation).toBeGreaterThan(0)
+    expect(sdata).toHaveProperty('page_changed')
+    expect(sdata).toHaveProperty('stale_refs')
+  })
+
+  it('FIX #6: scroll @ref --by moves the container’s own scrollTop, not the page', async () => {
+    await run(['open', scrollUrl, '--session', NAME])
+    await run(['snapshot', '-i', '--session', NAME])
+    const map = await loadRefMap(NAME)
+    // The scrollable container grounds as a `listbox` ref.
+    const boxRef = firstRefWithRole(map as RefMap, 'listbox')
+
+    // Baseline: the container is at the top and the window has not scrolled.
+    // `--no-content-boundaries` returns the raw eval value (no untrusted fence).
+    const topBefore = await run([
+      'eval', "document.getElementById('box').scrollTop",
+      '--enable-actions', '--no-content-boundaries', '--session', NAME,
+    ])
+    expect(Number(topBefore.env.data)).toBe(0)
+
+    const scrolled = await run([
+      'scroll', `@${boxRef}`, '--by', '0', '500', '--enable-actions', '--session', NAME,
+    ])
+    expect(scrolled.env.success).toBe(true)
+    // The delta form still rides the grounded handleAct pipeline (grounding fields).
+    const sd = scrolled.env.data as { verb: string; ref: string; generation: number }
+    expect(sd.verb).toBe('scroll')
+    expect(sd.generation).toBeGreaterThan(0)
+
+    // The CONTAINER's own scroll box moved by the delta…
+    const topAfter = await run([
+      'eval', "document.getElementById('box').scrollTop",
+      '--enable-actions', '--no-content-boundaries', '--session', NAME,
+    ])
+    expect(Number(topAfter.env.data)).toBe(500)
+
+    // …while the PAGE itself did not scroll.
+    const winY = await run([
+      'eval', 'window.scrollY',
+      '--enable-actions', '--no-content-boundaries', '--session', NAME,
+    ])
+    expect(Number(winY.env.data)).toBe(0)
   })
 
   // --- AC1: expect / assertion primitive ----------------------------------

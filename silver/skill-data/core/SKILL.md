@@ -151,7 +151,7 @@ verbs exist only for canvas/WebGL/custom-widget escape hatches where no accessib
 | `press @ref "<key>"` | Key press on a ref (e.g. `"Enter"`, `"Control+A"`). |
 | `select @ref <value…>` | Choose `<option>`s of a **native** `<select>` (by value or label). |
 | `check @ref` / `uncheck @ref` | Set checkbox/radio state. |
-| `scroll @ref` | Scroll a ref into view. |
+| `scroll @ref` | Scroll a ref into view. Add `--by <dx> <dy>` to instead scroll the ref's **own** scroll box by a delta (chat pane / modal body / virtualized list; negatives scroll up/left). |
 | `scrollintoview @ref` | Scroll a grounded ref into view (alias `scrollinto`). |
 | `upload @ref <file…>` | Set file inputs (each file must be a **contained** path). |
 | `download <@ref\|selector> <path>` | Click the ref/selector, capture the download, save to a **contained** path (`{saved:true}`; the path is never echoed). `download --wait [path]` awaits the *next* download without a click. |
