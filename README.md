@@ -82,7 +82,7 @@ npm link
 
 ## Status
 
-575 tests, an eval suite that passes, and a lethal-trifecta security check that passes, all on every
+589 tests, an eval suite that passes, and a lethal-trifecta security check that passes, all on every
 commit. Keyless. No MCP.
 
 ## License

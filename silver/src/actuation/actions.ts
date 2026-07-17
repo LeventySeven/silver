@@ -95,6 +95,14 @@ export type ActOptions = {
    * (also the `scrollintoview`/`scrollinto` alias path).
    */
   by?: [number, number]
+  /**
+   * `click`/`dblclick` (item #1): the mouse button and/or modifier keys to hold
+   * during the click. Faithful re-exposure of a Playwright/base capability
+   * (right-click context menus, Ctrl/Cmd-click open-in-new-tab, Shift-select) —
+   * still @ref-grounded and behind the existing actor gate. Ignored by other verbs.
+   */
+  button?: 'left' | 'right' | 'middle'
+  modifiers?: Array<'Alt' | 'Control' | 'Meta' | 'Shift'>
   /** `select`: option values/labels (multiple). Falls back to `value`. */
   selectValues?: string[]
   /** `upload`: file paths (multiple). Falls back to `value`. */
@@ -287,21 +295,44 @@ export async function find(
   }
 }
 
+/**
+ * Item #4: a `/pattern/flags` value becomes a RegExp matcher (a keyless, deterministic
+ * opt-in — NOT a query DSL). Applies to text/label/placeholder and the role `--name`
+ * filter, which all accept `string | RegExp`. An invalid pattern falls back to the
+ * literal string. A plain value (no slashes) is unchanged, so existing calls are byte-identical.
+ */
+function asMatcher(v: string): string | RegExp {
+  const m = /^\/(.+)\/([gimsuy]*)$/.exec(v)
+  if (!m) return v
+  try {
+    return new RegExp(m[1], m[2])
+  } catch {
+    return v
+  }
+}
+
 /** Build a Playwright Locator from a semantic (kind, val) pair. */
 export function locate(page: Page, kind: FindKind, val: string, opts: FindOptions = {}): Locator {
   switch (kind) {
     case 'role': {
-      const roleOpts: { name?: string; exact?: boolean } = {}
-      if (opts.name !== undefined) roleOpts.name = opts.name
-      if (opts.exact !== undefined) roleOpts.exact = opts.exact
+      const roleOpts: { name?: string | RegExp; exact?: boolean } = {}
+      if (opts.name !== undefined) {
+        const nm = asMatcher(opts.name)
+        roleOpts.name = nm
+        // `exact` only affects STRING name matching; Playwright rejects it with a
+        // RegExp name, so set it only for the string case.
+        if (opts.exact !== undefined && typeof nm === 'string') roleOpts.exact = opts.exact
+      } else if (opts.exact !== undefined) {
+        roleOpts.exact = opts.exact
+      }
       return page.getByRole(val as Parameters<Page['getByRole']>[0], roleOpts).first()
     }
     case 'text':
-      return page.getByText(val, exactOpt(opts)).first()
+      return byTextLike(asMatcher(val), (m, o) => page.getByText(m, o), opts)
     case 'label':
-      return page.getByLabel(val, exactOpt(opts)).first()
+      return byTextLike(asMatcher(val), (m, o) => page.getByLabel(m, o), opts)
     case 'placeholder':
-      return page.getByPlaceholder(val, exactOpt(opts)).first()
+      return byTextLike(asMatcher(val), (m, o) => page.getByPlaceholder(m, o), opts)
     case 'testid':
       return page.getByTestId(val).first()
     case 'first':
@@ -311,6 +342,16 @@ export function locate(page: Page, kind: FindKind, val: string, opts: FindOption
     case 'nth':
       return page.locator(val).nth(opts.index ?? 0)
   }
+}
+
+/** Apply a getBy* text-like matcher, passing `exact` only for a string (a RegExp
+ * matcher ignores/rejects exact). Returns the `.first()` locator. */
+function byTextLike(
+  matcher: string | RegExp,
+  get: (m: string | RegExp, o?: { exact?: boolean }) => Locator,
+  opts: FindOptions,
+): Locator {
+  return (matcher instanceof RegExp ? get(matcher) : get(matcher, exactOpt(opts))).first()
 }
 
 function exactOpt(opts: FindOptions): { exact?: boolean } {
@@ -352,10 +393,10 @@ async function applyVerb(
   const timeout = opts.timeout
   switch (verb) {
     case 'click':
-      await locator.click(withForce(opts))
+      await locator.click(withClickOpts(opts))
       return undefined
     case 'dblclick':
-      await locator.dblclick(withForce(opts))
+      await locator.dblclick(withClickOpts(opts))
       return undefined
     case 'hover':
       await locator.hover(withForce(opts))
@@ -480,6 +521,28 @@ function withForce(opts: ActOptions): { force?: boolean; timeout?: number } {
   const o: { force?: boolean; timeout?: number } = {}
   if (opts.force !== undefined) o.force = opts.force
   if (opts.timeout !== undefined) o.timeout = opts.timeout
+  return o
+}
+
+/**
+ * click/dblclick options (item #1): withForce plus the optional mouse `button`
+ * and held `modifiers`. Only set fields are included, so a plain click is
+ * byte-identical to the old `withForce` call.
+ */
+function withClickOpts(
+  opts: ActOptions,
+): {
+  force?: boolean
+  timeout?: number
+  button?: 'left' | 'right' | 'middle'
+  modifiers?: Array<'Alt' | 'Control' | 'Meta' | 'Shift'>
+} {
+  const o = withForce(opts) as ReturnType<typeof withForce> & {
+    button?: 'left' | 'right' | 'middle'
+    modifiers?: Array<'Alt' | 'Control' | 'Meta' | 'Shift'>
+  }
+  if (opts.button !== undefined) o.button = opts.button
+  if (opts.modifiers !== undefined && opts.modifiers.length > 0) o.modifiers = opts.modifiers
   return o
 }
 

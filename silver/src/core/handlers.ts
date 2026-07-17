@@ -70,6 +70,7 @@ import {
   applyRoutes,
   addRoute,
   removeRoute,
+  loadRoutes,
   startHar,
   stopHar,
   buildHar,
@@ -428,6 +429,82 @@ async function applyEmulation(
 }
 
 // ---------------------------------------------------------------------------
+// Storage-state ORIGINS replay (`state load`, item #14). Playwright's
+// storageState carries `cookies` AND `origins[].localStorage`; Silver historically
+// replayed only cookies, silently breaking auth on the many sites that keep the
+// session token in localStorage (a REGRESSION vs the Vercel base, which replays
+// origins). The context is already created on our CDP-attached daemon, so the
+// launch-time `storageState` option is unavailable — instead we persist the
+// origins to an ENCRYPTED sidecar (localStorage values are session tokens by
+// nature) and re-seed them via an init script on every connect, exactly like
+// `applyRoutes`/`ensureCapture`. Seed-if-ABSENT: a key already present on the live
+// origin is never clobbered, so a later app write survives a reload.
+// ---------------------------------------------------------------------------
+
+type OriginSeed = { origin: string; localStorage: Array<{ name: string; value: string }> }
+type StorageSeed = { origins: OriginSeed[] }
+
+function storageSeedPath(name: string): string {
+  return path.join(sessionDir(name), 'storage-seed.json')
+}
+
+async function loadStorageSeed(name: string): Promise<StorageSeed | null> {
+  try {
+    return await readSidecarObject<StorageSeed>(storageSeedPath(name))
+  } catch {
+    return null
+  }
+}
+
+async function saveStorageSeed(name: string, seed: StorageSeed): Promise<void> {
+  await fs.mkdir(sessionDir(name), { recursive: true })
+  await writeSidecar(storageSeedPath(name), seed)
+}
+
+/**
+ * Normalize the `origins` array of a parsed Playwright storageState into our seed
+ * shape, dropping anything malformed. Only string name/value pairs survive.
+ */
+function originsToSeed(origins: unknown): OriginSeed[] {
+  if (!Array.isArray(origins)) return []
+  const out: OriginSeed[] = []
+  for (const o of origins) {
+    if (typeof o !== 'object' || o === null) continue
+    const origin = (o as { origin?: unknown }).origin
+    const ls = (o as { localStorage?: unknown }).localStorage
+    if (typeof origin !== 'string' || !Array.isArray(ls)) continue
+    const items = ls
+      .filter(
+        (it): it is { name: string; value: string } =>
+          typeof it === 'object' &&
+          it !== null &&
+          typeof (it as { name?: unknown }).name === 'string' &&
+          typeof (it as { value?: unknown }).value === 'string',
+      )
+      .map((it) => ({ name: it.name, value: it.value }))
+    if (items.length > 0) out.push({ origin, localStorage: items })
+  }
+  return out
+}
+
+/** The seed-if-absent init script for a set of origins (keyless string JS). */
+function storageSeedScript(origins: OriginSeed[]): string {
+  return `(function(){try{var S=${JSON.stringify(origins)};var h=location.origin;for(var i=0;i<S.length;i++){if(S[i].origin!==h)continue;var it=S[i].localStorage||[];for(var j=0;j<it.length;j++){try{if(localStorage.getItem(it[j].name)===null)localStorage.setItem(it[j].name,it[j].value);}catch(e){}}}}catch(e){}})()`
+}
+
+/**
+ * Re-seed persisted storage-state origins on a fresh connection. Registered as an
+ * init script so a navigation the caller triggers in THIS command (`open`) is
+ * seeded at document-start — the `state load` then `open <site>` flow. Best-effort;
+ * never throws; a no-op (single cheap sidecar read) when nothing was loaded.
+ */
+async function applyStorageSeed(page: Page, session: string): Promise<void> {
+  const seed = await loadStorageSeed(session)
+  if (!seed || seed.origins.length === 0) return
+  await page.addInitScript(storageSeedScript(seed.origins)).catch(() => {})
+}
+
+// ---------------------------------------------------------------------------
 // Connection helpers.
 // ---------------------------------------------------------------------------
 
@@ -557,6 +634,10 @@ async function withConnection<T>(
     // single cheap sidecar read + early return when no rules exist — zero effect
     // on the common (no-route) path. Never throws.
     await applyRoutes(page, flags.session).catch(() => {})
+    // Item #14: re-seed persisted storage-state origins' localStorage on this
+    // connection (mirrors applyRoutes). Registered BEFORE fn so a navigation this
+    // command triggers (`open`) is seeded at document-start. Never throws.
+    await applyStorageSeed(page, flags.session).catch(() => {})
     try {
       return await fn({ ...conn, page })
     } finally {
@@ -624,6 +705,31 @@ async function loadDialogSidecar(name: string): Promise<LastDialog | null> {
   }
 }
 
+/**
+ * Item #17: a per-session dialog disposition, pre-armed by `dialog accept|dismiss`.
+ * DEFAULT (no sidecar) is ACCEPT — the daemon must never hang on a native dialog
+ * (spec §6). `dismiss` genuinely REJECTS (Cancel), fixing the prior lying no-op
+ * where `dialog dismiss` reported success while still auto-accepting.
+ */
+type DialogDisposition = { mode: 'accept' | 'dismiss'; promptText?: string }
+
+function dialogDispositionPath(name: string): string {
+  return path.join(sessionDir(name), 'dialog-disposition.json')
+}
+
+async function loadDialogDisposition(name: string): Promise<DialogDisposition | null> {
+  try {
+    return await readSidecarObject<DialogDisposition>(dialogDispositionPath(name))
+  } catch {
+    return null
+  }
+}
+
+async function saveDialogDisposition(name: string, d: DialogDisposition): Promise<void> {
+  await fs.mkdir(sessionDir(name), { recursive: true })
+  await writeSidecar(dialogDispositionPath(name), d)
+}
+
 function attachDialogHandler(page: Page, session: string): void {
   page.on('dialog', (dialog) => {
     const type = dialog.type()
@@ -632,9 +738,26 @@ function attachDialogHandler(page: Page, session: string): void {
     const rec: LastDialog = { type, message, at: new Date().toISOString() }
     if (defaultValue) rec.defaultValue = defaultValue
     void writeDialogSidecar(session, rec)
-    // Sane defaults: prompt -> its default text; alert/confirm/beforeunload -> OK.
-    const done = type === 'prompt' ? dialog.accept(defaultValue) : dialog.accept()
-    void done.catch(() => {})
+    // Apply the pre-armed disposition (async: a fast sidecar read). Default accept.
+    void (async () => {
+      const disp = await loadDialogDisposition(session).catch(() => null)
+      try {
+        if (disp?.mode === 'dismiss') {
+          await dialog.dismiss()
+        } else {
+          // accept: a prompt() gets the armed text if any, else its own default.
+          const text =
+            disp?.promptText !== undefined
+              ? disp.promptText
+              : type === 'prompt'
+                ? defaultValue
+                : undefined
+          await dialog.accept(text)
+        }
+      } catch {
+        /* dialog already handled / page navigated away — best effort */
+      }
+    })()
   })
 }
 
@@ -1448,7 +1571,12 @@ async function sessionCookieHeader(flags: ParsedFlags, url: string): Promise<str
 }
 
 async function handleScreenshot(flags: ParsedFlags): Promise<Envelope<unknown>> {
-  const outPath = flags.args[0]
+  // Item #5: an @ref first arg captures ONLY that grounded element (rung 5 of the
+  // perception ladder — a chart / captcha tile / one card), else the whole page.
+  // The path (if any) is then the SECOND arg. Host reads the pixels — keyless.
+  const first = flags.args[0]
+  const refArg = first !== undefined && parseRef(first) ? first : undefined
+  const outPath = refArg ? flags.args[1] : first
   // Path containment (fix P1-SEC4): only write inside the working directory.
   let resolvedOut: string | undefined
   if (outPath) {
@@ -1456,10 +1584,45 @@ async function handleScreenshot(flags: ParsedFlags): Promise<Envelope<unknown>> 
     if (!c.ok) return fail('path_denied')
     resolvedOut = c.resolved
   }
+  // Item #5: byte-lean encoding. `--type jpeg` (alias jpg) + `--quality 0-100`
+  // shrink the base64 the host hands its vision model; PNG is the default and
+  // ignores quality (Playwright throws if quality is set on a PNG).
+  const rawType = (flags.type ?? '').toLowerCase()
+  const type: 'png' | 'jpeg' | undefined =
+    rawType === 'jpeg' || rawType === 'jpg' ? 'jpeg' : rawType === 'png' ? 'png' : undefined
+  const quality =
+    type === 'jpeg' && flags.quality !== undefined
+      ? Math.max(0, Math.min(100, Math.round(flags.quality)))
+      : undefined
+
   return withConnection(flags, async ({ page }) => {
-    const shotOpts: { fullPage: boolean; path?: string } = { fullPage: flags.full }
-    if (resolvedOut) shotOpts.path = resolvedOut
-    const buf = await page.screenshot(shotOpts)
+    const baseOpts: { path?: string; type?: 'png' | 'jpeg'; quality?: number } = {}
+    if (resolvedOut) baseOpts.path = resolvedOut
+    if (type) baseOpts.type = type
+    if (quality !== undefined) baseOpts.quality = quality
+
+    // Element-scoped: ground the ref → screenshot its Locator (no fullPage).
+    if (refArg) {
+      const refmap = await loadRefMap(flags.session)
+      if (!refmap) return fail('element_not_found')
+      const g = groundRef(refmap, refArg)
+      if (!g.ok) return fail(g.code)
+      const cdp = await page.context().newCDPSession(page)
+      try {
+        const loc = await toLocator(page, cdp, g.entry, g.ref)
+        const buf = await loc.screenshot(baseOpts)
+        if (resolvedOut) return ok({ saved: true })
+        return ok({ encoding: 'base64', image: buf.toString('base64'), ref: g.ref })
+      } catch (err) {
+        if (err instanceof ResolveError) return fail(err.code)
+        return fail('element_not_found')
+      } finally {
+        await cleanupStamp(page).catch(() => {})
+        await cdp.detach().catch(() => {})
+      }
+    }
+
+    const buf = await page.screenshot({ ...baseOpts, fullPage: flags.full })
     if (resolvedOut) return ok({ saved: true })
     return ok({ encoding: 'base64', image: buf.toString('base64') })
   })
@@ -1574,6 +1737,27 @@ async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
     }
   }
 
+  // Item #1: validate --button / --modifiers for click/dblclick BEFORE spinning up
+  // the connection (fail fast, no browser round-trip). Only these verbs accept them.
+  let clickButton: 'left' | 'right' | 'middle' | undefined
+  let clickModifiers: Array<'Alt' | 'Control' | 'Meta' | 'Shift'> | undefined
+  if (verb === 'click' || verb === 'dblclick') {
+    if (flags.button !== undefined) {
+      const b = strictMouseButton(flags.button)
+      if (!b) return badRequest('--button must be one of left, right, middle')
+      clickButton = b
+    }
+    if (flags.modifiers.length > 0) {
+      const mods: Array<'Alt' | 'Control' | 'Meta' | 'Shift'> = []
+      for (const m of flags.modifiers) {
+        const nm = normalizeModifier(m)
+        if (!nm) return badRequest('--modifiers must be from: Shift, Control, Alt, Meta (ctrl/cmd/option accepted)')
+        if (!mods.includes(nm)) mods.push(nm)
+      }
+      clickModifiers = mods
+    }
+  }
+
   return withConnection(flags, async ({ page }) => {
     const cdp = await page.context().newCDPSession(page)
     try {
@@ -1589,6 +1773,9 @@ async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
       // FIX #6: the `scroll @ref --by dx dy` delta form scrolls the grounded
       // element's own scroll box (else scroll = scroll-into-view, as before).
       if (verb === 'scroll' && flags.by) opts.by = flags.by
+      // Item #1: mouse button + modifier keys for click/dblclick (validated above).
+      if (clickButton !== undefined) opts.button = clickButton
+      if (clickModifiers !== undefined) opts.modifiers = clickModifiers
 
       const env = await act(page, cdp, verb, ref, value, refmap, opts)
 
@@ -1848,6 +2035,12 @@ async function handleFind(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const subaction = flags.args[2] as Exclude<ActVerb, 'drag'> | undefined
   const subValue = flags.args[3]
 
+  // Item #4: `find` is now read-only-dispatchable so a read-only agent can LOCATE.
+  // But the ACTING form `find <kind> <value> <subaction>` performs a mutation, so
+  // it gates `--enable-actions` HERE (verb-level registry gate can't split by
+  // subcommand — same in-handler pattern as `network route` / `storage set`).
+  if (subaction !== undefined && !flags.enableActions) return fail('not_permitted')
+
   return withConnection(flags, async ({ page }) => {
     const opts: Parameters<typeof find>[4] = {}
     if (subValue !== undefined) opts.value = subValue
@@ -2093,7 +2286,15 @@ async function withLocator(
 // ---------------------------------------------------------------------------
 
 /** Matchers that assert on the PAGE (no ref/selector target). */
-const PAGE_MATCHERS: ReadonlySet<string> = new Set(['url-matches', 'title-contains'])
+// Item #8: `text-visible` is a page-level matcher (a sibling of url-matches/
+// title-contains) — "is this text visible anywhere on the page?" — backed by a
+// real visibility check (getByText().isVisible()), unlike element `text-contains`
+// which reads textContent (includes hidden text). Keyless, read-only.
+const PAGE_MATCHERS: ReadonlySet<string> = new Set([
+  'url-matches',
+  'title-contains',
+  'text-visible',
+])
 /** Matchers that assert on a resolved ELEMENT. */
 const ELEMENT_MATCHERS: ReadonlySet<string> = new Set([
   'visible',
@@ -2104,7 +2305,7 @@ const ELEMENT_MATCHERS: ReadonlySet<string> = new Set([
   'value-equals',
 ])
 const EXPECT_USAGE =
-  'usage: silver expect <ref|selector> <visible|hidden|enabled|checked|text-contains|value-equals|count> [value]  |  silver expect <url-matches|title-contains> <value>'
+  'usage: silver expect <ref|selector> <visible|hidden|enabled|checked|text-contains|value-equals|count> [value]  |  silver expect <url-matches|title-contains|text-visible> <value>'
 
 /** Simple glob/substring URL match: `*` is a wildcard; otherwise a substring test. */
 function urlMatches(url: string, pattern: string): boolean {
@@ -2171,6 +2372,17 @@ async function handleExpect(flags: ParsedFlags): Promise<Envelope<unknown>> {
         value as string,
         presentPageText(title, flags),
       )
+    }
+    if (matcher === 'text-visible') {
+      // Item #8: real visibility (getByText → isVisible), scoped to the active
+      // frame so it works inside an iframe context set via `frame`.
+      const frame = await resolveActiveFrame(page, flags.session)
+      const vis = await frame
+        .getByText(value as string)
+        .first()
+        .isVisible()
+        .catch(() => false)
+      return assertionResult(vis, matcher, value as string, String(vis))
     }
     if (matcher === 'count') {
       // Scope to the active frame (set via `frame <sel>`), else the main frame.
@@ -2281,6 +2493,8 @@ async function buildWaitSpec(
   // handling — it takes no positional and is the most robust settle signal.
   if (flags.ready) return { spec: { ready: true, timeout } }
   if (flags.text !== undefined) return { spec: { text: flags.text, timeout } }
+  // Item #7: wait until the text DISAPPEARS (state:hidden). Read-only, keyless.
+  if (flags.textGone !== undefined) return { spec: { text: flags.textGone, state: 'hidden', timeout } }
   if (flags.url !== undefined) return { spec: { url: flags.url, timeout } }
   if (flags.fn !== undefined) return { spec: { fn: flags.fn, timeout } }
   if (flags.load !== undefined) {
@@ -2288,7 +2502,7 @@ async function buildWaitSpec(
     return { spec: { load, timeout } }
   }
   const arg = flags.args[0]
-  if (!arg) return { error: badRequest('usage: silver wait <ref|ms|selector|--text|--url|--load|--fn>') }
+  if (!arg) return { error: badRequest('usage: silver wait <ref|ms|selector|--text|--text-gone|--url|--load|--ready|--fn>') }
   if (/^\d+$/.test(arg)) return { spec: { ms: Number(arg) } }
   // A ref → grounded wait; anything else is treated as a CSS selector.
   if (/^(@|ref=)?e\d+$/.test(arg)) {
@@ -2403,9 +2617,43 @@ async function handleStateVerb(flags: ParsedFlags): Promise<Envelope<unknown>> {
     const c = assertContainedPath(target)
     if (!c.ok) return fail('path_denied')
     const savePath = c.resolved
-    return withConnection(flags, async ({ context }) => {
-      await context.storageState({ path: savePath })
-      return ok({ saved: true })
+    return withConnection(flags, async ({ context, page }) => {
+      const state = (await context.storageState()) as {
+        cookies?: unknown[]
+        origins?: Array<{ origin: string; localStorage: Array<{ name: string; value: string }> }>
+      }
+      // Item #14: over a CDP-attached (connectOverCDP) context, storageState() does
+      // NOT collect localStorage — it returns cookies only, origins:[]. Capture the
+      // CURRENT page's origin localStorage manually and merge it, so `state save`
+      // actually persists the localStorage tokens `state load` will replay (the
+      // common single-origin auth flow). Multi-origin sessions capture only the
+      // active origin — a documented, honest limitation of the CDP model.
+      const origin = safeOrigin(page.url())
+      const ls = (await page
+        .evaluate(() => {
+          const s = (globalThis as unknown as { localStorage: Storage }).localStorage
+          const out: Array<{ name: string; value: string }> = []
+          for (let i = 0; i < s.length; i++) {
+            const k = s.key(i)
+            if (k !== null) out.push({ name: k, value: s.getItem(k) ?? '' })
+          }
+          return out
+        })
+        .catch(() => [] as Array<{ name: string; value: string }>)) as Array<{
+        name: string
+        value: string
+      }>
+      const origins = (Array.isArray(state.origins) ? state.origins : []).filter(
+        (o) => o.origin !== origin,
+      )
+      if (ls.length > 0) origins.push({ origin, localStorage: ls })
+      const merged = { ...state, origins }
+      await fs.writeFile(savePath, JSON.stringify(merged, null, 2), 'utf8')
+      return ok({
+        saved: true,
+        cookies: Array.isArray(state.cookies) ? state.cookies.length : 0,
+        localStorageKeys: ls.length,
+      })
     })
   }
   if (sub === 'load') {
@@ -2413,26 +2661,185 @@ async function handleStateVerb(flags: ParsedFlags): Promise<Envelope<unknown>> {
     // Path containment (fix P1-SEC4): only read a storage-state file from CWD.
     const c = assertContainedPath(target)
     if (!c.ok) return fail('path_denied')
-    let parsed: { cookies?: unknown }
+    let parsed: { cookies?: unknown; origins?: unknown }
     try {
-      parsed = JSON.parse(await fs.readFile(c.resolved, 'utf8')) as { cookies?: unknown }
+      parsed = JSON.parse(await fs.readFile(c.resolved, 'utf8')) as {
+        cookies?: unknown
+        origins?: unknown
+      }
     } catch {
       return badRequest('could not read the storage-state file')
     }
-    return withConnection(flags, async ({ context }) => {
+    // Item #14: replay the origins' localStorage too (not just cookies). Persist
+    // the origins to the encrypted storage-seed sidecar so applyStorageSeed
+    // re-seeds them on this AND every later connection (the `state load` then
+    // `open <site>` flow); also seed the CURRENT page immediately when it already
+    // sits on one of the saved origins.
+    const originSeed = originsToSeed(parsed.origins)
+    await saveStorageSeed(flags.session, { origins: originSeed })
+    return withConnection(flags, async ({ context, page }) => {
       if (Array.isArray(parsed.cookies) && parsed.cookies.length > 0) {
         await context.addCookies(parsed.cookies as Parameters<typeof context.addCookies>[0])
       }
-      // NOTE (v1): localStorage/origins from storageState are not replayed here
-      // (would require navigating each origin). Cookies are applied. See report.
-      return ok({ loaded: true, cookies: Array.isArray(parsed.cookies) ? parsed.cookies.length : 0 })
+      // Seed-if-absent on the live page when it is already on a saved origin, so a
+      // `state load` AFTER `open` takes effect without a reload.
+      let seededNow = 0
+      const here = safeOrigin(page.url())
+      const match = originSeed.find((o) => o.origin === here)
+      if (match) {
+        seededNow = (await page
+          .evaluate((items: Array<{ name: string; value: string }>) => {
+            // tsconfig has no DOM lib — reach localStorage through the page global
+            // (mirrors handleStorage's `globalThis as ... Storage` idiom).
+            const ls = (
+              globalThis as unknown as {
+                localStorage: { getItem(k: string): string | null; setItem(k: string, v: string): void }
+              }
+            ).localStorage
+            let n = 0
+            for (const it of items) {
+              try {
+                if (ls.getItem(it.name) === null) {
+                  ls.setItem(it.name, it.value)
+                  n++
+                }
+              } catch {
+                /* storage blocked (sandboxed/opaque origin) — skip */
+              }
+            }
+            return n
+          }, match.localStorage)
+          .catch(() => 0)) as number
+      }
+      return ok({
+        loaded: true,
+        cookies: Array.isArray(parsed.cookies) ? parsed.cookies.length : 0,
+        origins: originSeed.length,
+        localStorageKeys: originSeed.reduce((s, o) => s + o.localStorage.length, 0),
+        seededNow,
+      })
     })
   }
   return badRequest('usage: silver state save|load <path>')
 }
 
 async function handleCookies(flags: ParsedFlags): Promise<Envelope<unknown>> {
-  if (flags.args[0] !== 'set') return badRequest('usage: silver cookies set --curl <file>')
+  // Item #13: full cookie CRUD. `list`/`get` are READ-ONLY (no actor gate);
+  // `set`/`delete`/`clear` MUTATE the jar → actor sub-ops gated in-handler.
+  const sub = flags.args[0]
+  switch (sub) {
+    case 'list':
+      return cookiesList(flags)
+    case 'get':
+      return cookiesGet(flags)
+    case 'delete':
+      return cookiesDelete(flags)
+    case 'clear':
+      return cookiesClear(flags)
+    case 'set':
+      return cookiesSet(flags)
+    default:
+      return badRequest(
+        'usage: silver cookies <list|get <name>|set --curl <file>|delete <name>|clear> [--url <origin>]',
+      )
+  }
+}
+
+/** Constrain a cookie name/domain/path to a safe short token for display. Cookie
+ * names/domains are RFC tokens (no `<>`), but strip control/angle chars defensively. */
+function cookieField(s: unknown): string {
+  // Strip angle brackets + control chars (defensive forged-tag / CR-LF hygiene);
+  // ordinary token chars ('-', '.', etc.) are kept so my-site.com stays whole.
+  let out = ''
+  for (const ch of String(s ?? '').slice(0, 256)) {
+    const code = ch.charCodeAt(0)
+    if (code < 0x20 || ch === '<' || ch === '>') continue
+    out += ch
+  }
+  return out
+}
+
+
+/**
+ * Map a Playwright cookie to a display shape. The VALUE is ALWAYS redacted: cookie
+ * values ARE session tokens by nature, and the user's standing rule is to drive via
+ * the existing session, not to surface raw tokens into the transcript (the leak
+ * class Silver exists to avoid). Length is kept so the host can confirm presence.
+ */
+function cookieForDisplay(c: {
+  name: string
+  value: string
+  domain: string
+  path: string
+  expires: number
+  httpOnly: boolean
+  secure: boolean
+  sameSite: string
+}): Record<string, unknown> {
+  return {
+    name: cookieField(c.name),
+    value: REDACTED,
+    valueLength: typeof c.value === 'string' ? c.value.length : 0,
+    domain: cookieField(c.domain),
+    path: cookieField(c.path),
+    expires: c.expires,
+    httpOnly: c.httpOnly,
+    secure: c.secure,
+    sameSite: c.sameSite,
+  }
+}
+
+async function cookiesList(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  return withConnection(flags, async ({ context }) => {
+    const cookies = await context.cookies(flags.url ? [flags.url] : undefined)
+    return ok({ total: cookies.length, cookies: cookies.map(cookieForDisplay) })
+  })
+}
+
+async function cookiesGet(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const name = flags.args[1]
+  if (!name) return badRequest('usage: silver cookies get <name> [--url <origin>]')
+  return withConnection(flags, async ({ context }) => {
+    const matches = (await context.cookies(flags.url ? [flags.url] : undefined)).filter(
+      (c) => c.name === name,
+    )
+    if (matches.length === 0) {
+      return ok({ found: false, name: cookieField(name) }, 'no cookie with that name in the current context')
+    }
+    return ok({ found: true, cookies: matches.map(cookieForDisplay) })
+  })
+}
+
+async function cookiesDelete(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  if (!flags.enableActions) return fail('not_permitted')
+  const name = flags.args[1]
+  if (!name) return badRequest('usage: silver cookies delete <name>')
+  return withConnection(flags, async ({ context }) => {
+    // Playwright clearCookies({name}) removes every cookie with that name across
+    // domains — the "drop just the session cookie to test logout" flow.
+    await context.clearCookies({ name })
+    return ok({ deleted: cookieField(name) })
+  })
+}
+
+async function cookiesClear(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  if (!flags.enableActions) return fail('not_permitted')
+  return withConnection(flags, async ({ context }) => {
+    await context.clearCookies()
+    return ok({ cleared: true })
+  })
+}
+
+/**
+ * `cookies set --curl <file>`: structured import from a JSON array, a raw `Cookie:`
+ * header, or a pasted cURL command. This is the create path (a JSON-array file
+ * carries full attributes — httpOnly/secure/sameSite/expires); it MUTATES the jar
+ * → actor-gated. (No inline `--name/--value` flags: the JSON path already gives
+ * structured set, and the user's own rule prefers driving via the existing session
+ * over minting tokens, so 7 inline flags would be surface bloat.)
+ */
+async function cookiesSet(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  if (!flags.enableActions) return fail('not_permitted')
   if (!flags.curl) return badRequest('usage: silver cookies set --curl <file>')
   let raw: string
   try {
@@ -3052,23 +3459,41 @@ function compactHead(md: string): string {
 }
 
 /**
- * `dialog` verb (fix P0-7). Dialogs are AUTO-ACCEPTED as they appear (see
- * attachDialogHandler); this verb surfaces the last one. Minimal by design:
- *   dialog | dialog status   -> the last dialog (type + message) or null
- *   dialog accept | dismiss  -> acknowledges the (already-automatic) mode
- * Note: `dialog` is registry-classified as an actor verb, so it requires
- * --enable-actions to dispatch.
+ * `dialog` verb (fix P0-7, item #17). Native dialogs are auto-accepted by DEFAULT
+ * (the headless daemon must never hang), but the host can PRE-ARM a disposition
+ * for the next dialog:
+ *   dialog | dialog status              -> the last dialog + the armed disposition
+ *   dialog accept [--prompt-text <t>]   -> arm accept (default); prompt() gets <t>
+ *   dialog dismiss                      -> arm a genuine Cancel/reject
+ *   dialog reset                        -> back to the default (accept)
+ * `dialog` is registry-classified as an actor verb, so it requires --enable-actions.
  */
 async function handleDialog(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const sub = flags.args[0] ?? 'status'
   if (sub === 'status') {
     const last = await loadDialogSidecar(flags.session)
-    return ok({ lastDialog: last })
+    const disposition = (await loadDialogDisposition(flags.session)) ?? { mode: 'accept' as const }
+    return ok({ lastDialog: last, disposition })
   }
-  if (sub === 'accept' || sub === 'dismiss') {
-    return ok({ mode: sub, note: 'dialogs are auto-accepted when they appear' })
+  // Item #17: PRE-ARM the disposition for the NEXT dialog(s) — the headless daemon
+  // has no human to click a native dialog, so the host arms it ahead of the action
+  // that triggers it. `accept` (default) proceeds; `dismiss` genuinely Cancels
+  // (fixing the old no-op that lied). `reset` returns to the default (accept).
+  if (sub === 'accept') {
+    const d: DialogDisposition = { mode: 'accept' }
+    if (flags.promptText !== undefined) d.promptText = flags.promptText
+    await saveDialogDisposition(flags.session, d)
+    return ok({ armed: 'accept', ...(flags.promptText !== undefined ? { promptText: true } : {}) })
   }
-  return badRequest('usage: silver dialog status')
+  if (sub === 'dismiss') {
+    await saveDialogDisposition(flags.session, { mode: 'dismiss' })
+    return ok({ armed: 'dismiss' })
+  }
+  if (sub === 'reset') {
+    await fs.rm(dialogDispositionPath(flags.session), { force: true }).catch(() => {})
+    return ok({ armed: 'accept' })
+  }
+  return badRequest('usage: silver dialog <status|accept [--prompt-text <t>]|dismiss|reset>')
 }
 
 // ---------------------------------------------------------------------------
@@ -3084,26 +3509,34 @@ async function handleNetwork(flags: ParsedFlags): Promise<Envelope<unknown>> {
   switch (sub) {
     case 'requests':
       return handleNetworkRequests(flags)
+    case 'request':
+      return handleNetworkRequest(flags)
     case 'route':
       return handleNetworkRoute(flags)
+    case 'routes':
+      return handleNetworkRoutesList(flags)
     case 'unroute':
       return handleNetworkUnroute(flags)
     case 'har':
       return handleNetworkHar(flags)
     default:
-      return badRequest('usage: silver network <requests|route|unroute|har> [args]')
+      return badRequest('usage: silver network <requests|request|route|routes|unroute|har> [args]')
   }
 }
 
 async function handleNetworkRequests(flags: ParsedFlags): Promise<Envelope<unknown>> {
   return withConnection(flags, async ({ page }) => {
     await ensureCapture(page, flags.session)
-    let list = await readCapture(page, 'net')
+    // Tag each entry with its position in the FULL buffer BEFORE filtering, so the
+    // `index` a caller reads here is the SAME index `network request <index>` takes
+    // (item #11) — filters don't renumber it.
+    const full = await readCapture(page, 'net')
+    let list = full.map((r, i) => ({ r, i }))
     if (flags.filter !== undefined) {
-      list = list.filter((r) => String(r.url ?? '').includes(flags.filter as string))
+      list = list.filter(({ r }) => String(r.url ?? '').includes(flags.filter as string))
     }
     if (flags.type !== undefined) {
-      list = list.filter((r) => String(r.resourceType ?? '') === flags.type)
+      list = list.filter(({ r }) => String(r.resourceType ?? '') === flags.type)
     }
     // --method/--status only match AUTHORITATIVE (source:'fetch') entries. Observer
     // (PerformanceObserver) entries carry an ASSUMED method 'GET' / status 200
@@ -3112,12 +3545,12 @@ async function handleNetworkRequests(flags: ParsedFlags): Promise<Envelope<unkno
     if (flags.method !== undefined) {
       const m = flags.method.toUpperCase()
       list = list.filter(
-        (r) => String(r.source ?? '') === 'fetch' && String(r.method ?? '').toUpperCase() === m,
+        ({ r }) => String(r.source ?? '') === 'fetch' && String(r.method ?? '').toUpperCase() === m,
       )
     }
     if (flags.status !== undefined) {
       const s = flags.status
-      list = list.filter((r) => {
+      list = list.filter(({ r }) => {
         if (String(r.source ?? '') !== 'fetch') return false
         const st = String(r.status ?? '')
         return st === s || st.startsWith(s)
@@ -3127,18 +3560,23 @@ async function handleNetworkRequests(flags: ParsedFlags): Promise<Envelope<unkno
     // Bound the returned array (the page-side ring buffer is already capped).
     const CAP = 200
     // The request url is attacker-controlled free text (a page can seed a captured
-    // url with forged transcript tags), so route it through presentPageText
-    // (fix F6): neutralize + cap like console/errors before it reaches the host.
-    // Filtering/slicing runs on the RAW url first, so --filter still matches
-    // unwrapped. The HTTP method is NOT free text — it is a bounded token, so
-    // fencing it in content-boundary markers would corrupt a structured field.
-    // Sanitize it to a safe uppercase-letter token instead: this strips any
-    // injected tag characters entirely (strictly safer than fencing, which leaves
-    // attacker text present) while keeping real methods like GET/POST intact.
-    const requests = list.slice(-CAP).map((r) => ({
-      ...r,
+    // url with forged transcript tags), so route it through presentPageText (fix F6):
+    // neutralize + cap like console/errors before it reaches the host. Emit ONLY the
+    // lean metadata fields — captured response bodies/headers (item #11) are DELIBERATELY
+    // omitted here to keep the list token-lean; the host pulls a body via
+    // `network request <index> --part body`. The HTTP method is a bounded token,
+    // sanitized to safe uppercase letters (strips any injected tag chars).
+    const requests = list.slice(-CAP).map(({ r, i }) => ({
+      index: i,
       url: presentPageText(String(r.url ?? ''), flags),
-      method: String(r.method ?? '').toUpperCase().replace(/[^A-Z-]/g, '').slice(0, 16),
+      method: String(r.method ?? '')
+        .toUpperCase()
+        .replace(/[^A-Z-]/g, '')
+        .slice(0, 16),
+      status: typeof r.status === 'number' ? r.status : null,
+      resourceType: String(r.resourceType ?? 'other'),
+      source: String(r.source ?? 'fetch'),
+      ts: typeof r.ts === 'number' ? r.ts : null,
     }))
     if (flags.clear) await clearCapture(page, 'net')
     return ok({ total, requests })
@@ -3152,20 +3590,158 @@ async function handleNetworkRoute(flags: ParsedFlags): Promise<Envelope<unknown>
   const url = flags.args[1]
   if (!url) {
     return badRequest(
-      'usage: silver network route <url> [--abort] [--body <json>] [--resource-types <csv>]',
+      'usage: silver network route <url> [--abort] [--body <json>] [--status <code>] [--content-type <ct>] [--headers <json>] [--remove-headers <csv>] [--resource-types <csv>]',
     )
   }
   const rule: RouteRule = { url, abort: flags.abort }
   if (flags.body !== undefined) rule.body = flags.body
   if (flags.resourceTypes.length > 0) rule.resourceTypes = flags.resourceTypes
+  // Item #9: mock a non-200 status, an explicit Content-Type, and response headers
+  // (add/remove). A rule with headers/status but no body still fulfills.
+  if (flags.status !== undefined) {
+    const code = Number(flags.status)
+    if (!Number.isInteger(code) || code < 100 || code > 599) {
+      return badRequest('--status must be an HTTP status code (100-599)')
+    }
+    rule.status = code
+  }
+  if (flags.contentType !== undefined) rule.contentType = flags.contentType
+  if (flags.headers !== undefined) {
+    const parsed = parseHeaderMap(flags.headers)
+    if (parsed === null) return badRequest('--headers must be a JSON object of string→string')
+    rule.headers = parsed
+  }
+  if (flags.removeHeaders.length > 0) rule.removeHeaders = flags.removeHeaders
   // Persist the rule; withConnection re-applies all rules on every connection so
   // routing is effectively persistent across the stateless per-command reconnect.
   await addRoute(flags.session, rule)
+  const fulfilled =
+    rule.body !== undefined ||
+    rule.status !== undefined ||
+    rule.headers !== undefined ||
+    (rule.removeHeaders !== undefined && rule.removeHeaders.length > 0)
   return ok({
     routed: url,
     abort: rule.abort,
-    ...(rule.body !== undefined ? { fulfilled: true } : {}),
+    ...(fulfilled ? { fulfilled: true } : {}),
+    ...(rule.status !== undefined ? { status: rule.status } : {}),
     ...(rule.resourceTypes ? { resourceTypes: rule.resourceTypes } : {}),
+  })
+}
+
+/** Parse a `--headers '{"K":"V"}'` JSON object into a string→string map; null on a
+ * non-object or any non-string value. */
+function parseHeaderMap(raw: string): Record<string, string> | null {
+  let obj: unknown
+  try {
+    obj = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return null
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(obj)) {
+    if (typeof v !== 'string') return null
+    out[k] = v
+  }
+  return out
+}
+
+/**
+ * Item #10: list the active `network route` rules (read-only introspection — the
+ * plural of route/unroute). No actor gate: it only reads the persisted sidecar.
+ */
+async function handleNetworkRoutesList(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const routes = await loadRoutes(flags.session)
+  return ok({ total: routes.length, routes })
+}
+
+/**
+ * Normalize captured response headers (an object from the fetch wrapper OR a
+ * `name: value\r\n` string from XHR's getAllResponseHeaders) to ONE neutralized
+ * block, run through the presentPageText choke so a card-shaped or forged-tag
+ * header VALUE is masked/neutralized exactly like the url and body. Fixes the
+ * earlier asymmetry where the fetch object path emitted headers raw.
+ */
+function presentHeaders(raw: unknown, flags: ParsedFlags): string | null {
+  if (raw === null || raw === undefined) return null
+  let text: string
+  if (typeof raw === 'string') {
+    text = raw
+  } else if (typeof raw === 'object') {
+    text = Object.entries(raw as Record<string, unknown>)
+      .map(([k, v]) => `${k}: ${String(v)}`)
+      .join('\n')
+  } else {
+    return null
+  }
+  return presentPageText(text, flags)
+}
+
+/**
+ * Item #11: return ONE captured request's detail by index (0-based over the same
+ * order `network requests` prints). `--part request|response|body` slices the
+ * output; default returns a compact summary. Captured response bodies/headers are
+ * best-effort (fetch/XHR only) and pass the presentPageText neutralize+card-redact
+ * choke (see presentHeaders); a body that hit the storage cap reports
+ * `truncated:true` (never silent).
+ */
+async function handleNetworkRequest(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const idxRaw = flags.args[1]
+  if (idxRaw === undefined || !/^\d+$/.test(idxRaw)) {
+    return badRequest('usage: silver network request <index> [--part request|response|body]')
+  }
+  const part = flags.part
+  if (part !== undefined && part !== 'request' && part !== 'response' && part !== 'body') {
+    return badRequest('--part must be one of: request, response, body')
+  }
+  return withConnection(flags, async ({ page }) => {
+    await ensureCapture(page, flags.session)
+    const list = await readCapture(page, 'net')
+    const idx = Number(idxRaw)
+    if (idx < 0 || idx >= list.length) {
+      return fail('element_not_found')
+    }
+    const r = list[idx]
+    const url = presentPageText(String(r.url ?? ''), flags)
+    const method = String(r.method ?? '')
+      .toUpperCase()
+      .replace(/[^A-Z-]/g, '')
+      .slice(0, 16)
+    const status = typeof r.status === 'number' ? r.status : null
+    const authoritative = String(r.source ?? '') !== 'observer'
+    const bodyText =
+      typeof r.body === 'string' ? presentPageText(r.body, flags) : null
+    // Response headers are attacker-controlled page-derived output, so they MUST go
+    // through the same presentPageText choke as the url/body (card-mask + forged-tag
+    // neutralization). The capture layer stores them TWO ways — an object (fetch:
+    // res.headers.forEach) or a string (XHR: getAllResponseHeaders()) — so normalize
+    // BOTH to a single `name: value` block and neutralize ONCE. Earlier the object
+    // branch was emitted RAW, an asymmetric bypass for fetch responses (recheck HIGH).
+    const respHeaders = presentHeaders(r.respHeaders, flags)
+    const request = { index: idx, url, method, resourceType: String(r.resourceType ?? 'other') }
+    const response = {
+      status,
+      // observer entries carry a placeholder status; flag them so a consumer never
+      // reads a best-effort 200 as a real response code (capture.ts contract).
+      authoritative,
+      headers: respHeaders,
+      bodyTruncated: r.bodyTruncated === true,
+    }
+    if (part === 'request') return ok({ request })
+    if (part === 'response') return ok({ response })
+    if (part === 'body') {
+      if (bodyText === null) {
+        return ok(
+          { index: idx, body: null },
+          authoritative
+            ? 'no response body captured for this request (non-text body, too large, or not yet complete)'
+            : 'this is a best-effort observer entry (PerformanceObserver) — no body is captured',
+        )
+      }
+      return ok({ index: idx, body: bodyText, truncated: r.bodyTruncated === true })
+    }
+    return ok({ request, response, body: bodyText })
   })
 }
 
@@ -3288,16 +3864,16 @@ async function handleFrame(flags: ParsedFlags): Promise<Envelope<unknown>> {
 async function handleStorage(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const kind = flags.args[0]
   if (kind !== 'local' && kind !== 'session') {
-    return badRequest('usage: silver storage <local|session> [get|set|clear] [key] [value]')
+    return badRequest('usage: silver storage <local|session> [get|set|delete|clear] [key] [value]')
   }
   const store = kind === 'local' ? 'localStorage' : 'sessionStorage'
 
   // Sub-op + positional resolution mirrors the Rust oracle: an explicit
-  // get/set/clear takes key/value after it; a bare `storage local <key>` is a get.
+  // get/set/delete/clear takes key/value after it; a bare `storage local <key>` is a get.
   let op = flags.args[1]
   let key: string | undefined
   let value: string | undefined
-  if (op === 'get' || op === 'set' || op === 'clear') {
+  if (op === 'get' || op === 'set' || op === 'delete' || op === 'clear') {
     key = flags.args[2]
     value = flags.args[3]
   } else {
@@ -3306,10 +3882,26 @@ async function handleStorage(flags: ParsedFlags): Promise<Envelope<unknown>> {
     op = 'get'
   }
 
-  // set/clear mutate storage → ACTOR sub-ops (gate here; verb is read-only-listed).
-  if ((op === 'set' || op === 'clear') && !flags.enableActions) return fail('not_permitted')
+  // set/delete/clear mutate storage → ACTOR sub-ops (gate here; verb is read-only-listed).
+  if ((op === 'set' || op === 'delete' || op === 'clear') && !flags.enableActions) {
+    return fail('not_permitted')
+  }
 
   return withConnection(flags, async ({ page }) => {
+    // Item #12: remove ONE key (removeItem), leaving the rest intact — the missing
+    // fourth CRUD op (base storage had get/set/clear but no delete).
+    if (op === 'delete') {
+      if (key === undefined) {
+        return badRequest('usage: silver storage <local|session> delete <key>')
+      }
+      await page.evaluate(
+        (a: string[]) => {
+          ;(globalThis as unknown as Record<string, Storage>)[a[0]].removeItem(a[1])
+        },
+        [store, key],
+      )
+      return ok({ deleted: key, type: kind })
+    }
     if (op === 'set') {
       if (key === undefined || value === undefined) {
         return badRequest('usage: silver storage <local|session> set <key> <value>')
@@ -3358,13 +3950,21 @@ async function handleStorage(flags: ParsedFlags): Promise<Envelope<unknown>> {
 async function handleConsole(flags: ParsedFlags): Promise<Envelope<unknown>> {
   return withConnection(flags, async ({ page }) => {
     await ensureCapture(page, flags.session)
-    const msgs = await readCapture(page, 'console')
+    let msgs = await readCapture(page, 'console')
     if (flags.clear) await clearCapture(page, 'console')
+    // Item #16: keep only the requested level (each message already carries its
+    // level). Token-lean SELECTION at the source — the host asks for `error`
+    // instead of receiving debug/info noise and compressing after the fact.
+    if (flags.level !== undefined) {
+      const want = flags.level.toLowerCase()
+      msgs = msgs.filter((m) => String(m.level ?? 'log').toLowerCase() === want)
+    }
     const text = msgs.map((m) => `[${String(m.level ?? 'log')}] ${String(m.text ?? '')}`).join('\n')
-    return ok(
-      presentPageText(text, flags),
-      msgs.length === 0 ? 'no console messages captured yet on this page' : undefined,
-    )
+    const empty =
+      flags.level !== undefined
+        ? `no console messages at level "${flags.level}" captured yet on this page`
+        : 'no console messages captured yet on this page'
+    return ok(presentPageText(text, flags), msgs.length === 0 ? empty : undefined)
   })
 }
 
@@ -3435,6 +4035,35 @@ const MOUSE_BUTTONS: ReadonlySet<string> = new Set(['left', 'right', 'middle'])
 
 function mouseButton(arg: string | undefined): 'left' | 'right' | 'middle' {
   return arg && MOUSE_BUTTONS.has(arg) ? (arg as 'left' | 'right' | 'middle') : 'left'
+}
+
+/** STRICT variant for `click --button` (item #1): null on an unknown button (the
+ * caller reports a clean usage error rather than silently defaulting to left). */
+function strictMouseButton(arg: string): 'left' | 'right' | 'middle' | null {
+  return MOUSE_BUTTONS.has(arg) ? (arg as 'left' | 'right' | 'middle') : null
+}
+
+/** Normalize a `--modifiers` token to Playwright's exact casing (item #1); null on
+ * unknown. Accepts common aliases (ctrl→Control, cmd/command/super→Meta, option→Alt). */
+function normalizeModifier(m: string): 'Alt' | 'Control' | 'Meta' | 'Shift' | null {
+  switch (m.trim().toLowerCase()) {
+    case 'alt':
+    case 'option':
+      return 'Alt'
+    case 'control':
+    case 'ctrl':
+      return 'Control'
+    case 'meta':
+    case 'cmd':
+    case 'command':
+    case 'super':
+    case 'win':
+      return 'Meta'
+    case 'shift':
+      return 'Shift'
+    default:
+      return null
+  }
 }
 
 async function handleMouse(flags: ParsedFlags): Promise<Envelope<unknown>> {
@@ -3884,10 +4513,57 @@ const SENSITIVE_HEADER_RE =
 // neutralized + capped before it reaches the host.
 // ---------------------------------------------------------------------------
 
+/** Stringify an eval result for the envelope (string as-is, undefined sentinel, else JSON). */
+function evalResultToText(result: unknown): string {
+  return typeof result === 'string' ? result : result === undefined ? 'undefined' : safeJson(result)
+}
+
 async function handleEval(flags: ParsedFlags): Promise<Envelope<unknown>> {
-  const script = flags.stdin ? await readStdin() : flags.args.join(' ')
-  if (script.trim().length === 0) return badRequest('usage: silver eval <js> | eval --stdin')
+  // Item #15: a leading @ref makes this ELEMENT-SCOPED — the grounded element is
+  // passed to the fn (`eval @e5 "el => el.textContent"`), so the code operates on the
+  // exact node the ref identified rather than re-querying the DOM (grounded-ref soul).
+  // This is the SAFE, grounded substitute for arbitrary Playwright driver code
+  // (browser_run_code_unsafe), which Silver intentionally does NOT expose.
+  const firstArg = flags.args[0]
+  const refArg = firstArg && parseRef(firstArg) ? firstArg : undefined
+  const script = flags.stdin
+    ? await readStdin()
+    : (refArg ? flags.args.slice(1) : flags.args).join(' ')
+  if (script.trim().length === 0) {
+    return badRequest('usage: silver eval [<@ref>] <js> | eval [<@ref>] --stdin')
+  }
   return withConnection(flags, async ({ page }) => {
+    if (refArg) {
+      const refmap = await loadRefMap(flags.session)
+      if (!refmap) return fail('element_not_found')
+      const g = groundRef(refmap, refArg)
+      if (!g.ok) return fail(g.code)
+      const cdp = await page.context().newCDPSession(page)
+      try {
+        const loc = await toLocator(page, cdp, g.entry, g.ref)
+        let result: unknown
+        try {
+          // Playwright's locator.evaluate(STRING) treats the string as an EXPRESSION,
+          // NOT a function called with the element — so we pass a real wrapper fn that
+          // binds the grounded element as `el` and evaluates the host's code in-page.
+          // Supports both `el => el.textContent` and bare `el.textContent` forms.
+          result = await loc.evaluate((el, code: string) => {
+            const g2 = globalThis as unknown as { Function: FunctionConstructor }
+            const produced = g2.Function('el', 'return (' + code + ')')(el)
+            return typeof produced === 'function' ? (produced as (e: unknown) => unknown)(el) : produced
+          }, script)
+        } catch {
+          return badRequest('eval raised an exception in the page')
+        }
+        return ok(presentPageText(evalResultToText(result), flags))
+      } catch (err) {
+        if (err instanceof ResolveError) return fail(err.code)
+        return fail('element_not_found')
+      } finally {
+        await cleanupStamp(page).catch(() => {})
+        await cdp.detach().catch(() => {})
+      }
+    }
     // Run in the active frame's context (set via `frame <sel>`), else main frame.
     const frame = await resolveActiveFrame(page, flags.session)
     let result: unknown
@@ -3897,13 +4573,7 @@ async function handleEval(flags: ParsedFlags): Promise<Envelope<unknown>> {
       // A page/script exception — no path/secret leak; the host adjusts its JS.
       return badRequest('eval raised an exception in the page')
     }
-    const asText =
-      typeof result === 'string'
-        ? result
-        : result === undefined
-          ? 'undefined'
-          : safeJson(result)
-    return ok(presentPageText(asText, flags))
+    return ok(presentPageText(evalResultToText(result), flags))
   })
 }
 

@@ -30,6 +30,18 @@ import { sessionDir } from './session.js'
 const MAX = 500
 
 /**
+ * Item #11: response-body capture bounds. `RESP_BODY_CAP` is the max chars STORED
+ * per fetch/XHR response AND the point at which the streamed READ stops + cancels —
+ * so a Content-Length-less response (chunked / fetch-SSE) is never slurped whole
+ * into page memory, only a bounded prefix. `RESP_BODY_READ_MAX` is a cheap
+ * content-length early-out (skip obviously-huge bodies before even teeing the
+ * stream). A body cut short carries `bodyTruncated:true`, honoring the
+ * never-truncate-silently contract.
+ */
+const RESP_BODY_CAP = 16384
+const RESP_BODY_READ_MAX = 1048576
+
+/**
  * The instrumentation IIFE, as a STRING (tsconfig `lib` has no DOM types, so the
  * project convention is string-form `page.evaluate` for anything touching
  * window/document — see handlers.ts). Idempotent: guarded by `window.__silverCap`
@@ -52,6 +64,8 @@ const MAX = 500
 export const INSTALLER = `(function(){
   if (window.__silverCap) return;
   var MAX = ${MAX};
+  var BCAP = ${RESP_BODY_CAP};
+  var RMAX = ${RESP_BODY_READ_MAX};
   var C = { console: [], errors: [], net: [] };
   window.__silverCap = C;
   function cap(a, r){ a.push(r); if (a.length > MAX) a.shift(); }
@@ -84,13 +98,42 @@ export const INSTALLER = `(function(){
       try { method = (init && init.method) || (input && input.method) || 'GET'; } catch(e){}
       var rec = { url: String(url), method: String(method).toUpperCase(), status: 0, resourceType: 'fetch', source: 'fetch', ts: Date.now() };
       cap(C.net, rec);
-      return of.apply(this, arguments).then(function(res){ try { rec.status = res.status; } catch(e){} return res; }, function(err){ rec.status = -1; throw err; });
+      return of.apply(this, arguments).then(function(res){
+        try { rec.status = res.status; } catch(e){}
+        try { var hs={}; res.headers.forEach(function(v,k){ hs[k]=v; }); rec.respHeaders = hs; } catch(e){}
+        // Item #11: capture a BOUNDED response body. The READ itself is bounded (not
+        // just the stored slice): a streamed reader stops + cancels once BCAP chars
+        // accumulate, so a Content-Length-LESS response (chunked / fetch-SSE) is never
+        // slurped whole into page memory. content-length is only a cheap early-out.
+        try {
+          var cl = 0; try { cl = parseInt(res.headers.get('content-length')||'0',10)||0; } catch(e){}
+          if (cl > RMAX) { rec.bodyTruncated = true; }
+          else {
+            var cbody = res.clone().body;
+            if (cbody && cbody.getReader) {
+              var rdr = cbody.getReader(), dec = new TextDecoder(), acc = '';
+              (function pump(){
+                rdr.read().then(function(x){
+                  if (!x.done && acc.length < BCAP) { try { acc += dec.decode(x.value, {stream:true}); } catch(e){} return pump(); }
+                  try { rdr.cancel(); } catch(e){}
+                  rec.body = acc.length > BCAP ? acc.slice(0,BCAP) : acc;
+                  rec.bodyTruncated = acc.length > BCAP || !x.done;
+                }, function(){});
+              })();
+            } else {
+              // very old runtime with no stream reader — fall back but still cap the store.
+              res.clone().text().then(function(b){ try { rec.body = b.length > BCAP ? b.slice(0,BCAP) : b; rec.bodyTruncated = b.length > BCAP; } catch(e){} }, function(){});
+            }
+          }
+        } catch(e){}
+        return res;
+      }, function(err){ rec.status = -1; throw err; });
     };
   }
   try {
     var oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
     XMLHttpRequest.prototype.open = function(m, u){ try { this.__silver = { url: String(u), method: String(m||'GET').toUpperCase(), status: 0, resourceType: 'xhr', source: 'fetch', ts: Date.now() }; } catch(e){} return oo.apply(this, arguments); };
-    XMLHttpRequest.prototype.send = function(){ var self=this, rec=this.__silver; if (rec){ cap(C.net, rec); try { this.addEventListener('loadend', function(){ try { rec.status = self.status; } catch(e){} }); } catch(e){} } return os.apply(this, arguments); };
+    XMLHttpRequest.prototype.send = function(){ var self=this, rec=this.__silver; if (rec){ cap(C.net, rec); try { this.addEventListener('loadend', function(){ try { rec.status = self.status; } catch(e){} try { rec.respHeaders = self.getAllResponseHeaders(); } catch(e){} try { var rt = self.responseType; if (rt==='' || rt==='text') { var t = self.responseText||''; rec.body = t.length > BCAP ? t.slice(0,BCAP) : t; rec.bodyTruncated = t.length > BCAP; } } catch(e){} }); } catch(e){} } return os.apply(this, arguments); };
   } catch(e){}
   try {
     var po = new PerformanceObserver(function(list){
@@ -198,6 +241,14 @@ export type RouteRule = {
   abort: boolean
   /** Fulfill matching requests with this body (mutually exclusive with abort). */
   body?: string
+  /** Item #9: fulfill with this HTTP status (else 200). Lets a mock simulate 404/500. */
+  status?: number
+  /** Item #9: explicit fulfill Content-Type (else guessed from the body shape). */
+  contentType?: string
+  /** Item #9: extra response headers to set on the fulfilled mock. */
+  headers?: Record<string, string>
+  /** Item #9: response header names to strip from the fulfilled mock. */
+  removeHeaders?: string[]
   /** Only intercept these Playwright resource types (else all types match). */
   resourceTypes?: string[]
 }
@@ -267,8 +318,37 @@ export async function applyRoutes(page: Page, session: string): Promise<void> {
             await route.abort()
             return
           }
-          if (r.body !== undefined) {
-            await route.fulfill({ body: r.body, contentType: guessContentType(r.body) })
+          // Item #9: fulfill with a full response shape — body + status + explicit or
+          // guessed Content-Type + extra/removed headers. A rule with headers/status
+          // but no body still fulfills (an empty-body mock of a 204/302/etc.). Absent
+          // any fulfill signal → continue the real (still egress-guarded) request.
+          const hasFulfill =
+            r.body !== undefined ||
+            r.status !== undefined ||
+            r.headers !== undefined ||
+            (r.removeHeaders !== undefined && r.removeHeaders.length > 0)
+          if (hasFulfill) {
+            const body = r.body ?? ''
+            const headers: Record<string, string> = { ...(r.headers ?? {}) }
+            for (const h of r.removeHeaders ?? []) {
+              // case-insensitive strip of any header the rule wants removed.
+              const lower = h.toLowerCase()
+              for (const k of Object.keys(headers)) {
+                if (k.toLowerCase() === lower) delete headers[k]
+              }
+            }
+            const fulfill: {
+              body: string
+              status?: number
+              contentType?: string
+              headers?: Record<string, string>
+            } = { body }
+            if (r.status !== undefined) fulfill.status = r.status
+            // Explicit contentType wins; else guess only when a body is present.
+            if (r.contentType !== undefined) fulfill.contentType = r.contentType
+            else if (r.body !== undefined) fulfill.contentType = guessContentType(r.body)
+            if (Object.keys(headers).length > 0) fulfill.headers = headers
+            await route.fulfill(fulfill)
             return
           }
           await route.continue()

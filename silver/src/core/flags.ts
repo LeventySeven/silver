@@ -82,6 +82,10 @@ export type ParsedFlags = {
   instruction?: string
   ids?: string
   text?: string
+  /** `wait --text-gone <s>` (item #7): wait until the text DISAPPEARS (getByText →
+   * state:hidden). The read-only, keyless complement of `wait --text` (which waits
+   * for appearance) — no `--fn`/`--enable-actions` needed to await a spinner vanish. */
+  textGone?: string
   load?: string
   /**
    * `wait --ready` (S5): dual-quiet page-ready wait — resolve when the page is
@@ -147,10 +151,35 @@ export type ParsedFlags = {
   method?: string
   /** `network requests --status <code>`. */
   status?: string
+  /** `console --level <log|info|warn|error|debug>` (item #16): keep only messages at
+   * this level (token-lean selection at the source — drop debug/info noise). */
+  level?: string
+  /** `dialog accept --prompt-text <t>` (item #17): the text a pre-armed `accept`
+   * feeds a `prompt()` before accepting. */
+  promptText?: string
+  /** `screenshot --quality <0-100>` (item #5): JPEG quality (ignored for PNG). */
+  quality?: number
   /** `network route --body <json>` fulfillment body. */
   body?: string
+  /** `network route --content-type <ct>` (item #9): explicit fulfill Content-Type
+   * (else guessed from the body shape). */
+  contentType?: string
+  /** `network route --headers '<json>'` (item #9): extra response headers to set on
+   * a fulfilled mock (JSON object, string→string). */
+  headers?: string
+  /** `network route --remove-headers <csv>` (item #9): response header names to strip. */
+  removeHeaders: string[]
+  /** `network request <i> --part <request|response|body>` (item #11): which slice of a
+   * single captured request to return (default: a compact summary of all). */
+  part?: string
   /** `network route --resource-types <csv>`. */
   resourceTypes: string[]
+  /** `click|dblclick --button <left|right|middle>` (item #1): mouse button for a
+   * grounded click. Default left when absent. */
+  button?: string
+  /** `click|dblclick --modifiers <Shift,Control,Alt,Meta>` (item #1): modifier
+   * keys held during a grounded click (ctrl/cmd-click, shift-select). CSV. */
+  modifiers: string[]
   /** `network route --abort`. */
   abort: boolean
   /** `network requests|console|errors --clear`. */
@@ -213,6 +242,7 @@ const VALUE_FLAGS: Record<string, keyof ParsedFlags> = {
   instruction: 'instruction',
   ids: 'ids',
   text: 'text',
+  'text-gone': 'textGone',
   fn: 'fn',
   name: 'name',
   index: 'index',
@@ -232,7 +262,18 @@ const VALUE_FLAGS: Record<string, keyof ParsedFlags> = {
   type: 'type',
   method: 'method',
   status: 'status',
+  level: 'level',
+  'prompt-text': 'promptText',
   body: 'body',
+  // item #1: mouse button for a grounded click/dblclick.
+  button: 'button',
+  // item #5: JPEG quality for screenshot.
+  quality: 'quality',
+  // item #9: mock response Content-Type + extra headers (JSON).
+  'content-type': 'contentType',
+  headers: 'headers',
+  // item #11: which slice of a single captured request to return.
+  part: 'part',
   // E3 / S5 / O1 / K1 wiring value flags.
   'action-policy': 'actionPolicy',
   'result-file': 'resultFile',
@@ -240,11 +281,18 @@ const VALUE_FLAGS: Record<string, keyof ParsedFlags> = {
 }
 
 /** CSV value flags → string[]. */
-const CSV_FLAGS: Record<string, 'allowedDomains' | 'confirmActions' | 'resourceTypes'> = {
+const CSV_FLAGS: Record<
+  string,
+  'allowedDomains' | 'confirmActions' | 'resourceTypes' | 'modifiers' | 'removeHeaders'
+> = {
   'allowed-domains': 'allowedDomains',
   'confirm-actions': 'confirmActions',
   'resource-types': 'resourceTypes',
   'resource-type': 'resourceTypes',
+  // item #1: modifier keys held during a grounded click.
+  modifiers: 'modifiers',
+  // item #9: response header names to strip from a fulfilled mock.
+  'remove-headers': 'removeHeaders',
 }
 
 /** Boolean flags. */
@@ -310,7 +358,13 @@ const SHORT_VALUE: Record<string, 'depth' | 'selector'> = {
   s: 'selector',
 }
 
-const NUMERIC_FIELDS = new Set<keyof ParsedFlags>(['maxOutput', 'timeout', 'depth', 'index'])
+const NUMERIC_FIELDS = new Set<keyof ParsedFlags>([
+  'maxOutput',
+  'timeout',
+  'depth',
+  'index',
+  'quality',
+])
 
 function defaults(): ParsedFlags {
   return {
@@ -343,6 +397,8 @@ function defaults(): ParsedFlags {
     secrets: [],
     taintGuard: false,
     resourceTypes: [],
+    modifiers: [],
+    removeHeaders: [],
     abort: false,
     clear: false,
     bail: false,

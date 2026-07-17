@@ -28,7 +28,9 @@ export type WaitSpec =
   | { ms: number }
   | { selector: string; state?: WaitState; timeout?: number }
   | { ref: string; refmap: RefMap; cdp: CDPSession; state?: WaitState; timeout?: number }
-  | { text: string; timeout?: number }
+  // `state` defaults to 'visible' (wait for the text to APPEAR); item #7 threads
+  // 'hidden' for `wait --text-gone` (wait for the text to DISAPPEAR).
+  | { text: string; state?: WaitState; timeout?: number }
   | { url: string; timeout?: number }
   | { load: 'load' | 'domcontentloaded' | 'networkidle'; timeout?: number }
   // S5: dual-quiet page-ready — resolves via waitForReady (DOM + network quiet).
@@ -81,7 +83,11 @@ export async function waitFor(page: Page, spec: WaitSpec): Promise<void | ReadyR
     return
   }
   if ('text' in spec) {
-    await page.getByText(spec.text).first().waitFor({ state: 'visible', timeout: spec.timeout })
+    // Default 'visible' (appear); item #7 passes 'hidden' for `--text-gone`.
+    await page
+      .getByText(spec.text)
+      .first()
+      .waitFor({ state: spec.state ?? 'visible', timeout: spec.timeout })
     return
   }
   if ('url' in spec) {

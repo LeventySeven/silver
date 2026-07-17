@@ -92,6 +92,13 @@ const READ_ONLY_VERBS: readonly string[] = [
   'errors',
   'clipboard',
   'pdf',
+  // Item #4: `find` LOCATES an element (read: match count + first text) — a read,
+  // not a mutation — so bare `find <kind> <value>` is read-only-dispatchable,
+  // aligning it with the read-only-default soul (a read-only agent can locate).
+  // The ACTING form `find <kind> <value> <subaction>` gates `--enable-actions`
+  // INSIDE handleFind (the registry gate is verb-level and cannot split by
+  // subcommand — same pattern as `network route` / `storage set` / `wait --fn`).
+  'find',
 ]
 
 /**
@@ -119,7 +126,6 @@ const ACTOR_VERBS: readonly string[] = [
   'hover',
   'focus',
   'eval',
-  'find',
   'set',
   'mouse',
   'dialog',

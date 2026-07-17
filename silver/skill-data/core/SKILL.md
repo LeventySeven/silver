@@ -114,8 +114,10 @@ or stop; don't retry.
 | `snapshot -u` / `--urls` | Emit inline `url=<href>` on link nodes (OFF by default — token-lean; pass it only when you need raw hrefs). |
 | `read [url]` | No URL: plain-text body (innerText) of the live page. With a URL: fetches it (redirect-guarded, every hop re-checked) and returns landmark-skipped **Markdown** (`#` headings, `-` lists); add `--links` for inline `[text](url)` (relative hrefs resolved). |
 | `screenshot [path]` | PNG: base64 in `data.image`, or `{saved:true}` if a (contained) path is given. |
+| `screenshot @ref [path]` | **Element-scoped** capture — just that grounded element's pixels (a chart, a captcha tile, one card). Rung 5 of the perception ladder; YOU read the pixels (keyless). |
 | `screenshot --full [path]` | Full-page capture (default is the 1280×900 viewport). |
-| `console [--clear]` | Captured console messages (page-derived, neutralized). |
+| `screenshot --type jpeg [--quality <0-100>]` | Byte-lean JPEG instead of PNG — shrinks the base64 you hand a vision model (PNG ignores `--quality`). |
+| `console [--clear] [--level <log\|info\|warn\|error\|debug>]` | Captured console messages (page-derived, neutralized). `--level` keeps only that level (token-lean selection at the source). |
 | `errors [--clear]` | Captured page errors (uncaught exceptions). |
 
 ### Query (read-only)
@@ -134,10 +136,11 @@ or stop; don't retry.
 | `wait <ms>` | Sleep N milliseconds (`wait 500`). |
 | `wait <css>` | Wait for a CSS selector to appear. |
 | `wait --text "<s>"` / `wait --url "<s>"` | Wait for page text / URL to contain a string. |
+| `wait --text-gone "<s>"` | Wait until text **disappears** (a spinner/toast/modal vanishing). Read-only + keyless — no `--fn`/`--enable-actions` needed. |
 | `wait --load [networkidle]` | Wait for a load state (`load` default, or `networkidle`/`domcontentloaded`). |
 | `wait --ready` | **Dual-quiet page-ready** — waits for DOM-quiet (~500ms no mutations) **and** network-quiet, with soft/hard caps. Prefer over `--load networkidle` on SPAs with open sockets/long-polls where `networkidle` never fires. The most robust settle signal. |
 | `wait --fn "<js>"` | Predicate JS run **in the page** — **needs `--enable-actions`** (arbitrary in-page code). |
-| `expect <target> <matcher> [value]` | **Verify the goal, keyless.** Read-only assertion: `success:true` **only** if it holds, else a failure carrying `{matched, matcher, expected, observed}`. Element matchers `visible`/`hidden`/`enabled`/`checked`/`text-contains`/`value-equals`/`count`; page matchers `url-matches`/`title-contains`. Collapses "did it actually work?" into one call. |
+| `expect <target> <matcher> [value]` | **Verify the goal, keyless.** Read-only assertion: `success:true` **only** if it holds, else a failure carrying `{matched, matcher, expected, observed}`. Element matchers `visible`/`hidden`/`enabled`/`checked`/`text-contains`/`value-equals`/`count`; page matchers `url-matches`/`title-contains`/`text-visible "<s>"` (real visibility, page-wide). Collapses "did it actually work?" into one call. |
 
 ### Interaction (every one needs `--enable-actions`)
 
@@ -146,7 +149,7 @@ verbs exist only for canvas/WebGL/custom-widget escape hatches where no accessib
 
 | Command | What it does |
 |---|---|
-| `click @ref` | Click. `dblclick` / `hover` / `focus` are siblings. |
+| `click @ref` | Click. `dblclick` / `hover` / `focus` are siblings. Add `--button <right\|middle>` (context menu / middle-click) and `--modifiers <Shift,Control,Alt,Meta>` (Ctrl/Cmd-click, Shift-select) to `click`/`dblclick`. |
 | `fill @ref "<text>"` | Clear + set value, then **read back to verify** — because `type` can silently drop characters on a slow/validated field; `fill` clears, sets, and re-reads so a partial write fails loud instead of looking done. Prefer over `type`. |
 | `type @ref "<text>"` | Type without clearing (key-sequence). |
 | `press @ref "<key>"` | Key press on a ref (e.g. `"Enter"`, `"Control+A"`). |
@@ -157,17 +160,20 @@ verbs exist only for canvas/WebGL/custom-widget escape hatches where no accessib
 | `upload @ref <file…>` | Set file inputs (each file must be a **contained** path). |
 | `download <@ref\|selector> <path>` | Click the ref/selector, capture the download, save to a **contained** path (`{saved:true}`; the path is never echoed). `download --wait [path]` awaits the *next* download without a click. |
 | `drag @src @dst` | Drag one ref onto another. |
-| `find <kind> <value> [action] [text]` | Semantic locate, no snapshot needed. `kind` ∈ `role,text,label,placeholder,testid,first,last,nth`; flags `--name` (role name), `--index` (nth). Optionally act in the same call. |
+| `find <kind> <value> [action] [text]` | Semantic locate, no snapshot needed. `kind` ∈ `role,text,label,placeholder,testid,first,last,nth`; flags `--name` (role name), `--index` (nth). A `/pattern/` value matches by **regex** (text/label/placeholder/`--name`). Bare `find` (locate only) is **read-only** — no grant; the acting form (`… click`/`… fill`) needs `--enable-actions`. |
 | `mouse move\|click <x> <y> [button]` · `mouse down\|up [button]` · `mouse wheel <dy> [dx]` | Raw pointer input at page coordinates. |
 | `keyboard type <text>` · `keyboard press\|down\|up <key>` | Raw keyboard input (typed length reported, never the text). |
 | `keydown <key>` · `keyup <key>` | Hold / release a single key on the focused element (raw, page-level). |
 | `eval "<js>"` (or `eval --stdin`) | Run **your own** JS in the page / active frame. Result neutralized + capped. Keyless (your code, not a model). |
+| `eval @ref "el => …"` | **Element-scoped** eval — the grounded `@ref` element is passed to your fn (`el`), so the code runs on the exact node the ref identified, not a re-query. The *grounded, safe* substitute for running raw driver code (which Silver never exposes). |
 
-`find` is registry-classified as an actor verb, so **it needs `--enable-actions` even just to
-locate**. Examples:
+Bare `find` (locate only) is **read-only** — no grant needed. The **acting** form (a subaction
+like `click`/`fill`) gates `--enable-actions` in-handler. A `/pattern/` value matches by regex.
+Examples:
 ```
-silver find role button --name "Sign in" --enable-actions           # locate: match count + text
-silver find role textbox --name "username" fill "alice" --enable-actions   # locate + act
+silver find role button --name "Sign in"                            # locate (read-only): match count + text
+silver find text "/Add to (cart|bag)/"                              # regex locate (read-only)
+silver find role textbox --name "username" fill "alice" --enable-actions   # locate + act (needs the grant)
 silver find text "Add to cart" click --enable-actions
 ```
 
@@ -189,23 +195,27 @@ beats `'the price'`); full coaching in `reference/extract.md`.
 
 | Command | What it does |
 |---|---|
-| `network requests [--filter <substr>] [--type <rt>] [--method <M>] [--status <code>] [--clear]` | Captured requests (ring buffer, capped at 200). |
-| `network route <url-glob> [--abort] [--body <json>] [--resource-types <csv>]` | Intercept/mock/abort matching requests. **Actor sub-op.** Persists across commands. |
+| `network requests [--filter <substr>] [--type <rt>] [--method <M>] [--status <code>] [--clear]` | Captured requests (ring buffer, capped at 200). Each carries an `index` for `network request`. |
+| `network request <index> [--part request\|response\|body]` | ONE captured request's detail by `index`. `--part body` returns the **bounded, redacted** response body (fetch/XHR; fails loud if it hit the cap — never silent truncation). |
+| `network route <url-glob> [--abort] [--body <json>] [--status <code>] [--content-type <ct>] [--headers <json>] [--remove-headers <csv>] [--resource-types <csv>]` | Intercept/mock/abort matching requests — now with a custom **status** (mock a 404/500), Content-Type, and response header add/remove. **Actor sub-op.** Persists across commands. |
+| `network routes` | List the active route rules. Read-only. |
 | `network unroute [url]` | Remove one route rule (or all). **Actor sub-op.** |
 | `network har start` · `network har stop [path]` | Record → export a HAR (to stdout or a contained file). |
 | `pdf [path]` | Render the current page to PDF. Base64 or a contained file. |
 | `frame <@ref\|selector\|name>` · `frame main` | Point subsequent selector/`eval` commands at an iframe (or reset). Ref-based verbs are already frame-aware. |
 | `storage local\|session [get] [<key>]` | Read localStorage/sessionStorage (one key, or the whole store). |
-| `storage local\|session set <key> <value>` · `… clear` | Write/clear storage. **Actor sub-op.** |
+| `storage local\|session set <key> <value>` · `… delete <key>` · `… clear` | Write / remove one key / clear storage. **Actor sub-op.** |
 | `clipboard read` | Read the async clipboard (neutralized). |
 | `clipboard write <text>` (or `--stdin`) | Write the clipboard. **Actor sub-op.** |
-| `dialog status` | The last auto-accepted `alert`/`confirm`/`prompt`. Registry-classified actor, so needs `--enable-actions`. |
+| `dialog status` · `dialog accept [--prompt-text <t>]` · `dialog dismiss` · `dialog reset` | Native dialogs auto-accept by **default**; **pre-arm** the next one — `dismiss` genuinely Cancels/rejects, `accept --prompt-text` feeds a `prompt()`. `status` shows the last dialog + the armed disposition. Actor verb (needs `--enable-actions`). |
 | `set viewport <w> <h>` · `set offline <t\|f>` · `set color-scheme <dark\|light\|no-preference>` · `set geolocation <lat> <lng>` · `set timezone <tz>` · `set locale <loc>` | Mutate emulation state. **Actor verb.** Persisted + re-applied on every reconnect (via the emulation sidecar). |
 | `set headers '{"X-Api-Key":"…","Authorization":"Bearer …"}'` | Persistent extra HTTP headers (`context.setExtraHTTPHeaders`) — reach header-gated targets (Bearer / X-Api-Key / `x-vercel-protection-bypass` / ngrok skip-warning). JSON object, string→string; `{}` clears. **Actor verb.** Pass a secret as `<secret>NAME</secret>` (secure: resolved at apply-time from `--secret NAME=…`/`SILVER_SECRET_NAME`, the token REFERENCE is what lands on disk — never the secret; the envelope masks sensitive values). A domain-scoped secret applies once the destination host is known (a reload after the first `open`). |
 | `set credentials <user> <pass>` · `set auth <user> <pass>` · `set credentials ""` (clear) | HTTP **Basic Auth** (`context.setHTTPCredentials`) — unlock staging/preview behind native .htpasswd (a browser 401 dialog cookies/route can't answer). **Actor verb.** The password may be `<secret>NAME</secret>` (resolved at auth-time; the reference, not the secret, is persisted; the envelope shows `password: [redacted]`). A no-creds `open` of a Basic-Auth wall returns `auth_required`. |
 
-Dialogs are **auto-accepted** the instant they appear (a `prompt` returns its default text), so
-a page's `confirm("delete?")` guard resolves instead of hanging; `dialog status` surfaces it.
+Dialogs are **auto-accepted** by default the instant they appear (a `prompt` returns its default
+text), so a page's `confirm("delete?")` guard resolves instead of hanging. To drive a Cancel path,
+pre-arm `dialog dismiss` before the action that triggers it (and `dialog accept`/`dialog reset` to
+go back); `dialog status` surfaces the last dialog + the armed disposition.
 
 ### Sessions & parallelism
 
@@ -280,8 +290,10 @@ independent reads.** Touching one shared account is not "independent."
 
 | Command | What it does |
 |---|---|
-| `state save <path>` · `state load <path>` | Save/load Playwright storage-state (cookies) to/from a **contained** file. |
-| `cookies set --curl <file> [--url <origin>]` | Load cookies from a JSON array, a `Cookie:` header, or a pasted curl command. |
+| `state save <path>` · `state load <path>` | Save/load storage-state (cookies **and** per-origin localStorage) to/from a **contained** file. `load` replays localStorage on the next navigation to each saved origin — so a session whose auth lives in localStorage actually resumes. |
+| `cookies list [--url <origin>]` · `cookies get <name>` | Read the cookie jar. **Values are redacted** (`[redacted]` + length) — cookie values are session tokens; drive via the existing session, don't surface raw tokens. |
+| `cookies set --curl <file> [--url <origin>]` | Load cookies from a JSON array, a `Cookie:` header, or a pasted curl command (structured import; **actor**). |
+| `cookies delete <name>` · `cookies clear` | Drop one cookie (test logout) or wipe the jar. **Actor.** |
 | `confirm <id>` · `deny <id>` | Resolve a `--two-phase-confirm` pending action by id: `confirm` executes it (needs `--enable-actions`; one-shot), `deny` aborts it (idempotent). See §3. |
 | `version` · `doctor` | `{name, version}` / install check `{playwright, chromium, uab_writable}`. |
 | `skill [--full]` | This guide (compact head, or the whole doc). |
