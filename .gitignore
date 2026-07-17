@@ -17,9 +17,17 @@ playwright-report/
 .agent-browser-state/
 profiles/
 
-# Local-only resources + scaffolding (NOT in the public repo)
-reference/
-research/
-rust-oracle/
-plan/
-docs/
+# Local-only resources + scaffolding (NOT in the public repo).
+# Anchored to the repo ROOT with a leading `/` — a bare `reference/` matches at
+# ANY depth and was wrongly hiding the skill's OWN docs (silver/skill-data/core/
+# reference/), shipping an incomplete skill.
+/reference/
+/research/
+/rust-oracle/
+/plan/
+/docs/
+
+# Belt: the served skill (SKILL.md links to reference/ + commands/) MUST ship even
+# if a future ignore pattern is added — always keep the whole skill-data tree.
+!silver/skill-data/
+!silver/skill-data/**
