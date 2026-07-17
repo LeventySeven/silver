@@ -125,7 +125,7 @@ or stop; don't retry.
 | `get title` / `get url` | Page title / current URL. |
 | `get count <css>` | Number of matches for a selector (scoped to the active frame). |
 | `get text [@ref]` | Element text, or the whole body — neutralized + capped. |
-| `get value @ref` | Input value — **passwords/cards render `[redacted]`**. |
+| `get value @ref` | Input value; also reads **contenteditable / rich-text** nodes (innerText fallback, symmetric with `fill`). **Passwords/cards render `[redacted]`**. |
 | `get attr @ref <name>` | One attribute — redacted + neutralized + capped. |
 | `get html @ref` | The grounded element's **outerHTML** — neutralized + capped. The code escape hatch for a *nameless/ambiguous* ref (custom widget, icon button) whose role+name isn't enough. Element-scoped, **not** a whole-page dump. |
 | `get box @ref` | The grounded element's bounding box `{x, y, width, height}`, computed **on demand** (never on the snapshot). Pair with `click --at`: center = `x+width/2, y+height/2`. For canvas/coordinate targets. |
@@ -135,6 +135,7 @@ or stop; don't retry.
 | `wait <css>` | Wait for a CSS selector to appear. |
 | `wait --text "<s>"` / `wait --url "<s>"` | Wait for page text / URL to contain a string. |
 | `wait --load [networkidle]` | Wait for a load state (`load` default, or `networkidle`/`domcontentloaded`). |
+| `wait --ready` | **Dual-quiet page-ready** — waits for DOM-quiet (~500ms no mutations) **and** network-quiet, with soft/hard caps. Prefer over `--load networkidle` on SPAs with open sockets/long-polls where `networkidle` never fires. The most robust settle signal. |
 | `wait --fn "<js>"` | Predicate JS run **in the page** — **needs `--enable-actions`** (arbitrary in-page code). |
 | `expect <target> <matcher> [value]` | **Verify the goal, keyless.** Read-only assertion: `success:true` **only** if it holds, else a failure carrying `{matched, matcher, expected, observed}`. Element matchers `visible`/`hidden`/`enabled`/`checked`/`text-contains`/`value-equals`/`count`; page matchers `url-matches`/`title-contains`. Collapses "did it actually work?" into one call. |
 
@@ -149,7 +150,7 @@ verbs exist only for canvas/WebGL/custom-widget escape hatches where no accessib
 | `fill @ref "<text>"` | Clear + set value, then **read back to verify** — because `type` can silently drop characters on a slow/validated field; `fill` clears, sets, and re-reads so a partial write fails loud instead of looking done. Prefer over `type`. |
 | `type @ref "<text>"` | Type without clearing (key-sequence). |
 | `press @ref "<key>"` | Key press on a ref (e.g. `"Enter"`, `"Control+A"`). |
-| `select @ref <value…>` | Choose `<option>`s of a **native** `<select>` (by value or label). |
+| `select @ref <value…>` | Choose `<option>`s of a **native** `<select>` (by value or label). Fast-fails in <1s with `no_matching_option` / `wrong_element_type` (non-retryable — re-snapshot for the real option list; do **not** raise `--timeout`). |
 | `check @ref` / `uncheck @ref` | Set checkbox/radio state. |
 | `scroll @ref` | Scroll a ref into view. Add `--by <dx> <dy>` to instead scroll the ref's **own** scroll box by a delta (chat pane / modal body / virtualized list; negatives scroll up/left). |
 | `scrollintoview @ref` | Scroll a grounded ref into view (alias `scrollinto`). |

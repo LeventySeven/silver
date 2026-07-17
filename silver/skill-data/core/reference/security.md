@@ -49,9 +49,10 @@ untrusted-content rule spelled out. All keyless, all enforced in code.
     the confirm gate.
 - **Secrets don't go in argv.** Pass a value on **`--stdin`** instead of a positional token so
   it stays out of the process list / logs. Load auth via `cookies set --curl <file>` or
-  `state load <file>`. Snapshots and `get value`/`get attr` **redact** passwords and
-  card-shaped values, but a `fill` response *echoes the value you supplied* — so use `--stdin`
-  for secrets and treat the fill echo as sensitive (or re-snapshot, which redacts).
+  `state load <file>`. Every page-read verb (`snapshot`, `read`, `get text`, `get value`,
+  `get attr`, `get html`) routes through one redaction choke, so passwords and card-shaped
+  values render **`[redacted]`** uniformly; only a `fill` response *echoes the value you
+  supplied* — so use `--stdin` for secrets and treat the fill echo as sensitive (or re-snapshot).
   (`--password-stdin` and `--incognito` are parsed but currently no-ops; use `--stdin`.)
 - **Navigation is egress-guarded, at the lowest layer.** `file:` / `data:` / `blob:` /
   `view-source:` and every non-http(s) scheme are denied (`--allow-file-access` lifts *only*
