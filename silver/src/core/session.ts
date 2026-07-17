@@ -19,6 +19,7 @@ import type { Browser, BrowserContext, Page } from 'playwright'
 import type { RefMap } from '../perception/refmap.js'
 import { decodeStateBuffer, encryptJson, isStateEncryptionEnabled } from './state-crypto.js'
 import {
+  assertNavigableResolved,
   containedFilename,
   createSubresourceEgressGuard,
   type EgressOptions,
@@ -155,6 +156,28 @@ export function currentFetchEgressPolicy(): EgressOptions {
   return fetchEgressPolicy
 }
 
+// ---------------------------------------------------------------------------
+// HTTP Basic-Auth resolver (ADD #2 — `set credentials`/`set auth`). The Fetch
+// egress guard owns the CDP `Fetch` domain, so Playwright's own
+// `context.setHTTPCredentials` cannot answer a 401 Basic challenge on a
+// CDP-attached context (two Fetch owners conflict → net::ERR_INVALID_AUTH_CREDENTIALS).
+// Instead the guard itself answers `Fetch.authRequired` using credentials from
+// this process-wide resolver, which handlers.ts installs (per command, from the
+// persisted+token-resolved emulation creds) BEFORE the guard is armed on connect.
+// Returns the resolved {username,password} for a challenging request URL, or null
+// when no credentials apply (then the guard lets the challenge proceed unanswered,
+// preserving the honest 401 dead-end). Keyless: pure lookup, no model/network.
+// ---------------------------------------------------------------------------
+
+export type BasicAuthResolver = (url: string) => { username: string; password: string } | null
+let basicAuthResolver: BasicAuthResolver | null = null
+
+/** Install (or clear with `null`) the per-command Basic-Auth resolver the Fetch
+ * egress guard consults when a 401 auth challenge fires. */
+export function setBasicAuthResolver(fn: BasicAuthResolver | null): void {
+  basicAuthResolver = fn
+}
+
 /**
  * CDP `Fetch.enable` interception patterns for the S2 subresource egress guard:
  * one wildcard-URL pattern per interceptable SUBRESOURCE `resourceType`. `Document`
@@ -211,6 +234,15 @@ export async function enableFetchEgressGuard(
   // same host resolves that host at most once. Shared across every page armed by
   // this guard (host→verdict is deterministic under a fixed policy).
   const decide = createSubresourceEgressGuard(opts)
+  // ADD #2: when a Basic-Auth resolver is installed for this command, the guard
+  // must ALSO own auth handling (`handleAuthRequests`) and intercept the
+  // `Document` request so its 401 challenge routes here — Playwright's
+  // `setHTTPCredentials` can't answer it while the guard owns the Fetch domain.
+  // Captured ONCE per arm() so a mid-flight change can't split a page's state.
+  const authOn = basicAuthResolver !== null
+  const patterns = authOn
+    ? [{ urlPattern: '*', resourceType: 'Document' as const }, ...FETCH_GUARD_PATTERNS]
+    : FETCH_GUARD_PATTERNS
   const arm = async (page: Page): Promise<void> => {
     let cdp: import('playwright').CDPSession
     try {
@@ -222,6 +254,14 @@ export async function enableFetchEgressGuard(
       const requestId = evt.requestId
       const url = evt.request?.url ?? ''
       const resourceType = String(evt.resourceType ?? '')
+      // A `Document` request is only paused when auth handling is on. It was
+      // already vetted by `assertNavigableResolved` at the nav layer, so continue
+      // it unconditionally (do NOT re-run the egress decider on a navigation) and
+      // let its 401, if any, surface as a `Fetch.authRequired` below.
+      if (resourceType === 'Document') {
+        void cdp.send('Fetch.continueRequest', { requestId }).catch(() => {})
+        return
+      }
       // The decision now RESOLVES DNS (async). Hold the paused request until the
       // verdict lands, then fail-closed block or continue. `decide` never throws
       // (it blocks on any resolution error), so this listener cannot reject.
@@ -236,15 +276,47 @@ export async function enableFetchEgressGuard(
         }
       })()
     })
+    if (authOn) {
+      // Answer a 401 Basic/Digest challenge with the resolver's credentials for
+      // THIS request URL (domain-scoped `<secret>` tokens resolve against it). No
+      // credentials → `Default` (let the browser cancel → the honest 401 remains).
+      cdp.on('Fetch.authRequired', (evt) => {
+        const requestId = evt.requestId
+        const url = evt.request?.url ?? ''
+        void (async () => {
+          const creds = basicAuthResolver ? basicAuthResolver(url) : null
+          // SECURITY: never hand Basic-Auth creds to a host the egress guard would
+          // DENY (loopback/link-local/private/metadata, or a DNS-rebind host that
+          // resolves to one). A 401 redirect to an internal/metadata endpoint must
+          // NOT steal the session's credentials — this closes the SSRF-style
+          // credential-theft even for a literal/context-wide password. (A
+          // domain-scoped `<secret>NAME@domain</secret>` token is ADDITIONALLY
+          // refused by the resolver when the challenging host does not match.)
+          const allowed = creds ? (await assertNavigableResolved(url, opts)).ok : false
+          const authChallengeResponse =
+            creds && allowed
+              ? {
+                  response: 'ProvideCredentials' as const,
+                  username: creds.username,
+                  password: creds.password,
+                }
+              : { response: 'Default' as const }
+          void cdp
+            .send('Fetch.continueWithAuth', { requestId, authChallengeResponse })
+            .catch(() => {})
+        })()
+      })
+    }
     try {
-      // Intercept every SUBRESOURCE type but deliberately NOT `Document`:
-      // navigations (and the download a `download`-attribute link triggers, which
-      // Chromium classifies as a `Document` request) are the nav path's job and are
-      // vetted by `assertNavigableResolved` before goto. Pausing a Document request
-      // in the Fetch domain and continuing it drops the page-initiated download
-      // (E4) on the floor — so navigations are left entirely native here while the
-      // exfil vectors (`fetch()`/`<img>`/XHR/beacon/…) stay guarded.
-      await cdp.send('Fetch.enable', { patterns: FETCH_GUARD_PATTERNS })
+      // Intercept every SUBRESOURCE type but deliberately NOT `Document` (unless
+      // auth handling is on, above): navigations (and the download a
+      // `download`-attribute link triggers, which Chromium classifies as a
+      // `Document` request) are the nav path's job and are vetted by
+      // `assertNavigableResolved` before goto. Pausing a Document request in the
+      // Fetch domain and continuing it drops the page-initiated download (E4) on
+      // the floor — so navigations are left entirely native here (no Basic Auth)
+      // while the exfil vectors (`fetch()`/`<img>`/XHR/beacon/…) stay guarded.
+      await cdp.send('Fetch.enable', { patterns, handleAuthRequests: authOn })
     } catch {
       /* target vanished before enable landed — nothing to guard */
     }

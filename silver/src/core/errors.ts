@@ -102,7 +102,7 @@ export const ERRORS = {
   auth_required: {
     retryableByHost: false,
     message:
-      'a login form was detected — if you have credentials, fill the fields and submit; if you already have a saved session, `state load` first',
+      'a login form or HTTP auth challenge was detected — for a login form, fill the fields and submit; for native HTTP Basic Auth, set credentials via `set credentials <user> <pass>`; if you already have a saved session, `state load` first',
   },
   not_permitted: {
     retryableByHost: false,
@@ -257,6 +257,15 @@ const PAGE_CRASH_NEEDLES: readonly string[] = [
   'browserContext.newPage: Browser closed'.toLowerCase(),
 ]
 
+/**
+ * Message fragment Chromium emits when a navigation hit an HTTP auth challenge
+ * (401 `WWW-Authenticate: Basic`/Digest) it could not answer — no credentials
+ * configured, or the ones supplied were rejected. Maps to `auth_required` so a
+ * native Basic-Auth wall surfaces as a clear "set credentials" signal rather than
+ * the neutral `engine_error` dead-end. (ADD #2 — `set credentials` unlocks it.)
+ */
+const AUTH_REQUIRED_NEEDLES: readonly string[] = ['net::err_invalid_auth_credentials']
+
 /** Extract a lowercased message string from any thrown value (for needle match). */
 function errorText(err: unknown): string {
   if (typeof err === 'string') return err.toLowerCase()
@@ -279,6 +288,7 @@ function errorText(err: unknown): string {
 export function classifyEngineError(err: unknown): ErrorCode | null {
   const text = errorText(err)
   if (text.length === 0) return null
+  if (AUTH_REQUIRED_NEEDLES.some((n) => text.includes(n))) return 'auth_required'
   if (NAVIGATION_FAILED_NEEDLES.some((n) => text.includes(n))) return 'navigation_failed'
   if (WRONG_TYPE_NEEDLES.some((n) => text.includes(n))) return 'wrong_element_type'
   if (PAGE_CRASH_NEEDLES.some((n) => text.includes(n))) return 'page_crash'

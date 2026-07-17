@@ -45,6 +45,7 @@ import {
   autoHandleDownloads,
   noteAction,
   isRepeating,
+  setBasicAuthResolver,
   type Connection,
   type OpenOptions,
 } from './session.js'
@@ -89,7 +90,7 @@ import { observe } from '../perception/diff.js'
 import { htmlToMarkdown } from '../perception/markdown.js'
 import { assertNavigableResolved, assertContainedPath, isLoopbackLiteralHost } from '../security/egress.js'
 import { neutralize, capOutput } from '../security/injection.js'
-import { redactValue, redactHtml, maskCards } from '../security/redact.js'
+import { redactValue, redactHtml, maskCards, REDACTED } from '../security/redact.js'
 import { requiresConfirm, confirmGateDecision, isDestructivePaidName } from '../security/confirm.js'
 import {
   act,
@@ -115,7 +116,8 @@ import {
 } from '../actuation/pagechange.js'
 import { withRetries } from './retry.js'
 import { loadPolicy, decideAction } from '../security/policy.js'
-import { buildSecretRegistry, type SecretRegistry } from '../security/secret.js'
+import { buildSecretRegistry, hasSecretToken, type SecretRegistry } from '../security/secret.js'
+import { hasTotpToken } from '../security/totp.js'
 import { taintGuardCheck } from '../security/taint.js'
 import { resolveSkills, type Skill } from './skillmatch.js'
 import { waitFor, WaitError, type WaitSpec, type WaitState } from '../actuation/wait.js'
@@ -336,6 +338,23 @@ type EmulationState = {
   viewport?: { width: number; height: number }
   offline?: boolean
   colorScheme?: 'dark' | 'light' | 'no-preference'
+  /**
+   * ADD #1 — persistent extra HTTP headers (`set headers`). Applied via
+   * `context.setExtraHTTPHeaders` on every connect so header-gated targets
+   * (Authorization/X-Api-Key/x-vercel-protection-bypass/ngrok skip-warning) stay
+   * reachable across the per-command reconnect. NO-LEAK: a value is persisted
+   * EXACTLY as the host typed it — a `<secret>NAME</secret>` token lands here as
+   * the REFERENCE, resolved to the real secret only at apply-time (never on disk).
+   */
+  extraHeaders?: Record<string, string>
+  /**
+   * ADD #2 — HTTP Basic Auth credentials (`set credentials` / `set auth`).
+   * Applied via `context.setHTTPCredentials` on every connect so a native
+   * .htpasswd 401 (which cookies/route cannot answer) is unlocked. NO-LEAK: the
+   * password is persisted as-typed — a `<secret>NAME</secret>` token lands here
+   * as the REFERENCE, resolved only at apply-time.
+   */
+  httpCredentials?: { username: string; password: string }
 }
 
 function emulationPath(name: string): string {
@@ -361,12 +380,51 @@ async function patchEmulation(name: string, patch: Partial<EmulationState>): Pro
  * Best-effort per override — a failure to apply one never fails the command.
  * Runs AFTER `connect` set the default viewport, so a persisted viewport wins.
  */
-async function applyEmulation(page: Page, context: BrowserContext, name: string): Promise<void> {
+async function applyEmulation(
+  page: Page,
+  context: BrowserContext,
+  name: string,
+  secrets: SecretRegistry,
+): Promise<void> {
   const emu = await loadEmulation(name)
   if (!emu) return
   if (emu.viewport) await page.setViewportSize(emu.viewport).catch(() => {})
   if (emu.colorScheme) await page.emulateMedia({ colorScheme: emu.colorScheme }).catch(() => {})
   if (emu.offline !== undefined) await context.setOffline(emu.offline).catch(() => {})
+  // ADD #1: re-apply persistent extra HTTP headers. Each value may carry a
+  // `<secret>NAME</secret>`/`<totp>NAME</totp>` token — resolve it AT APPLY TIME
+  // against the live page URL (mirrors actions.ts WRITE path). A token that is
+  // refused/unresolvable this run is SKIPPED (never send the literal token
+  // string) — best-effort, never throws. An empty set clears nothing here (a
+  // fresh connect has no extra headers to begin with).
+  if (emu.extraHeaders && Object.keys(emu.extraHeaders).length > 0) {
+    const url = page.url()
+    const resolved: Record<string, string> = {}
+    for (const [k, v] of Object.entries(emu.extraHeaders)) {
+      const r = resolveWriteValue(v, url, secrets)
+      if (r.refused) continue
+      resolved[k] = r.value
+    }
+    if (Object.keys(resolved).length > 0) {
+      await context.setExtraHTTPHeaders(resolved).catch(() => {})
+    }
+  }
+  // ADD #2: re-apply HTTP Basic Auth credentials. The password may be a
+  // `<secret>` token — resolve at apply-time; a refused token SKIPS the apply
+  // (never sends the literal token as a password).
+  if (emu.httpCredentials) {
+    const r = resolveWriteValue(emu.httpCredentials.password, page.url(), secrets)
+    if (!r.refused) {
+      // Belt: set Playwright's own credentials too. On a CDP-attached context the
+      // S2 Fetch egress guard owns the Fetch domain, so the guard's auth handler
+      // (armed from the same persisted creds — see withConnection →
+      // setBasicAuthResolver) is what actually answers the 401 challenge; this
+      // call is a harmless fallback for a context with no guard armed.
+      await context
+        .setHTTPCredentials({ username: emu.httpCredentials.username, password: r.value })
+        .catch(() => {})
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -458,13 +516,21 @@ async function withConnection<T>(
   fn: (conn: Connection) => Promise<T>,
 ): Promise<T> {
   return withSessionLock(flags.session, async () => {
+    // ADD #2: install the Basic-Auth resolver BEFORE ensureConnected — connect()
+    // arms the Fetch egress guard, and the guard is what answers a 401 challenge
+    // from these credentials (Playwright's setHTTPCredentials cannot, since the
+    // guard owns the Fetch domain on a CDP-attached context). Cleared in finally.
+    await installBasicAuthResolver(flags.session)
     const conn = await ensureConnected(flags.session, openOpts(flags))
     // Every verb operates on the ACTIVE tab, not blindly on pages()[0].
     const page = await resolveActivePage(conn.context, flags.session)
-    // F8: re-apply persisted emulation overrides (viewport/offline/color-scheme).
-    // The per-command reconnect otherwise drops them, so a `set viewport` made in
-    // an earlier command would be silently lost by the next command's connect.
-    await applyEmulation(page, conn.context, flags.session).catch(() => {})
+    // F8: re-apply persisted emulation overrides (viewport/offline/color-scheme/
+    // extra-headers/basic-auth). The per-command reconnect otherwise drops them,
+    // so a `set viewport`/`set headers`/`set credentials` made in an earlier
+    // command would be silently lost by the next command's connect. The secret
+    // registry is threaded in so a `<secret>`-tokened header value / password is
+    // resolved at apply-time (never persisted or echoed raw).
+    await applyEmulation(page, conn.context, flags.session, currentSecrets()).catch(() => {})
     // Register the dialog handler on the active page (fix P0-7): with no
     // listener, Playwright silently CANCELS every alert/confirm/prompt, so a
     // `confirm("delete?")` guard is auto-dismissed while the host still gets ok().
@@ -494,10 +560,35 @@ async function withConnection<T>(
     try {
       return await fn({ ...conn, page })
     } finally {
+      // Clear the per-command Basic-Auth resolver so it never bleeds into an
+      // unrelated later command sharing this process (e.g. a `batch` sub-command).
+      setBasicAuthResolver(null)
       // Flush any in-flight auto-download saves before dropping the transport.
       if (drainDownloads) await drainDownloads().catch(() => {})
       await conn.browser.close().catch(() => {})
     }
+  })
+}
+
+/**
+ * ADD #2: build the Basic-Auth resolver from the session's persisted credentials
+ * (or clear it when none) and install it for the Fetch egress guard to consult.
+ * The password may be a `<secret>NAME</secret>` token — resolved LAZILY against
+ * the actual challenging request URL at auth time (so a domain-scoped secret is
+ * checked against the real target host). A refused token → `null` (the guard
+ * then lets the 401 stand, never sending the literal token as a password).
+ */
+async function installBasicAuthResolver(session: string): Promise<void> {
+  const creds = (await loadEmulation(session).catch(() => null))?.httpCredentials
+  if (!creds) {
+    setBasicAuthResolver(null)
+    return
+  }
+  const reg = currentSecrets()
+  setBasicAuthResolver((url: string) => {
+    const r = resolveWriteValue(creds.password, url, reg)
+    if (r.refused) return null
+    return { username: creds.username, password: r.value }
   })
 }
 
@@ -3543,10 +3634,23 @@ async function handleDownload(flags: ParsedFlags): Promise<Envelope<unknown>> {
 //   set geolocation <lat> <lng>         context.setGeolocation (+ grant permission) (alias: geo)
 //   set timezone <IANA-tz>              CDP Emulation.setTimezoneOverride (alias: tz)
 //   set locale <BCP47>                  CDP Emulation.setLocaleOverride
+//   set headers '<json>'                context.setExtraHTTPHeaders ('{}' clears)
+//   set credentials <user> <pass>       context.setHTTPCredentials (alias: auth; "" clears)
 // Any other subcommand returns a clean typed error listing the valid ones.
+//
+// NO-LEAK (headers/credentials): a header value or the password MAY be a secret.
+// The value is persisted EXACTLY as the host typed it, so a `<secret>NAME</secret>`
+// token lands on disk as the REFERENCE — resolved to the real secret only at
+// apply-time (applyEmulation, via resolveWriteValue), never written or echoed
+// raw. The `set` envelope masks secret-shaped values / the password. Passing the
+// `<secret>NAME</secret>` form is the RECOMMENDED, secure way to supply a
+// token/password (resolved from `--secret NAME=…` / `SILVER_SECRET_NAME`); a raw
+// literal is persisted literally (encrypted at rest by default; SILVER_STATE_KEY
+// / the per-machine key file), which is the host's choice.
 // ---------------------------------------------------------------------------
 
-const SET_SUBCOMMANDS = 'viewport, offline, color-scheme, geolocation, timezone, locale'
+const SET_SUBCOMMANDS =
+  'viewport, offline, color-scheme, geolocation, timezone, locale, headers, credentials'
 
 async function handleSet(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const sub = flags.args[0]
@@ -3643,10 +3747,135 @@ async function handleSet(flags: ParsedFlags): Promise<Envelope<unknown>> {
         }
       })
     }
+    case 'headers': {
+      // ADD #1: parse a JSON object of string→string header pairs. `{}` CLEARS.
+      const raw = flags.args[1]
+      if (raw === undefined) {
+        return badRequest(
+          "usage: silver set headers '{\"X-Api-Key\":\"…\"}'  (JSON object; '{}' clears; " +
+            'use <secret>NAME</secret> for a token resolved at apply-time)',
+        )
+      }
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(raw)
+      } catch {
+        return badRequest('set headers: argument must be a JSON object of string→string pairs')
+      }
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return badRequest('set headers: argument must be a JSON object (not an array/scalar/null)')
+      }
+      // Reject control chars (a CR/LF in a value would smuggle a second header;
+      // a control char in a name is invalid) — charCode check, not a regex escape.
+      const hasCtrl = (s: string): boolean => {
+        for (let i = 0; i < s.length; i++) {
+          const c = s.charCodeAt(i)
+          if (c < 0x20 || c === 0x7f) return true
+        }
+        return false
+      }
+      // A header name must be a valid HTTP token (RFC 7230): no separators/space.
+      const validName = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/
+      const headers: Record<string, string> = {}
+      for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+        if (typeof v !== 'string') {
+          return badRequest('set headers: every header value must be a string')
+        }
+        // Fail the WHOLE set on any bad header — never silently drop one (which
+        // would poison the rest) or persist a control-char value.
+        if (!validName.test(k)) {
+          return badRequest('set headers: invalid header name (must be a valid HTTP token)')
+        }
+        if (hasCtrl(v)) {
+          return badRequest('set headers: header values must not contain control characters')
+        }
+        headers[k] = v
+      }
+      // NO-LEAK: PERSIST the values AS TYPED — a `<secret>NAME</secret>` token
+      // lands as the reference, resolved only at apply-time. `{}` persists an
+      // empty set (applyEmulation then applies nothing → cleared).
+      await patchEmulation(flags.session, { extraHeaders: headers })
+      return withConnection(flags, async ({ context, page }) => {
+        // Apply on THIS connection too (applyEmulation already ran on connect;
+        // this reflects the just-persisted set immediately). Resolve tokens now;
+        // a refused token is skipped (never send the literal token string). An
+        // empty set clears via setExtraHTTPHeaders({}).
+        const resolved: Record<string, string> = {}
+        for (const [k, v] of Object.entries(headers)) {
+          const r = resolveWriteValue(v, page.url(), currentSecrets())
+          if (!r.refused) resolved[k] = r.value
+        }
+        await context.setExtraHTTPHeaders(resolved).catch(() => {})
+        // ENVELOPE masks secret-shaped values: echo NAMES, redact sensitive values.
+        const count = Object.keys(headers).length
+        return ok({ set: 'headers', cleared: count === 0, headers: maskHeaders(headers) })
+      })
+    }
+    case 'credentials':
+    case 'auth': {
+      // ADD #2: HTTP Basic Auth. Clear form: `set credentials ""` (empty user).
+      if (flags.args.length < 2) {
+        return badRequest(
+          'usage: silver set credentials <username> <password>  (pass "" to clear; ' +
+            'use <secret>NAME</secret> as the password for an apply-time token)',
+        )
+      }
+      const username = flags.args[1]
+      // Empty username with no password → CLEAR (documented clear form).
+      if (username === '' && flags.args[2] === undefined) {
+        await patchEmulation(flags.session, { httpCredentials: undefined })
+        return withConnection(flags, async ({ context }) => {
+          // Playwright: setHTTPCredentials(null) clears any pending Basic Auth.
+          await context.setHTTPCredentials(null).catch(() => {})
+          return ok({ set: 'credentials', cleared: true })
+        })
+      }
+      const password = flags.args[2]
+      if (password === undefined) {
+        return badRequest('usage: silver set credentials <username> <password>  (pass "" to clear)')
+      }
+      // NO-LEAK: persist the password AS TYPED (a `<secret>` token lands as the
+      // reference; resolved only at apply-time).
+      await patchEmulation(flags.session, { httpCredentials: { username, password } })
+      return withConnection(flags, async ({ context, page }) => {
+        const r = resolveWriteValue(password, page.url(), currentSecrets())
+        if (!r.refused) {
+          await context.setHTTPCredentials({ username, password: r.value }).catch(() => {})
+        }
+        // ENVELOPE never echoes the password (it may be a secret).
+        return ok({ set: 'credentials', username, password: REDACTED })
+      })
+    }
     default:
       return badRequest(`usage: silver set <${SET_SUBCOMMANDS}> [args…]`)
   }
 }
+
+/**
+ * Mask a header map for the `set headers` ENVELOPE: echo every header NAME, but
+ * replace any value that looks like a credential with `[redacted]`. A value is
+ * treated as sensitive when (a) the header NAME hints auth/key/token/cookie/
+ * bypass/password, (b) the value carries a `<secret>`/`<totp>` token, or (c) the
+ * shared `redactValue` choke (card-shaped / password-hinted) would redact it.
+ * Benign values (e.g. `X-Test: abc`) are echoed so the host can confirm them.
+ */
+function maskHeaders(headers: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(headers)) {
+    const sensitive =
+      SENSITIVE_HEADER_RE.test(k) ||
+      hasSecretToken(v) ||
+      hasTotpToken(v) ||
+      redactValue('', k, v) === REDACTED
+    out[k] = sensitive ? REDACTED : v
+  }
+  return out
+}
+
+/** Header names whose VALUE is treated as a credential and always masked in the
+ * envelope (defense in depth — the value never rides in an outbound envelope). */
+const SENSITIVE_HEADER_RE =
+  /authorization|api[-_]?key|token|secret|cookie|bypass|password|x-vercel-protection-bypass/i
 
 // ---------------------------------------------------------------------------
 // eval <js> | eval --stdin — run host-authored JS in the page (or active frame).

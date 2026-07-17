@@ -1,8 +1,9 @@
 import { describe, it, expect, afterAll, beforeAll } from 'vitest'
 import { createServer, type Server } from 'node:http'
 import { AddressInfo } from 'node:net'
+import * as path from 'node:path'
 import { run } from '../../src/cli.js'
-import { closeSession, loadRefMap } from '../../src/core/session.js'
+import { closeSession, loadRefMap, sessionDir, readSidecarObject } from '../../src/core/session.js'
 import { ERRORS } from '../../src/core/errors.js'
 import type { RefMap } from '../../src/perception/refmap.js'
 
@@ -119,6 +120,29 @@ describe('vercel-parity verbs (real Chromium via the run() entry)', () => {
       if (url.startsWith('/echo-cookie')) {
         res.writeHead(200, { 'content-type': 'text/plain' })
         res.end('COOKIE:' + (req.headers.cookie ?? 'none'))
+        return
+      }
+      // ADD #1: echo the received request headers as the page body (a <pre> so
+      // `get text` surfaces them) — proves `set headers` reached the server.
+      if (url.startsWith('/echo-headers')) {
+        res.writeHead(200, { 'content-type': 'text/html' })
+        res.end('<!doctype html><pre id="hdrs">' + JSON.stringify(req.headers) + '</pre>')
+        return
+      }
+      // ADD #2: a native HTTP Basic Auth wall — 401 with WWW-Authenticate unless
+      // the Authorization header decodes to user:pass, then 200 "AUTHED OK".
+      if (url.startsWith('/protected')) {
+        const expected = 'Basic ' + Buffer.from('user:pass').toString('base64')
+        if ((req.headers.authorization ?? '') === expected) {
+          res.writeHead(200, { 'content-type': 'text/html' })
+          res.end('<!doctype html><body><h1>AUTHED OK</h1></body>')
+          return
+        }
+        res.writeHead(401, {
+          'content-type': 'text/html',
+          'www-authenticate': 'Basic realm="staging"',
+        })
+        res.end('<!doctype html><body><h1>401</h1></body>')
         return
       }
       res.writeHead(200, { 'content-type': 'text/html' })
@@ -526,5 +550,97 @@ describe('vercel-parity verbs (real Chromium via the run() entry)', () => {
     } finally {
       process.stdout.isTTY = origTTY
     }
+  })
+
+  // --- ADD #1: persistent extra HTTP headers ------------------------------
+  it('set headers is gated, persists across a reconnect, and reaches the server', async () => {
+    // Quarantined without the actions grant (ACTOR verb).
+    const denied = await run(['set', 'headers', '{"X-Test":"abc123"}', '--session', NAME])
+    expect(denied.env.success).toBe(false)
+    expect(denied.env.error).toBe(ERRORS.not_permitted.message)
+
+    // A non-object / non-string-value argument is a clean badRequest.
+    const badArr = await run(['set', 'headers', '["x"]', '--enable-actions', '--session', NAME])
+    expect(badArr.env.success).toBe(false)
+    const badVal = await run(['set', 'headers', '{"X":1}', '--enable-actions', '--session', NAME])
+    expect(badVal.env.success).toBe(false)
+
+    // Persist in ONE command …
+    const set = await run([
+      'set', 'headers', '{"X-Test":"abc123"}', '--enable-actions', '--session', NAME,
+    ])
+    expect(set.env.success).toBe(true)
+    expect((set.env.data as { headers: Record<string, string> }).headers['X-Test']).toBe('abc123')
+
+    // … then a SEPARATE `open` command (proving persistence across the
+    // per-command reconnect via applyEmulation) carries the header to the server.
+    await run(['open', `${baseUrl}/echo-headers`, '--enable-actions', '--session', NAME])
+    const text = await run(['get', 'text', '--session', NAME])
+    expect(text.env.data as string).toContain('"x-test":"abc123"')
+
+    // `{}` clears them.
+    const cleared = await run(['set', 'headers', '{}', '--enable-actions', '--session', NAME])
+    expect((cleared.env.data as { cleared: boolean }).cleared).toBe(true)
+    await run(['reload', '--enable-actions', '--session', NAME])
+    const after = await run(['get', 'text', '--session', NAME])
+    expect(after.env.data as string).not.toContain('"x-test":"abc123"')
+  })
+
+  it('a <secret> header value is resolved at apply time but stored on disk as a reference', async () => {
+    const set = await run([
+      '--secret', 'TK=secretval',
+      'set', 'headers', '{"Authorization":"Bearer <secret>TK</secret>"}',
+      '--enable-actions', '--session', NAME,
+    ])
+    expect(set.env.success).toBe(true)
+    // ENVELOPE masks the sensitive value — never the resolved secret.
+    expect((set.env.data as { headers: Record<string, string> }).headers.Authorization).toBe(
+      '[redacted]',
+    )
+
+    // ON DISK: the emulation sidecar holds the TOKEN REFERENCE, never `secretval`.
+    const emu = await readSidecarObject<{ extraHeaders?: Record<string, string> }>(
+      path.join(sessionDir(NAME), 'emulation.json'),
+    )
+    expect(emu.extraHeaders?.Authorization).toBe('Bearer <secret>TK</secret>')
+    expect(JSON.stringify(emu)).not.toContain('secretval')
+
+    // At APPLY time (with the --secret available) the token resolves and the
+    // real header reaches the server. A reload guarantees the resolve happens
+    // against the known localhost origin (domain scope) rather than about:blank.
+    await run(['--secret', 'TK=secretval', 'open', `${baseUrl}/echo-headers`, '--enable-actions', '--session', NAME])
+    await run(['--secret', 'TK=secretval', 'reload', '--enable-actions', '--session', NAME])
+    const text = await run(['get', 'text', '--session', NAME])
+    expect(text.env.data as string).toContain('"authorization":"Bearer secretval"')
+
+    // Clear so the Authorization header cannot bleed into the basic-auth test.
+    await run(['set', 'headers', '{}', '--enable-actions', '--session', NAME])
+  })
+
+  // --- ADD #2: HTTP Basic Auth --------------------------------------------
+  it('set credentials unlocks a native 401 Basic-Auth wall and redacts the password', async () => {
+    // Without credentials the 401 challenge is an honest dead-end → auth_required.
+    const noCreds = await run(['open', `${baseUrl}/protected`, '--enable-actions', '--session', NAME])
+    expect(noCreds.env.success).toBe(false)
+    expect(noCreds.env.error).toBe(ERRORS.auth_required.message)
+
+    // The set-credentials ENVELOPE never echoes the password.
+    const setCreds = await run([
+      'set', 'credentials', 'user', 'pass', '--enable-actions', '--session', NAME,
+    ])
+    expect(setCreds.env.success).toBe(true)
+    const cd = setCreds.env.data as { username: string; password: string }
+    expect(cd.username).toBe('user')
+    expect(cd.password).toBe('[redacted]')
+
+    // With credentials the same open unlocks (401 → 200 "AUTHED OK").
+    const authed = await run(['open', `${baseUrl}/protected`, '--enable-actions', '--session', NAME])
+    expect(authed.env.success).toBe(true)
+    const body = await run(['get', 'text', '--session', NAME])
+    expect(body.env.data as string).toContain('AUTHED OK')
+
+    // The clear form removes the persisted credentials.
+    const clear = await run(['set', 'credentials', '', '--enable-actions', '--session', NAME])
+    expect((clear.env.data as { cleared: boolean }).cleared).toBe(true)
   })
 })
