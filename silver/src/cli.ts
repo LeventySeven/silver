@@ -20,6 +20,7 @@
  */
 import { fileURLToPath } from 'node:url'
 import * as path from 'node:path'
+import { realpathSync } from 'node:fs'
 import { fail, print, type Envelope } from './core/envelope.js'
 import type { ErrorCode } from './core/errors.js'
 import { ERRORS, classifyEngineError } from './core/errors.js'
@@ -264,10 +265,22 @@ function usage(): Envelope<unknown> {
 function isMainModule(): boolean {
   const entry = process.argv[1]
   if (!entry) return false
+  const self = fileURLToPath(import.meta.url)
+  // Resolve symlinks on BOTH sides before comparing. When Silver runs via its bin
+  // symlink — exactly how `npm i -g` and `npx` install it — process.argv[1] is the
+  // symlink (e.g. /opt/homebrew/bin/silver) while import.meta.url is the real
+  // module file, so a plain path compare NEVER matches and the CLI silently does
+  // nothing. realpathSync normalizes both to the real cli.js path.
   try {
-    return path.resolve(entry) === fileURLToPath(import.meta.url)
+    return realpathSync(path.resolve(entry)) === realpathSync(self)
   } catch {
-    return false
+    // realpath can throw if the entry path no longer exists; fall back to a plain
+    // compare so a direct `node dist/cli.js` invocation still runs.
+    try {
+      return path.resolve(entry) === self
+    } catch {
+      return false
+    }
   }
 }
 
