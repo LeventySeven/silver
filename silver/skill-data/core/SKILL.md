@@ -20,7 +20,7 @@ UI-task success from ~50% to 90%+, an industry-wide finding.
 ## Install & invoke
 
 ```
-npm i -g github:LeventySeven/silver   # the npm name `silver` is taken → install from GitHub
+npm i -g agent-silver     # published as `agent-silver` (the npm name `silver` was taken)
 # then the `silver` command is on your PATH. Or run the built binary directly, no install:
 node /path/to/silver/dist/cli.js <verb> …
 # first run only, if Chromium isn't present yet:

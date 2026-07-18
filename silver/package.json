@@ -1,12 +1,13 @@
 {
-  "name": "silver",
+  "name": "agent-silver",
   "version": "0.1.0",
-  "description": "Silver is a keyless browser for AI agents: a CLI that runs a real headless Chromium and hands the agent a compact, grounded view of the page (stable @refs, ID-grounded extraction, long-running tasks, parallel sessions and subagents). The agent decides; Silver acts. It never calls a model.",
+  "description": "Agent Silver is a keyless browser for AI agents: a CLI (the `silver` command) that runs a real headless Chromium and hands the agent a compact, grounded view of the page (stable @refs, ID-grounded extraction, a grounded completion gate, long-running tasks, parallel sessions and subagents). The agent decides; Silver acts. It never calls a model.",
   "author": "LeventySeven",
   "license": "MIT",
   "type": "module",
   "bin": {
-    "silver": "./dist/cli.js"
+    "silver": "./dist/cli.js",
+    "agent-silver": "./dist/cli.js"
   },
   "engines": {
     "node": ">=24"

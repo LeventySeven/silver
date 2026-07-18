@@ -54,18 +54,19 @@ or the disk.
 
 ## Install
 
-The npm name `silver` is already taken, so it installs from GitHub.
+Published to npm as **`agent-silver`** (the name `silver` was already taken). The CLI command is
+`silver` (an `agent-silver` alias is also installed).
 
 ```bash
-# Run it once without installing (prints the full agent guide):
-npx github:LeventySeven/silver skill --full
-
 # Install the CLI:
-npm i -g github:LeventySeven/silver
+npm i -g agent-silver
 silver version
 
+# Run it once without installing (prints the full agent guide):
+npx agent-silver skill --full
+
 # Drop the skill into your project:
-npx github:LeventySeven/silver skill install
+npx agent-silver skill install
 
 # First-time browser download (Playwright usually handles this on install):
 npx playwright install chromium
