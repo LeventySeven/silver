@@ -33,6 +33,25 @@ describe('transformSchema — URL fields become element-ID fields (the moat)', (
     expect(transformed.properties!.title).toEqual({ type: 'string' })
   })
 
+  it('SHORTHAND schema `{field:"type"}` is normalized so URL grounding still applies (no silent bypass)', () => {
+    // Real failure (error-analysis on MDN): a shorthand schema slipped past walk()
+    // → urlFieldPaths:[] → the element ID leaked out as data with success:true.
+    const { transformed, urlFieldPaths } = transformSchema({
+      country: 'string',
+      link: 'string',
+    } as unknown as JsonSchema)
+    expect(urlFieldPaths).toEqual(['link']) // was [] — the moat is now applied
+    expect(transformed.type).toBe('object')
+    expect(transformed.properties!.link.pattern).toBe('^\\d+-\\d+$') // link → ID field
+    expect(transformed.properties!.country).toEqual({ type: 'string' }) // non-URL untouched
+    // A CANONICAL schema is unchanged by normalization (it already carries `type`).
+    const canon = transformSchema({
+      type: 'object',
+      properties: { link: { type: 'string', format: 'uri' } },
+    })
+    expect(canon.urlFieldPaths).toEqual(['link'])
+  })
+
   it('a fabricated free-text URL cannot satisfy the installed pattern; a real ID can', () => {
     const schema: JsonSchema = { type: 'object', properties: { url: { type: 'string' } } }
     const { transformed } = transformSchema(schema)

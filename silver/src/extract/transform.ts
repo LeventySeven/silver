@@ -67,12 +67,56 @@ function nameIsUrlLeaf(nameHint: string | undefined, node: JsonSchema): boolean 
  * (`items.*.href`); an array-of-urls is `links.*`; a root url string is `""`.
  * These paths are what resolve.ts walks to reverse-map IDs → real values.
  */
+/** JSON-Schema type-name strings a shorthand value may carry. */
+const TYPE_NAMES = new Set(['string', 'number', 'integer', 'boolean', 'array', 'object', 'null'])
+
+/**
+ * Normalize the SHORTHAND schema form `{field: "type", …}` (a plain map of
+ * field → type-name string, with NO `type`/`properties`/`items`) into canonical
+ * `{type:'object', properties:{field:{type:'type'}}}`. Without this, a shorthand
+ * schema slips past `walk` (which only recurses a node that HAS `type:'object'` +
+ * `properties`), so URL fields are never detected and the ID-grounding moat is
+ * SILENTLY bypassed — a `link`/`url` field then leaks the raw element ID out as if
+ * it were data, with success:true (the worst failure shape). Canonical schemas
+ * carry `type`, so they are returned UNCHANGED; nested shorthand normalizes
+ * recursively; anything not clearly shorthand is left for `walk` (never guessed).
+ */
+function normalizeShorthand(schema: JsonSchema): JsonSchema {
+  const s = schema as unknown as Record<string, unknown>
+  const isPlainMap =
+    s !== null &&
+    typeof s === 'object' &&
+    !Array.isArray(s) &&
+    s.type === undefined &&
+    s.properties === undefined &&
+    s.items === undefined &&
+    Object.keys(s).length > 0
+  if (!isPlainMap) return schema
+  const entries = Object.entries(s)
+  // Every value must be a type-name string OR a nested shorthand object — else this
+  // is not the shorthand form, so leave it untouched (do not guess a structure).
+  const looksShorthand = entries.every(
+    ([, v]) =>
+      (typeof v === 'string' && TYPE_NAMES.has(v)) ||
+      (typeof v === 'object' && v !== null && !Array.isArray(v)),
+  )
+  if (!looksShorthand) return schema
+  const properties: Record<string, JsonSchema> = {}
+  for (const [k, v] of entries) {
+    properties[k] =
+      typeof v === 'string'
+        ? ({ type: v } as JsonSchema)
+        : normalizeShorthand(v as JsonSchema)
+  }
+  return { type: 'object', properties } as JsonSchema
+}
+
 export function transformSchema(schema: JsonSchema): {
   transformed: JsonSchema
   urlFieldPaths: string[]
 } {
   const paths: string[] = []
-  const transformed = walk(schema, [], undefined, paths)
+  const transformed = walk(normalizeShorthand(schema), [], undefined, paths)
   return { transformed, urlFieldPaths: paths }
 }
 

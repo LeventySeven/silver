@@ -2284,7 +2284,14 @@ async function handleGet(flags: ParsedFlags): Promise<Envelope<unknown>> {
           return ok(presentPageText(text ?? '', flags))
         }
         return withLocator(page, flags.session, ref, async (loc) => {
-          const t = (await loc.textContent()) ?? ''
+          // innerText (layout-aware: inserts \t between table cells, \n between rows,
+          // and drops hidden text) — NOT textContent (boundary-less concatenation).
+          // So `get text @<table/row/list ref>` preserves cell/item boundaries
+          // (`India\t1,429,404,000\t17.3%`, not the fused `India1,429,404,00017.3%`),
+          // matching the whole-page `get text` above (which already uses body.innerText).
+          const t = ((await loc
+            .evaluate((el) => el.innerText ?? el.textContent ?? '')
+            .catch(() => '')) as string)
           return ok(presentPageText(t, flags))
         })
       }

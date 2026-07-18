@@ -189,6 +189,30 @@ export const FIXTURES = [
     },
   },
   {
+    name: 'overlay-recovery',
+    path: '/overlay',
+    // A consent/GDPR-style full-viewport overlay covering the action. Mechanism:
+    // RECOVERY — the host must dismiss the wall (the overlay's own Accept button,
+    // which sits ON TOP and is clickable) before the underlying action grounds.
+    // Folds the real cookie-consent failure surface into the measured corpus.
+    html: `<!doctype html><html><head><title>Consent</title></head><body>
+      <button type="button" onclick="document.getElementById('d').textContent='Continued'">Continue</button>
+      <div id="d"></div>
+      <div id="ov" style="position:fixed;top:0;left:0;width:100%;height:100%;z-index:9999;background:rgba(0,0,0,.6)">
+        <button type="button" onclick="document.getElementById('ov').remove()">Accept cookies</button></div>
+      </body></html>`,
+    criteria: [['text-visible', 'Continued']],
+    async drive({ cmd, snap }) {
+      const s = await snap()
+      const accept = refFor(s, 'button', 'Accept cookies')
+      if (accept) await cmd(['click', accept, ...A]) // dismiss the wall first (recovery ladder)
+      const s2 = await snap()
+      const cont = refFor(s2, 'button', 'Continue')
+      if (cont) await cmd(['click', cont, ...A])
+      await snap()
+    },
+  },
+  {
     name: 'data-table',
     path: '/table',
     // A 10x4 data table (verbose in the full tree) + one action.

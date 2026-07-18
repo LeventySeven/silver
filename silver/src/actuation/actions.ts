@@ -270,7 +270,13 @@ export async function find(
   if (count === 0) return actFail<FindResult>('element_not_found')
 
   if (subaction === undefined) {
-    const text = await locator.textContent({ timeout: opts.timeout }).catch(() => null)
+    // innerText (layout-aware, boundary-preserving) not textContent (fuses adjacent
+    // cells/nodes): `find role table` etc. keep row/cell separators. Preview only —
+    // the match was already made by the locator; a strict-mode multi-match still
+    // falls back to null (no preview) via the catch, as before.
+    const text = (await locator
+      .evaluate((el) => el.innerText ?? el.textContent ?? '')
+      .catch(() => null)) as string | null
     const res: FindResult = { kind, val, matched: count }
     if (text !== null && text !== '') res.text = text
     return ok(res)
@@ -602,8 +608,17 @@ function mapActionError(err: unknown): ErrorCode {
   if (err instanceof ActionError) return err.code
   const name = err instanceof Error ? err.name : ''
   const msg = err instanceof Error ? err.message : ''
-  if (name === 'TimeoutError') return 'timeout'
+  // A pointer-intercept (an overlay / modal / consent-GDPR banner covering the
+  // target) is what Playwright reports on a covered element — but it WRAPS it in a
+  // TimeoutError, so this phrase check MUST run BEFORE the `TimeoutError` name
+  // return. Otherwise an occluded click misreports as a plain `timeout` ("re-snapshot
+  // or increase --timeout" — advice that can NEVER clear a persistent modal) instead
+  // of `element_obscured` ("dismiss the consent/cookie banner first, then re-snapshot")
+  // — the crux of the R2 recovery ladder, and consent walls sit on ~every major site.
+  // A bare TimeoutError (a genuinely absent/slow element, no intercept phrase) still
+  // maps to `timeout`.
   if (/intercepts pointer events|subtree intercepts/i.test(msg)) return 'element_obscured'
+  if (name === 'TimeoutError') return 'timeout'
   const classified = classifyEngineError(err)
   if (classified !== null) return classified
   return 'element_not_found'
