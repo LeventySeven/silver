@@ -46,6 +46,7 @@
     "build": "tsc -p . && chmod +x dist/cli.js",
     "prepare": "tsc -p . && chmod +x dist/cli.js",
     "test": "vitest run",
+    "eval": "npm run build && node evals/run.mjs",
     "dev": "tsx src/cli.ts"
   },
   "dependencies": {
