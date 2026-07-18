@@ -5,7 +5,7 @@ import {
   STRUCTURAL_ROLES,
 } from '../../src/perception/roles.js'
 
-describe('role allowlists (verbatim from reference snapshot.rs:11-62)', () => {
+describe('role allowlists (adapted from reference snapshot.rs:11-62; content grammar narrowed in R4)', () => {
   it('classifies interactive roles', () => {
     expect(INTERACTIVE_ROLES.has('button')).toBe(true)
     expect(INTERACTIVE_ROLES.has('textbox')).toBe(true)
@@ -20,9 +20,16 @@ describe('role allowlists (verbatim from reference snapshot.rs:11-62)', () => {
     expect(CONTENT_ROLES.has('heading')).toBe(true)
     expect(CONTENT_ROLES.has('main')).toBe(true)
     expect(CONTENT_ROLES.has('listitem')).toBe(true)
+    expect(CONTENT_ROLES.has('gridcell')).toBe(true) // ARIA interactive-grid cell — kept
     // not content
     expect(CONTENT_ROLES.has('button')).toBe(false)
     expect(CONTENT_ROLES.has('generic')).toBe(false)
+    // Round 4 measured downsample: plain-table roles are name-from-content, so as
+    // CONTENT_ROLES they flooded the interactive tree with non-actionable data cells.
+    // Removed — a bare `<td>`/`<th>` grounds ONLY when genuinely interactive.
+    expect(CONTENT_ROLES.has('cell')).toBe(false)
+    expect(CONTENT_ROLES.has('columnheader')).toBe(false)
+    expect(CONTENT_ROLES.has('rowheader')).toBe(false)
   })
 
   it('classifies structural roles', () => {
@@ -47,7 +54,7 @@ describe('role allowlists (verbatim from reference snapshot.rs:11-62)', () => {
 
   it('has the exact expected cardinalities (guards accidental edits)', () => {
     expect(INTERACTIVE_ROLES.size).toBe(18)
-    expect(CONTENT_ROLES.size).toBe(10)
+    expect(CONTENT_ROLES.size).toBe(7) // was 10; −3 plain-table roles (Round 4 downsample)
     expect(STRUCTURAL_ROLES.size).toBe(20)
   })
 })

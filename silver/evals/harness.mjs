@@ -123,6 +123,89 @@ export const FIXTURES = [
       await snap() // observe the settled page (obs-token sample)
     },
   },
+
+  // ---- richer / noisier fixtures (real obs-token deltas + capability amid noise) ----
+  {
+    name: 'noisy-deep',
+    path: '/noisy',
+    // 40 paragraphs of wrapper-div soup around ONE actionable button — the full
+    // tree is dominated by non-interactive noise; the interactive tree is ~1 line.
+    html: `<!doctype html><html><head><title>Noisy</title></head><body>
+      <div><div><div><nav>${'<span>nav item </span>'.repeat(8)}</nav>
+      ${'<div class="wrap"><p>Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod.</p></div>'.repeat(40)}
+      <div><div><button type="button" onclick="document.getElementById('done').textContent='You continued'">Continue</button></div></div>
+      <div id="done"></div></div></div></body></html>`,
+    criteria: [['text-visible', 'You continued']],
+    async drive({ cmd, snap }) {
+      const s = await snap()
+      const btn = refFor(s, 'button', 'Continue')
+      if (btn) await cmd(['click', btn, ...A])
+      await snap()
+    },
+  },
+  {
+    name: 'big-form',
+    path: '/bigform',
+    // Ten labeled inputs + a submit — a realistic multi-field form.
+    html: `<!doctype html><html><head><title>Big form</title></head><body><form>
+      ${Array.from({ length: 10 }, (_, i) => `<label>Field ${i + 1} <input aria-label="Field ${i + 1}"></label>`).join('')}
+      <button type="button" onclick="document.getElementById('s').textContent='Saved'">Save</button></form>
+      <div id="s"></div></body></html>`,
+    criteria: [
+      ['[aria-label="Field 1"]', 'value-equals', 'v1'],
+      ['[aria-label="Field 2"]', 'value-equals', 'v2'],
+      ['text-visible', 'Saved'],
+    ],
+    async drive({ cmd, snap }) {
+      // Capture ALL refs from the FIRST full snapshot. A value-only fill does not
+      // bump the refmap generation (no structural change), so these refs stay valid
+      // across the fills — and this avoids relying on a post-action diff snapshot to
+      // re-list the unchanged Save button (a diff omits it). Realistic host pattern.
+      const s = await snap()
+      const f1 = refFor(s, 'textbox', 'Field 1')
+      const f2 = refFor(s, 'textbox', 'Field 2')
+      const save = refFor(s, 'button', 'Save')
+      if (f1) await cmd(['fill', f1, 'v1', ...A])
+      if (f2) await cmd(['fill', f2, 'v2', ...A])
+      if (save) await cmd(['click', save, ...A])
+      await snap()
+    },
+  },
+  {
+    name: 'long-list',
+    path: '/longlist',
+    // 60 static rows push the action button off-viewport — tests off-viewport
+    // completeness (the button must still ground) + the noise the interactive tree drops.
+    html: `<!doctype html><html><head><title>Long</title></head><body>
+      <ul>${'<li>row of content that is not interactive</li>'.repeat(60)}</ul>
+      <button type="button" onclick="document.getElementById('m').textContent='Bottom reached'">Load more</button>
+      <div id="m"></div></body></html>`,
+    criteria: [['text-visible', 'Bottom reached']],
+    async drive({ cmd, snap }) {
+      const s = await snap()
+      const btn = refFor(s, 'button', 'Load more')
+      if (btn) await cmd(['click', btn, ...A])
+      await snap()
+    },
+  },
+  {
+    name: 'data-table',
+    path: '/table',
+    // A 10x4 data table (verbose in the full tree) + one action.
+    html: `<!doctype html><html><head><title>Table</title></head><body>
+      <table><thead><tr><th>A</th><th>B</th><th>C</th><th>D</th></tr></thead><tbody>
+      ${'<tr><td>cell</td><td>cell</td><td>cell</td><td>cell</td></tr>'.repeat(10)}
+      </tbody></table>
+      <button type="button" onclick="document.getElementById('e').textContent='Exported'">Export</button>
+      <div id="e"></div></body></html>`,
+    criteria: [['text-visible', 'Exported']],
+    async drive({ cmd, snap }) {
+      const s = await snap()
+      const btn = refFor(s, 'button', 'Export')
+      if (btn) await cmd(['click', btn, ...A])
+      await snap()
+    },
+  },
 ]
 
 /** An http server that serves each fixture's html at its path. */
@@ -175,6 +258,24 @@ export async function runEval({ runCmd, baseUrl, session, namespace }) {
     for (const c of f.criteria) await runCmd(['task', 'criteria', id, ...c, ...ns])
 
     await cmd(['open', `${baseUrl}${f.path}`])
+
+    // Representation A/B: the FULL tree vs the INTERACTIVE tree, in obs-tokens, on
+    // the SAME loaded page (measurement only — NOT counted as driver acts/obsTokens).
+    // The delta is the harness-as-moat datapoint: how much the grounded interactive
+    // representation saves. passK below proves the saving costs no actionable element.
+    //
+    // Order matters: take interactive FIRST, then the FULL snapshot LAST — so the
+    // stored diff-baseline ends on the FULL shape. The driver's next `snapshot -i`
+    // is then a SHAPE-FLIP (interactive≠full), which Silver serves as a fresh FULL
+    // tree, not a diff. (Two identical `-i` snapshots back-to-back would make the
+    // second a diff — "No changes detected" — and the driver's refFor would find
+    // nothing. This is a genuine property of Silver's diff-when-shorter, surfaced
+    // by the eval itself.)
+    const inter = await runCmd(['snapshot', '-i', ...sess])
+    const full = await runCmd(['snapshot', ...sess])
+    const fullTok = typeof full.env.data === 'string' ? estTokens(full.env.data) : 0
+    const interTok = typeof inter.env.data === 'string' ? estTokens(inter.env.data) : 0
+
     let driveErr = null
     try {
       await f.drive({ cmd, snap })
@@ -191,12 +292,19 @@ export async function runEval({ runCmd, baseUrl, session, namespace }) {
       passed,
       acts,
       obsTokens,
+      fullTok,
+      interTok,
+      reductionPct: fullTok ? Math.round((1 - interTok / fullTok) * 100) : 0,
       ...(driveErr ? { driveErr } : {}),
       ...(passed ? {} : { unmet: data.unmet ?? [] }),
     })
   }
 
   const passK = results.length ? results.filter((r) => r.passed).length / results.length : 0
+  const fulls = results.map((r) => r.fullTok)
+  const inters = results.map((r) => r.interTok)
+  const fMed = median(fulls)
+  const iMed = median(inters)
   const metrics = {
     passK,
     fixtures: results.length,
@@ -204,6 +312,10 @@ export async function runEval({ runCmd, baseUrl, session, namespace }) {
     obsTokenMedian: median(allObsTokens),
     obsTokenP90: p90(allObsTokens),
     actsMedian: median(results.map((r) => r.acts)),
+    // Representation A/B (the harness-as-moat datapoint): interactive vs full tree.
+    fullTreeMedian: fMed,
+    interactiveMedian: iMed,
+    interactiveReductionPct: fMed ? Math.round((1 - iMed / fMed) * 100) : 0,
   }
   return { results, metrics }
 }

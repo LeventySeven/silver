@@ -28,11 +28,15 @@ try {
   for (const r of results) {
     const tag = r.passed ? 'PASS' : 'FAIL'
     const extra = r.passed ? '' : `  unmet=${JSON.stringify(r.unmet)}${r.driveErr ? ` err=${r.driveErr}` : ''}`
-    console.log(`  ${tag}  ${r.name.padEnd(14)} acts=${r.acts}  obsTokens=[${r.obsTokens.join(', ')}]${extra}`)
+    console.log(
+      `  ${tag}  ${r.name.padEnd(14)} acts=${r.acts}  full→int obsTok ${r.fullTok}→${r.interTok} (-${r.reductionPct}%)${extra}`,
+    )
   }
   console.log(
     `\n  passK=${(metrics.passK * 100).toFixed(1)}% (${metrics.passed}/${metrics.fixtures})  ` +
-      `obsTokens median=${metrics.obsTokenMedian} p90=${metrics.obsTokenP90}  acts median=${metrics.actsMedian}\n`,
+      `acts median=${metrics.actsMedian}\n` +
+      `  representation A/B: full=${metrics.fullTreeMedian} → interactive=${metrics.interactiveMedian} obs-tokens ` +
+      `(−${metrics.interactiveReductionPct}% median) — grounded interactive tree, passK proves no lost target\n`,
   )
 
   const report = { at: new Date().toISOString(), metrics, results }

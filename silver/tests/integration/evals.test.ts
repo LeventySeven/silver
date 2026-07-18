@@ -48,5 +48,13 @@ describe('eval harness — keyless, model-free harness-quality gate', () => {
     // is observable run-over-run.
     expect(metrics.obsTokenMedian).toBeGreaterThan(0)
     expect(metrics.actsMedian).toBeGreaterThan(0)
+
+    // The grounded interactive tree must stay dramatically leaner than the full
+    // tree on this realistic corpus (the harness-as-moat property). A regression
+    // that re-floods the interactive tree — e.g. re-adding non-actionable table
+    // cells as refs — would collapse this and fail here.
+    expect(metrics.interactiveReductionPct).toBeGreaterThan(50)
+    const table = results.find((r) => r.name === 'data-table')
+    expect(table?.interTok, `data-table interactive tokens: ${table?.interTok}`).toBeLessThan(80)
   })
 })
