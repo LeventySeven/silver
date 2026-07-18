@@ -52,6 +52,49 @@ describe('transformSchema — URL fields become element-ID fields (the moat)', (
     expect(canon.urlFieldPaths).toEqual(['link'])
   })
 
+  it('SHORTHAND LIST form `{"links":[{...,"url":"string"}]}` (the README onboarding schema) grounds url', () => {
+    // Real failure caught by onboarding error-analysis: the FIRST `extract` the
+    // README hands a new user — a nested single-element array of shorthand — slipped
+    // past normalization (array values bailed), so the url field was NOT grounded and
+    // the moat was silently off on a brand-new user's very first extract.
+    const { transformed, urlFieldPaths } = transformSchema({
+      links: [{ title: 'string', url: 'string' }],
+    } as unknown as JsonSchema)
+    expect(urlFieldPaths).toEqual(['links.*.url']) // was [] — the moat now applies
+    expect(transformed.type).toBe('object')
+    const item = transformed.properties!.links.items!
+    expect(item.properties!.url.pattern).toBe(ID_PATTERN) // url → element-ID field
+    expect(item.properties!.title).toEqual({ type: 'string' }) // non-URL untouched
+  })
+
+  it('MIXED shorthand + canonical map grounds the canonically-annotated url field', () => {
+    // Adversarial-review catch: a user writes sibling fields in shorthand but
+    // annotates the one url/link field they care about (`{type:"string"}`,
+    // `format:"uri"`, a description). The whole map must still normalize so walk()
+    // grounds that field — a stricter all-or-nothing guard silently disabled the moat.
+    for (const schema of [
+      { title: 'string', url: { type: 'string' } },
+      { name: 'string', url: { type: 'string', format: 'uri' } },
+      { title: 'string', link: { type: 'string', description: 'the link' } },
+    ] as unknown as JsonSchema[]) {
+      const { transformed, urlFieldPaths } = transformSchema(schema)
+      expect(urlFieldPaths.length, JSON.stringify(schema)).toBeGreaterThan(0) // was [] — moat back ON
+      expect(transformed.type).toBe('object')
+    }
+  })
+
+  it('does NOT misread a JSON-Schema combinator as shorthand (no false-positive restructuring)', () => {
+    // A canonical `{type:…}` node anywhere makes the map non-shorthand, so an
+    // `oneOf`/`anyOf` array (whose elements carry `type`) is left UNTOUCHED — never
+    // wrapped into a bogus `{type:object, properties:{oneOf:…}}`.
+    const combinator = { oneOf: [{ type: 'string' }] }
+    const { transformed, urlFieldPaths } = transformSchema(combinator as unknown as JsonSchema)
+    expect(urlFieldPaths).toEqual([])
+    expect(transformed).toEqual(combinator) // structurally unchanged
+    // A shorthand array of a bare type name is not URL-bearing → no paths, no crash.
+    expect(transformSchema({ tags: ['string'] } as unknown as JsonSchema).urlFieldPaths).toEqual([])
+  })
+
   it('a fabricated free-text URL cannot satisfy the installed pattern; a real ID can', () => {
     const schema: JsonSchema = { type: 'object', properties: { url: { type: 'string' } } }
     const { transformed } = transformSchema(schema)

@@ -71,15 +71,57 @@ function nameIsUrlLeaf(nameHint: string | undefined, node: JsonSchema): boolean 
 const TYPE_NAMES = new Set(['string', 'number', 'integer', 'boolean', 'array', 'object', 'null'])
 
 /**
- * Normalize the SHORTHAND schema form `{field: "type", …}` (a plain map of
- * field → type-name string, with NO `type`/`properties`/`items`) into canonical
- * `{type:'object', properties:{field:{type:'type'}}}`. Without this, a shorthand
- * schema slips past `walk` (which only recurses a node that HAS `type:'object'` +
- * `properties`), so URL fields are never detected and the ID-grounding moat is
- * SILENTLY bypassed — a `link`/`url` field then leaks the raw element ID out as if
- * it were data, with success:true (the worst failure shape). Canonical schemas
- * carry `type`, so they are returned UNCHANGED; nested shorthand normalizes
- * recursively; anything not clearly shorthand is left for `walk` (never guessed).
+ * A shorthand VALUE is one of: a bare type-name string (`"string"`); a
+ * single-element array of shorthand (`[{…}]` — the documented `{"links":[{…}]}`
+ * list form); or a plain map whose EVERY value is itself shorthand (a nested
+ * object). Crucially, any object carrying `type`/`properties`/`items` is a
+ * CANONICAL node and is NOT shorthand — its presence makes the whole map
+ * canonical, so we never misread a JSON-Schema construct (a `oneOf`/`$ref` array,
+ * a `{type:…}` leaf) as a shorthand field and wrongly restructure it.
+ */
+function isShorthandValue(v: unknown): boolean {
+  if (typeof v === 'string') return TYPE_NAMES.has(v)
+  if (Array.isArray(v)) return v.length === 1 && isShorthandValue(v[0])
+  if (typeof v === 'object' && v !== null) {
+    const o = v as Record<string, unknown>
+    if (o.type !== undefined || o.properties !== undefined || o.items !== undefined) return false
+    const vals = Object.values(o)
+    return vals.length > 0 && vals.every(isShorthandValue)
+  }
+  return false
+}
+
+/** Turn a KNOWN-shorthand value (validated by `isShorthandValue`) into a canonical node. */
+function shorthandToSchema(v: unknown): JsonSchema {
+  if (typeof v === 'string') return { type: v }
+  if (Array.isArray(v)) return { type: 'array', items: shorthandToSchema(v[0]) }
+  const o = v as Record<string, unknown>
+  const properties: Record<string, JsonSchema> = {}
+  for (const [k, val] of Object.entries(o)) properties[k] = shorthandToSchema(val)
+  return { type: 'object', properties }
+}
+
+/**
+ * Normalize a SHORTHAND extract schema into canonical `{type,properties,items}`
+ * form BEFORE `walk` runs. Shorthand is the map-of-field form the README
+ * documents: `{field:"type"}`, a nested `{field:{…}}`, the list form
+ * `{"links":[{"title":"string","url":"string"}]}`, and — crucially — a MIX where
+ * one field is annotated canonically (`{title:"string", url:{type:"string",
+ * format:"uri"}}`). Without this, such a map slips past `walk` (which only
+ * recurses a node that HAS `type:'object'`+`properties` or `type:'array'`+`items`),
+ * so URL fields are never detected and the ID-grounding moat is SILENTLY bypassed
+ * — a `link`/`url` field then leaks the raw element ID out as if it were data,
+ * with success:true (the worst shape; the README onboards a new user with exactly
+ * the list form).
+ *
+ * A plain map (no top-level `type`/`properties`/`items`) is treated as a field-map
+ * and wrapped as `{type:'object', properties}` — EACH value converted if it is
+ * shorthand (a type-name string, a 1-element array of shorthand, or a nested
+ * shorthand map) and PASSED THROUGH unchanged if it is already a canonical node
+ * (so `walk` grounds a canonical `url` child by name/format). The map is left
+ * entirely UNTOUCHED only when a value is neither shorthand nor a plain object —
+ * e.g. a JSON-Schema combinator's array of canonical nodes (`{oneOf:[{type:…}]}`),
+ * a multi-element array, a number — so we never misread a combinator as a field.
  */
 function normalizeShorthand(schema: JsonSchema): JsonSchema {
   const s = schema as unknown as Record<string, unknown>
@@ -92,23 +134,25 @@ function normalizeShorthand(schema: JsonSchema): JsonSchema {
     s.items === undefined &&
     Object.keys(s).length > 0
   if (!isPlainMap) return schema
-  const entries = Object.entries(s)
-  // Every value must be a type-name string OR a nested shorthand object — else this
-  // is not the shorthand form, so leave it untouched (do not guess a structure).
-  const looksShorthand = entries.every(
-    ([, v]) =>
-      (typeof v === 'string' && TYPE_NAMES.has(v)) ||
-      (typeof v === 'object' && v !== null && !Array.isArray(v)),
-  )
-  if (!looksShorthand) return schema
+  // A field-map value is: a type-name string, a plain (non-array) object (canonical
+  // or a nested shorthand map — recursed / passed through), or a 1-element array of
+  // shorthand (the `{"links":[{…}]}` list form). Anything else (a number, a multi-
+  // element array, a combinator's array of canonical nodes) means this is not a
+  // field-map, so leave it for `walk` — never guess a structure.
+  const isFieldMapValue = (v: unknown): boolean =>
+    (typeof v === 'string' && TYPE_NAMES.has(v)) ||
+    (typeof v === 'object' && v !== null && !Array.isArray(v)) ||
+    isShorthandValue(v)
+  if (!Object.values(s).every(isFieldMapValue)) return schema
   const properties: Record<string, JsonSchema> = {}
-  for (const [k, v] of entries) {
-    properties[k] =
-      typeof v === 'string'
-        ? ({ type: v } as JsonSchema)
+  for (const [k, v] of Object.entries(s)) {
+    properties[k] = Array.isArray(v)
+      ? { type: 'array', items: shorthandToSchema(v[0]) }
+      : typeof v === 'string'
+        ? { type: v }
         : normalizeShorthand(v as JsonSchema)
   }
-  return { type: 'object', properties } as JsonSchema
+  return { type: 'object', properties }
 }
 
 export function transformSchema(schema: JsonSchema): {
