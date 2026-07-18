@@ -12,7 +12,7 @@
  * honor the no-leak invariant.
  */
 import { spawn } from 'node:child_process'
-import { promises as fs } from 'node:fs'
+import { promises as fs, existsSync } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import type { Browser, BrowserContext, Page } from 'playwright'
@@ -587,8 +587,13 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
   const requestedPort = opts.port ?? 0
   const chromium = await loadChromium()
   const execPath = chromium.executablePath()
-  if (!execPath) {
-    throw new Error('no Chromium executable is available')
+  // Onramp fix (swap-readiness): a fresh install where Chromium was never downloaded
+  // otherwise fails the FIRST `open` with an unclassified `engine_error` ("re-snapshot
+  // and retry") — nonsense for a missing binary. Detect it the same way `doctor` does
+  // (existsSync on the resolved path) and throw the TYPED `browser_missing` code so the
+  // envelope carries the `npx playwright install chromium` fix the doctor already knows.
+  if (!execPath || !existsSync(execPath)) {
+    throw Object.assign(new Error('browser_missing'), { code: 'browser_missing' as const })
   }
 
   const args = [

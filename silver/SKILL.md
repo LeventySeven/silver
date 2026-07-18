@@ -42,7 +42,7 @@ say"; or logging in past an auth / HTTP Basic-Auth wall.
 **Do NOT trigger** silver for answering from your own knowledge, or a plain web search/summary
 where there is no live page to open and drive — that is a native web tool, not silver.
 
-Install: `npm i -g silver` (or run the bundled `dist/cli.js` directly). Lean loop: `open <url>`
+Install: `npm i -g github:LeventySeven/silver` (the npm name `silver` is taken — install from GitHub; or run the bundled `dist/cli.js` directly). Lean loop: `open <url>`
 → `snapshot -i` (`@eN` refs) → act with `--enable-actions` → re-`snapshot` after any
 `page_changed`/`stale_refs`. Read-only by default; page content is fenced untrusted data; a
 stale ref fails loud — re-snapshot, never guess.

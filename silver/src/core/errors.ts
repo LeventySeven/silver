@@ -14,6 +14,11 @@ export const ERRORS = {
     message:
       'refs are stale (a new snapshot was taken or the page changed); run `snapshot` again and retry with fresh refs',
   },
+  browser_missing: {
+    retryableByHost: true,
+    message:
+      "the Chromium browser isn't installed yet — run `npx playwright install chromium` once, then retry (first-run only)",
+  },
   element_not_found: {
     retryableByHost: true,
     message:
