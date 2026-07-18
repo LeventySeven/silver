@@ -9,9 +9,15 @@
  *   task list                          all tasks in the namespace
  *   task resume <id>                   latest checkpoint + remaining plan + log tail
  *   task exec <id> -- <silver-cmd...>  run a silver command AND auto-log it
+ *   task criteria <id> [<expect-args>] commit (or list) a grounded acceptance criterion
+ *   task verify <id>                   re-run every criterion live (dry-run; met/unmet)
+ *   task done <id>                     REFUSE done unless every grounded criterion passes
  *
  * `task exec`/`task start`-style writers require --enable-actions for `exec`
  * only (it re-dispatches an arbitrary command); everything else is read-only.
+ * `task criteria/verify/done` are the KEYLESS completion gate: pre-committed
+ * grounded `expect` predicates that `done` re-checks live and refuses to skip —
+ * completion is VERIFIED, never self-reported (no model call).
  * The dispatch VERB `task` is read-only in the registry; the actor sub-gate for
  * `exec` lives here (mirrors how `wait --fn` is gated inside its handler).
  *
@@ -44,6 +50,10 @@ import {
   saveReplayCache,
   loadReplayCache,
   decideReplay,
+  readCriteria,
+  addCriterion,
+  readCompletion,
+  writeCompletion,
   REPLAY_CACHE_FILE,
   type Checkpoint,
   type ReplayStep,
@@ -129,9 +139,15 @@ export async function handleTask(flags: ParsedFlags): Promise<Envelope<unknown>>
       return taskCompile(flags)
     case 'replay':
       return taskReplay(flags)
+    case 'criteria':
+      return taskCriteria(flags)
+    case 'verify':
+      return taskVerify(flags, false)
+    case 'done':
+      return taskVerify(flags, true)
     default:
       return badRequest(
-        'usage: silver task start|log|checkpoint|status|list|resume|exec|compile|replay',
+        'usage: silver task start|log|checkpoint|status|list|resume|exec|compile|replay|criteria|verify|done',
       )
   }
 }
@@ -228,12 +244,19 @@ async function taskStatus(flags: ParsedFlags): Promise<Envelope<unknown>> {
   // The T2 manifest is the machine-readable index; surface it (and refresh it so
   // `status` never reports a stale count) for list/status/resume + tooling.
   const manifest = n > 0 ? await refreshManifest(id, n) : null
+  // The completion gate: surface the pre-committed acceptance criteria + whether
+  // `task done` has verified them, so status shows the honest done-state.
+  const criteria = n > 0 ? await readCriteria(id, n) : []
+  const completion = n > 0 ? await readCompletion(id, n) : null
   return ok({
     id,
     runs: (await listRuns(id)).map((r) => `run_${r}`),
     latestRun: n > 0 ? `run_${n}` : null,
     status: cp?.status ?? 'unknown',
     plan: { total: plan.total, checked: plan.checked, remaining: plan.total - plan.checked },
+    criteria: { total: criteria.length, list: criteria.map((c) => bound(c.args.join(' '))) },
+    done: completion?.done === true,
+    verifiedAt: completion?.at ?? null,
     logEntries: log.length,
     verbCount: manifest?.verbCount ?? 0,
     manifest,
@@ -379,6 +402,127 @@ async function taskExec(flags: ParsedFlags): Promise<Envelope<unknown>> {
     error: res.env.error,
     ...(res.env.warning ? { warning: res.env.warning } : {}),
   }
+}
+
+// ---------------------------------------------------------------------------
+// The keyless completion gate — `task criteria` / `task verify` / `task done`.
+//
+// The SOTA seam Silver is uniquely positioned for: because @ref grounding makes a
+// fabricated URL/element impossible, a set of PRE-COMMITTED grounded `expect`
+// predicates is an UN-GAMEABLE completion gate with ZERO model call. The host
+// commits its success criteria up front (`task criteria`), drives, then `task
+// done` RE-RUNS each criterion LIVE — it returns done only when every one passes
+// a grounded assertion. This is Aside's "grade the trace, not the self-report /
+// verify you accomplished it, not just attempted" made model-free and structural.
+// ---------------------------------------------------------------------------
+
+/**
+ * `task criteria <id> [<expect-args…>]` — with args, append one pre-committed
+ * acceptance criterion (a raw `expect` matcher); with none, list the ledger.
+ * Read-only (no browser): it only records the yardstick.
+ */
+async function taskCriteria(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const id = idAt(flags, 1)
+  if (!id) return badRequest('usage: silver task criteria <id> [<expect-args…>]  (e.g. task criteria t1 url-matches "*/success")')
+  if (!(await taskExists(id))) return badRequest('no such task; run `task start` first')
+  const n = await latestRun(id)
+  if (n === 0) return badRequest('this task has no run yet; run `task start` first')
+
+  const args = flags.args.slice(2)
+  if (args.length === 0) {
+    const cur = await readCriteria(id, n)
+    return ok({ id, run: `run_${n}`, criteria: cur.map((c) => bound(c.args.join(' '))), count: cur.length })
+  }
+  const cur = await addCriterion(id, n, args, new Date().toISOString())
+  await appendLog(id, n, { kind: 'criterion', args })
+  return ok({
+    id,
+    run: `run_${n}`,
+    added: bound(args.join(' ')),
+    criteria: cur.map((c) => bound(c.args.join(' '))),
+    count: cur.length,
+    note: 'pre-committed acceptance criterion (a grounded `expect`); `task verify`/`task done` re-check it LIVE and `done` refuses unless every criterion passes — completion is verified, not claimed',
+  })
+}
+
+/**
+ * `task verify <id>` (dry-run) / `task done <id>` (markDone) — re-run each
+ * pre-committed criterion LIVE via the grounded `expect` verb against the current
+ * `--session`, log the ledger, and report met/unmet. `done` REFUSES (envelope
+ * failure) unless every criterion passes. Read-only: it re-dispatches `expect`
+ * (a read-only verb) through the full cli so grounding/egress gates re-apply; it
+ * grants no bypass and makes no model call.
+ */
+async function taskVerify(flags: ParsedFlags, markDone: boolean): Promise<Envelope<unknown>> {
+  const sub = markDone ? 'done' : 'verify'
+  const id = idAt(flags, 1)
+  if (!id) return badRequest(`usage: silver task ${sub} <id> [--session <s>]`)
+  if (!(await taskExists(id))) return badRequest('no such task; run `task start` first')
+  const n = await latestRun(id)
+  if (n === 0) return badRequest('this task has no run yet; run `task start` first')
+
+  const criteria = await readCriteria(id, n)
+  if (criteria.length === 0) {
+    return badRequest('no acceptance criteria to check — commit them first with `task criteria <id> <expect-args…>` (a completion gate needs pre-committed, grounded criteria)')
+  }
+
+  const { run } = await import('../cli.js')
+  const ledger: Array<{ criterion: string; matched: boolean; observed: string; error?: string }> = []
+  for (const c of criteria) {
+    // Re-dispatch the grounded `expect` (read-only) against this session. `expect`
+    // returns success iff the assertion matched; its data carries `observed`.
+    const argv = ['expect', ...c.args, '--session', flags.session]
+    if (flags.namespace) argv.push('--namespace', flags.namespace)
+    const res = await run(argv)
+    // Read `data` regardless of success: `expect`'s NON-match envelope still carries
+    // a populated, already-scrubbed `observed` (the actual url/text/count that failed
+    // to match) — the actual-vs-expected the host needs to fix the page. `data &&
+    // typeof === object` already blanks the hard-error paths (fail(code) → data:null).
+    const d = res.env.data && typeof res.env.data === 'object' ? (res.env.data as Record<string, unknown>) : {}
+    const matched = res.env.success === true
+    ledger.push({
+      // criterion is host-authored `expect` argv (not page content) → bound only;
+      // observed is already scrubbed by `expect` (presentPageText) → bound only
+      // (re-neutralizing would DOUBLE-fence a url/text observation).
+      criterion: bound(c.args.join(' ')),
+      matched,
+      observed: bound(String(d.observed ?? '')),
+      ...(matched ? {} : { error: res.env.error ?? 'assertion failed' }),
+    })
+  }
+  const allPassed = ledger.every((l) => l.matched)
+  const unmet = ledger.filter((l) => !l.matched).map((l) => l.criterion)
+  await appendLog(id, n, { kind: sub, allPassed, unmet, ...(markDone ? { done: allPassed } : {}) })
+
+  if (markDone) {
+    if (!allPassed) {
+      // Structural refusal: not done until every grounded criterion passes.
+      return {
+        success: false,
+        data: { id, run: `run_${n}`, done: false, allPassed, criteria: ledger, unmet },
+        error: `task not done: ${unmet.length} of ${ledger.length} acceptance criteria unmet — ${unmet.join('; ')}. Fix the page state (or the criteria) and re-run \`task done\`.`,
+      }
+    }
+    const at = new Date().toISOString()
+    await writeCompletion(id, n, { done: true, at, ledger: ledger.map(({ criterion, matched, observed }) => ({ criterion, matched, observed })) })
+    return ok({
+      id,
+      run: `run_${n}`,
+      done: true,
+      allPassed: true,
+      criteria: ledger,
+      verifiedAt: at,
+      note: 'every pre-committed criterion passed a LIVE grounded expect — completion is verified, not claimed (zero model calls)',
+    })
+  }
+  return ok({
+    id,
+    run: `run_${n}`,
+    allPassed,
+    criteria: ledger,
+    ...(unmet.length ? { unmet } : {}),
+    note: allPassed ? 'all acceptance criteria pass — `task done` will confirm completion' : 'some criteria unmet — not done yet',
+  })
 }
 
 /**

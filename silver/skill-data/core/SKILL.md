@@ -262,6 +262,9 @@ each worker does `tab new` and drives its own tab; cheaper on RAM, tabs share co
 | `task status <id>` · `task resume <id>` · `task list` | Progress / pick up after a crash / all tasks. |
 | `task compile <id>` | Compile the run into a re-runnable `run_N/compiled.sh` (+ `replay_cache.json`) with detected parameters (override via env var). |
 | `task replay <id> [<current-dom-hash>]` | Replay the compiled script; a per-step DOM-hash gate re-resolves against the live page. |
+| `task criteria <id> [<expect-args…>]` | **Completion gate.** Pre-commit a grounded acceptance criterion (a raw `expect`: `url-matches */order-done`, `text-visible "Order confirmed"`, `.item count 3`), or list them with no args. Commit them BEFORE driving — the yardstick, fixed up front. |
+| `task verify <id>` | Dry-run: re-run every criterion LIVE against `--session`; report which pass/fail. No state change. |
+| `task done <id>` | **REFUSES** (envelope failure, `done:false`, `unmet[]`) unless EVERY pre-committed criterion passes a live grounded `expect`. Completion is verified by grounding, never self-reported — zero model calls. This is the honest done-signal: @ref grounding makes a faked pass impossible. |
 
 ### Subagents (scoped child units of work, keyless) — full: `reference/agents-memory.md`
 

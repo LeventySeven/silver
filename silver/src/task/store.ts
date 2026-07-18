@@ -79,6 +79,61 @@ async function readJson<T>(file: string): Promise<T | null> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// The keyless completion gate (SOTA seam): a run carries a set of PRE-COMMITTED
+// acceptance criteria — each a raw `expect` matcher (`url-matches …`,
+// `text-visible …`, `count …`) that is GROUNDED and keyless. `task verify`/`task
+// done` re-run each one LIVE against the page; `done` refuses unless every one
+// passes. Grounding forbids faking a PASS, so completion is verified, never
+// claimed — the structural-honesty property Silver's @ref model uniquely affords.
+// The criteria file is append-only (a criterion committed BEFORE the outcome
+// cannot be edited to fit it). Plaintext, like plan.md / action_log.jsonl — these
+// are the human-readable run artifact, not session secrets.
+// ---------------------------------------------------------------------------
+
+/** One pre-committed acceptance criterion: the raw `expect` argv + when it was committed. */
+export type Criterion = { args: string[]; addedAt: string }
+
+function criteriaPath(id: string, n: number): string {
+  return path.join(runDirPath(id, n), 'criteria.json')
+}
+
+/** All pre-committed acceptance criteria for a run (empty when none). */
+export async function readCriteria(id: string, n: number): Promise<Criterion[]> {
+  const doc = await readJson<{ criteria: Criterion[] }>(criteriaPath(id, n))
+  return Array.isArray(doc?.criteria) ? doc.criteria : []
+}
+
+/** Append one acceptance criterion (append-only; returns the full ledger). `at`
+ * is the committed timestamp, supplied by the caller (no clock in the store). */
+export async function addCriterion(id: string, n: number, args: string[], at: string): Promise<Criterion[]> {
+  const cur = await readCriteria(id, n)
+  cur.push({ args, addedAt: at })
+  await fs.mkdir(runDirPath(id, n), { recursive: true }).catch(() => {})
+  await writeJson(criteriaPath(id, n), { criteria: cur })
+  return cur
+}
+
+/** The recorded outcome of a passing `task done` (the verified ledger). */
+export type Completion = {
+  done: boolean
+  at: string
+  ledger: Array<{ criterion: string; matched: boolean; observed: string }>
+}
+
+function completionPath(id: string, n: number): string {
+  return path.join(runDirPath(id, n), 'completion.json')
+}
+
+export async function readCompletion(id: string, n: number): Promise<Completion | null> {
+  return readJson<Completion>(completionPath(id, n))
+}
+
+export async function writeCompletion(id: string, n: number, c: Completion): Promise<void> {
+  await fs.mkdir(runDirPath(id, n), { recursive: true }).catch(() => {})
+  await writeJson(completionPath(id, n), c)
+}
+
 /** Does this task exist on disk? */
 export async function taskExists(id: string): Promise<boolean> {
   return (await readJson<TaskMeta>(path.join(taskDir(id), 'meta.json'))) !== null

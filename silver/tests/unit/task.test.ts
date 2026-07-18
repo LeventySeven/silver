@@ -134,6 +134,32 @@ describe('silver task — Webwright keyless run-folder artifact', () => {
     expect(execEntry.event.success).toBe(true)
   })
 
+  it('criteria appends pre-committed acceptance criteria and lists them; done/verify refuse with none', async () => {
+    await run(['task', 'start', 'gated goal', '--id', 'gk', '--namespace', NS])
+
+    // A gate with no criteria refuses to run (before any browser connect) — no yardstick.
+    const noCrit = await run(['task', 'done', 'gk', '--namespace', NS])
+    expect(noCrit.env.success).toBe(false)
+    expect(noCrit.env.error).toContain('no acceptance criteria')
+
+    // Commit two criteria; the ledger accumulates and lists them verbatim.
+    const c1 = await run(['task', 'criteria', 'gk', 'url-matches', '*/done', '--namespace', NS])
+    expect(data<{ count: number }>(c1).count).toBe(1)
+    const c2 = await run(['task', 'criteria', 'gk', 'text-visible', 'All set', '--namespace', NS])
+    const l2 = data<{ count: number; criteria: string[] }>(c2)
+    expect(l2.count).toBe(2)
+    expect(l2.criteria).toEqual(['url-matches */done', 'text-visible All set'])
+
+    // Listing (no args) returns the committed ledger without a browser.
+    const listed = await run(['task', 'criteria', 'gk', '--namespace', NS])
+    expect(data<{ count: number }>(listed).count).toBe(2)
+
+    // A `criterion` event is journaled to the action_log (the pre-commit is a trace event).
+    const log = (await fs.readFile(path.join(nsTasks(), 'gk', 'run_1', 'action_log.jsonl'), 'utf8')).trim().split('\n')
+    const kinds = log.map((l) => JSON.parse(l).event?.kind)
+    expect(kinds.filter((k) => k === 'criterion').length).toBe(2)
+  })
+
   it('compile emits a runnable .sh with a # Parameters header from logged commands (F1)', async () => {
     // Log a couple of exec-shaped commands so compile has verbatim invocations.
     await run([
