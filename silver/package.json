@@ -43,8 +43,8 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc -p .",
-    "prepare": "tsc -p .",
+    "build": "tsc -p . && chmod +x dist/cli.js",
+    "prepare": "tsc -p . && chmod +x dist/cli.js",
     "test": "vitest run",
     "dev": "tsx src/cli.ts"
   },

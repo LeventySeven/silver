@@ -40,6 +40,15 @@ export type ParsedFlags = {
    * through a proxy. Applied at LAUNCH (Chromium `--proxy-server`), so it only takes
    * effect on a FRESH session (like `--profile`/`--engine`); unauthenticated proxies. */
   proxy?: string
+  /** CloakHQ binary swap: `--exec-path <path>` spawns a different Chromium executable
+   * (e.g. a stealth build) instead of the bundled one. Applied at LAUNCH (like --proxy);
+   * for a set-once form that also survives an auto-respawn, use SILVER_BROWSER_EXECUTABLE. */
+  execPath?: string
+  /** 2c: `--restore` auto-loads this session's saved cookies+localStorage on `open`
+   * and autosaves them after mutating commands, so a logged-in session survives a
+   * daemon crash/idle-reap. Encrypted at rest (AES-256-GCM sidecar); the user's own
+   * cookies, never minted. */
+  restore?: boolean
   maxOutput?: number
   /** ON by default; `--no-content-boundaries` disables. */
   contentBoundaries: boolean
@@ -268,6 +277,9 @@ const VALUE_FLAGS: Record<string, keyof ParsedFlags> = {
   // Vercel-alignment: route the session's browser through an (unauthenticated)
   // proxy — applied at LAUNCH, so it takes effect on a FRESH session only.
   proxy: 'proxy',
+  // CloakHQ binary swap: spawn a different (stealth) Chromium executable — applied
+  // at LAUNCH, so it takes effect on a FRESH session only (like --proxy/--profile).
+  'exec-path': 'execPath',
   // network / storage verb sub-flags.
   filter: 'filter',
   type: 'type',
@@ -329,6 +341,9 @@ const BOOL_FLAGS: Record<string, keyof ParsedFlags> = {
   // subagent spawn boolean flags.
   background: 'background',
   tab: 'tab',
+  // 2c: durable session — auto-load saved cookies+localStorage on open, autosave
+  // after mutating commands (survives a daemon crash/idle-reap).
+  restore: 'restore',
   // network / batch verb boolean flags.
   abort: 'abort',
   clear: 'clear',
@@ -405,6 +420,7 @@ function defaults(): ParsedFlags {
     list: false,
     background: false,
     tab: false,
+    restore: false,
     echoPlan: false,
     noConfig: false,
     secrets: [],

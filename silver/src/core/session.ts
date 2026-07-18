@@ -75,6 +75,13 @@ export type SessionInfo = {
   userDataDir?: string
   /** Whether to launch headed (recorded for the non-chromium relaunch path). */
   headed?: boolean
+  /** The custom browser executable this session was spawned with (CloakHQ binary
+   * swap), if any — recorded so `doctor`/`session` can surface a non-default,
+   * user-obtained binary. Absent means the bundled Chromium. */
+  execPath?: string
+  /** 2c: this session is a durable (--restore) session — its cookies+localStorage
+   * are autosaved to the external restore file. Sticky across auto-respawn. */
+  restore?: boolean
 }
 
 export type OpenOptions = {
@@ -105,6 +112,28 @@ export type OpenOptions = {
   /** Vercel-alignment: route the browser through a proxy (Chromium `--proxy-server`),
    * applied at launch. Unauthenticated proxies only. */
   proxy?: string
+  /**
+   * CloakHQ alignment (opt-in binary swap): an operator-supplied path to a
+   * DIFFERENT Chromium executable to spawn instead of Playwright's bundled one —
+   * e.g. a source-level stealth build (cloakbrowser.dev) whose C++ fingerprint
+   * patches (canvas/WebGL/TLS-JA3/fonts) live below JS and cannot be reimplemented
+   * in Silver. Silver still drives it over CDP (a stealth Chromium is a standard
+   * CDP target), and every security guard (egress/redaction/containment) is
+   * Node-layer and runs BEFORE goto/fetch — so the swap buys authenticity WITHOUT
+   * weakening the envelope. Silver NEVER downloads/bundles the binary; it only
+   * accepts a path the user obtained themselves. Falls back to
+   * `SILVER_BROWSER_EXECUTABLE` (the sticky, set-once form that also survives an
+   * auto-respawn), then to the bundled Chromium.
+   */
+  execPath?: string
+  /**
+   * 2c durable session: mark this session so its cookies+localStorage are
+   * autosaved (after mutating commands) to an encrypted restore file that lives
+   * OUTSIDE the session dir — so it survives closeSession's `fs.rm(sessionDir)`,
+   * `session gc`, AND a daemon SIGKILL. The mark is made STICKY in the sidecar
+   * (see openSession) so a later bare command's auto-respawn does not drop it.
+   */
+  restore?: boolean
 }
 
 /**
@@ -555,6 +584,132 @@ function assertName(name: string): string {
   return name
 }
 
+// ---------------------------------------------------------------------------
+// 2c — durable session snapshot (cookies + per-origin localStorage).
+//
+// Persisted so a logged-in session survives a daemon crash / idle-reap / graceful
+// close. Deliberately lives OUTSIDE the session dir (a SIBLING of `sessions/`),
+// because closeSession's `fs.rm(sessionDir)` and `session gc` wipe the WHOLE
+// session dir (profile included) — so an in-dir file would be lost on a graceful
+// close, the exact "log in once, come back tomorrow" case this feature exists for.
+// Written through writeSidecar → AES-256-GCM at rest exactly like every other
+// sidecar (it holds session tokens; never plaintext). No token is ever minted:
+// this is the user's OWN session, captured and replayed.
+// ---------------------------------------------------------------------------
+
+export type RestoreSnapshot = {
+  cookies: unknown[]
+  origins: Array<{ origin: string; localStorage: Array<{ name: string; value: string }> }>
+}
+
+/** Persistent restore dir, a SIBLING of `sessions/` so a session's teardown never
+ * deletes it: `~/.silver/[<ns>/]restore`. */
+function restoreRoot(): string {
+  const base = path.join(os.homedir(), '.silver')
+  return activeNamespace ? path.join(base, activeNamespace, 'restore') : path.join(base, 'restore')
+}
+
+/** `~/.silver/[<ns>/]restore/<name>.json`. The name is validated (assertName) so
+ * it can never escape the restore dir. */
+export function restorePath(name: string): string {
+  return path.join(restoreRoot(), `${assertName(name)}.json`)
+}
+
+/** Read the durable snapshot, or null when none/corrupt. */
+export async function readRestoreSnapshot(name: string): Promise<RestoreSnapshot | null> {
+  try {
+    return await readSidecarObject<RestoreSnapshot>(restorePath(name))
+  } catch {
+    return null
+  }
+}
+
+/** Write the durable snapshot (encrypted at rest, best-effort dir create). */
+export async function writeRestoreSnapshot(name: string, snap: RestoreSnapshot): Promise<void> {
+  await fs.mkdir(restoreRoot(), { recursive: true })
+  await writeSidecar(restorePath(name), snap)
+}
+
+/**
+ * Capture the CURRENT session state into a RestoreSnapshot, MERGING with any prior
+ * snapshot so other origins' localStorage survives a navigation. Cookies come from
+ * `context.storageState()` (all origins, always complete). localStorage does NOT
+ * cross connectOverCDP (storageState returns `origins:[]` over CDP), so the CURRENT
+ * page's origin localStorage is scraped manually and merged — the same honest
+ * single-active-origin capture `state save` documents.
+ *
+ * The load-bearing distinction is CAPTURE-FAILURE vs GENUINE-EMPTY:
+ *   - A FAILED capture must never overwrite a good snapshot (a transient CDP
+ *     hiccup on the per-command reconnect would otherwise wipe the login):
+ *     `storageState()` rejecting returns `null` here → the caller SKIPS the write;
+ *     a failed localStorage scrape PRESERVES that origin's prior localStorage.
+ *   - A SUCCESSFUL-but-empty capture is a real state and IS persisted: a
+ *     `localStorage.clear()` logout (localStorage-only auth) drops the origin, so a
+ *     logged-out session is not resurrected on the next `open --restore`.
+ * Returns `null` when the capture is untrustworthy (caller must not write it).
+ */
+export async function captureRestoreSnapshot(
+  name: string,
+  context: BrowserContext,
+  page: Page | null,
+): Promise<RestoreSnapshot | null> {
+  // Cookies cover all origins. If storageState() REJECTS the capture is
+  // untrustworthy — return null so the caller does not clobber a good login with
+  // []. (A successful empty result IS trusted and persisted.)
+  let state: { cookies?: unknown[] }
+  try {
+    state = (await context.storageState()) as { cookies?: unknown[] }
+  } catch {
+    return null
+  }
+  const cookies = Array.isArray(state.cookies) ? state.cookies : []
+
+  let origin = ''
+  try {
+    origin = page ? new URL(page.url()).origin : ''
+  } catch {
+    origin = ''
+  }
+
+  // Merge: base off the PRIOR snapshot's origins (accumulated over the session so
+  // OTHER origins survive), drop the current origin's stale entry, then re-add per
+  // the failure-vs-empty rule below. `origin===''`/about:blank keeps all prior
+  // origins untouched (nothing to scrape).
+  const prev = await readRestoreSnapshot(name).catch(() => null)
+  const prevForOrigin = prev?.origins?.find((o) => o.origin === origin)
+  const origins = (prev?.origins ?? []).filter((o) => o.origin !== origin)
+
+  if (page && origin && origin !== 'null') {
+    // Scrape localStorage for THIS origin. Distinguish a thrown scrape (untrusted →
+    // preserve prior) from a successful empty result (a real logout → drop it).
+    let ls: Array<{ name: string; value: string }> | null
+    try {
+      ls = (await page.evaluate(() => {
+        const s = (globalThis as unknown as { localStorage: Storage }).localStorage
+        const out: Array<{ name: string; value: string }> = []
+        for (let i = 0; i < s.length; i++) {
+          const k = s.key(i)
+          if (k !== null) out.push({ name: k, value: s.getItem(k) ?? '' })
+        }
+        return out
+      })) as Array<{ name: string; value: string }>
+    } catch {
+      ls = null // scrape FAILED (untrusted) — do not treat as a logout
+    }
+    if (ls === null) {
+      // Failed scrape: keep the prior origin's localStorage rather than lose it.
+      if (prevForOrigin) origins.push(prevForOrigin)
+    } else if (ls.length > 0) {
+      origins.push({ origin, localStorage: ls })
+    }
+    // ls === [] (successful, empty) → drop the origin so a real logout persists.
+  } else if (prevForOrigin) {
+    // No usable page/origin to scrape — never drop a prior entry we can't re-read.
+    origins.push(prevForOrigin)
+  }
+  return { cookies, origins }
+}
+
 /**
  * Spawn a detached Chromium, wait until its debugging endpoint is live, and
  * persist the sidecar. Returns the sidecar contents.
@@ -566,6 +721,14 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
   // Whichever is chosen is recorded in the sidecar and REUSED on every reconnect.
   const userDataDir = opts.profile ?? opts.userDataDir ?? path.join(dir, 'profile')
   await fs.mkdir(userDataDir, { recursive: true })
+
+  // 2c: the --restore mark is STICKY. A later bare command (no --restore) that
+  // triggers an auto-respawn re-runs openSession with THAT command's flags, which
+  // would drop restore=false and silence autosave. OR it with the existing
+  // sidecar's mark so a session opened with --restore stays a restore session for
+  // its whole life. (Fresh open: no prior sidecar → just opts.restore.)
+  const stickyRestore =
+    Boolean(opts.restore) || (await readSidecar(name).catch(() => null))?.restore === true
 
   // BUG #9: delete any STALE `DevToolsActivePort` left in the profile dir. Chromium
   // removes this file on clean exit but LEAVES it on crash/SIGKILL/OOM/sleep. When
@@ -586,14 +749,22 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
 
   const requestedPort = opts.port ?? 0
   const chromium = await loadChromium()
-  const execPath = chromium.executablePath()
+  // CloakHQ binary swap: an operator-supplied stealth Chromium wins over the bundled
+  // one. Precedence: explicit --exec-path (opts.execPath) > SILVER_BROWSER_EXECUTABLE
+  // env (the sticky, set-once form that also survives an auto-respawn, which re-runs
+  // openSession with the current command's flags, NOT the original open's) > bundled.
+  const envExec = process.env.SILVER_BROWSER_EXECUTABLE?.trim()
+  const customExec = opts.execPath?.trim() || (envExec ? envExec : undefined)
+  const execPath = customExec ?? chromium.executablePath()
   // Onramp fix (swap-readiness): a fresh install where Chromium was never downloaded
   // otherwise fails the FIRST `open` with an unclassified `engine_error` ("re-snapshot
   // and retry") — nonsense for a missing binary. Detect it the same way `doctor` does
-  // (existsSync on the resolved path) and throw the TYPED `browser_missing` code so the
-  // envelope carries the `npx playwright install chromium` fix the doctor already knows.
+  // (existsSync on the resolved path) and throw the TYPED code so the envelope carries
+  // the right fix: a MISSING custom binary needs a path fix (cloakbrowser.dev), while a
+  // missing BUNDLED binary needs `npx playwright install chromium`.
   if (!execPath || !existsSync(execPath)) {
-    throw Object.assign(new Error('browser_missing'), { code: 'browser_missing' as const })
+    const code = customExec ? ('browser_execpath_missing' as const) : ('browser_missing' as const)
+    throw Object.assign(new Error(code), { code })
   }
 
   const args = [
@@ -609,7 +780,13 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
     // pin `--host-resolver-rules` here — it would break legitimate resolution and
     // `localhost` — so a residual rebind TOCTOU between our lookup and Chromium's
     // own is accepted and documented (see egress.ts).
-    // stealth: never advertise automation (spec §7) — note: NO --enable-automation
+    // stealth: never advertise automation (spec §7) — note: NO --enable-automation.
+    // CloakHQ de-tell: disable the Blink AutomationControlled feature, which is what
+    // sets `navigator.webdriver = true` — the single most common headless tell. This
+    // is a stable launch FLAG (authenticity: don't advertise automation), NOT fragile
+    // JS canvas/WebGL spoofing (deliberately NOT reimplemented — see OpenOptions.execPath
+    // for the real fingerprint fixes, which live in a stealth binary's compiled C++).
+    '--disable-blink-features=AutomationControlled',
     ...(opts.headed ? [] : ['--headless=new']),
     // Vercel-alignment: route through a proxy (unauthenticated). Applied at launch,
     // so it only affects a FRESH session. The value is operator-supplied argv, not
@@ -646,6 +823,8 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
       engine: 'chromium',
       userDataDir,
       headed: Boolean(opts.headed),
+      ...(customExec ? { execPath: customExec } : {}),
+      ...(stickyRestore ? { restore: true } : {}),
     }
     await fs.mkdir(dir, { recursive: true })
     await writeSidecar(sidecarPath(name), info)

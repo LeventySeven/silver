@@ -231,6 +231,8 @@ generation, tabs) lives in `~/.silver/[<ns>/]sessions/<name>/`.
 |---|---|
 | `--session <name>` | Target/create a named browser. **One detached browser per name.** Default: `default`. |
 | `--proxy <scheme://host:port>` | Route this session's browser through a proxy (unauthenticated). Applied at **launch** — pass it on the FIRST `open` of a session (like `--profile`/`--engine`); the egress guard still governs which hosts navigation may reach. |
+| `--restore` | **Durable session.** Auto-loads this session's saved cookies+localStorage on `open` and autosaves them after mutating commands, so a logged-in session survives a daemon crash / idle-reap / `close`. Encrypted at rest (AES-256-GCM), stored OUTSIDE the session dir (`~/.silver/[<ns>/]restore/<name>.json`); the user's own cookies, never minted. Pass on `open` — the mark is sticky for the session's life. |
+| `--exec-path <path>` (or `SILVER_BROWSER_EXECUTABLE`) | **CloakHQ binary swap.** Spawn a DIFFERENT Chromium executable (e.g. a source-level stealth build from cloakbrowser.dev) instead of the bundled one, for real fingerprint authenticity (canvas/WebGL/TLS-JA3/fonts) Silver won't fake in fragile JS. Silver drives it over CDP unchanged; every guard (egress/redaction/containment) is Node-layer and intact. Silver never downloads/bundles the binary — you supply the path. Use the env var for a set-once form that survives auto-respawn. |
 | `--namespace <ns>` | Isolate an entire agent-GROUP under `~/.silver/<ns>/…`. Two groups both using `--session default` never collide. |
 | `session id [--scope worktree] [--prefix <p>]` | A deterministic session name derived from the cwd (stable per project). |
 | `session list` | This namespace's sessions: name, `alive`, pid, tab count, age. |

@@ -19,6 +19,11 @@ export const ERRORS = {
     message:
       "the Chromium browser isn't installed yet — run `npx playwright install chromium` once, then retry (first-run only)",
   },
+  browser_execpath_missing: {
+    retryableByHost: false,
+    message:
+      'no browser executable at the --exec-path / SILVER_BROWSER_EXECUTABLE you set — point it at a real Chromium binary (e.g. a stealth build from cloakbrowser.dev), or omit it to use the bundled Chromium; not retryable until the path is fixed',
+  },
   element_not_found: {
     retryableByHost: true,
     message:

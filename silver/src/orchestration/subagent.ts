@@ -54,6 +54,21 @@ const SPAWN_LOCK_NAME = '.subagents-lock'
 
 /** Aside's default: at most 5 concurrent children under one parent/namespace. */
 export const CONCURRENCY_CAP = 5
+/**
+ * 3b — crash-safe cap reclamation. A child is driven by the HOST's own loop;
+ * there is NO Silver-side process for it, so a host that dies mid-task never
+ * calls `subagent done|fail` and its record stays `running` FOREVER, permanently
+ * wedging a cap slot (the 6th spawn is refused for good). There is also no
+ * heartbeat and no usable liveness signal — session-daemon liveness does NOT
+ * track the driver (a persistent browser daemon outlives its dead driver), so a
+ * generous TTL on `updatedAt` is the only robust keyless reclaim: a child that
+ * has been `running` this long with no completion is presumed abandoned. It
+ * fails SAFE — a falsely-reaped but still-live child recovers, because its later
+ * `subagent done` simply flips the record back (subagentMark writes status
+ * unconditionally) and its result is preserved. This reclaims the cap SLOT only;
+ * the abandoned child's orphan browser is `session gc`'s job, not the reaper's.
+ */
+export const STALE_SUBAGENT_MS = 30 * 60_000
 const MAX_PROMPT = 20_000
 /** Hard bound on a result FILE (O1). Far above MAX_PROMPT — a long result is
  * written whole (not truncated to MAX_PROMPT); this only caps a hostile blob. */
@@ -86,6 +101,13 @@ export type SubRecord = {
    * truncation of long child output).
    */
   resultPath: string | null
+  /**
+   * 3b — metadata note (NOT the child's output). The stale-reaper writes the
+   * "abandoned…" reason here, leaving `result` null, so a falsely-reaped child
+   * that later completes never surfaces the reap reason as its result. An explicit
+   * done/fail clears it (an answering child was not abandoned). Optional/additive.
+   */
+  note?: string | null
 }
 
 function subagentsRoot(): string {
@@ -145,6 +167,41 @@ async function allRecords(): Promise<SubRecord[]> {
     if (rec) out.push(rec)
   }
   return out
+}
+
+/**
+ * 3b — is this a `running` child that has gone stale (abandoned by a dead
+ * driver)? Keyed on `updatedAt` (the semantic "last activity" — equal to
+ * `createdAt` today since children don't heartbeat, but the right field the day
+ * one is added). An unparseable timestamp is treated as NOT stale (fail-safe:
+ * never reap on a parse glitch).
+ */
+function isStaleRunning(rec: SubRecord): boolean {
+  if (rec.status !== 'running') return false
+  const last = Date.parse(rec.updatedAt)
+  if (!Number.isFinite(last)) return false
+  return Date.now() - last > STALE_SUBAGENT_MS
+}
+
+/**
+ * 3b — reap abandoned children: flip every stale `running` record to `failed`
+ * (in place AND on disk, best-effort) so the cap slot and its session name are
+ * genuinely reclaimed and `list`/`status` tell the truth. MUST be called inside
+ * the spawn lock so the read-check-write stays atomic. A concurrent `subagent
+ * done` from a slow-but-live child races cleanly: whoever writes last wins, and
+ * a real completion (done) is the correct final state.
+ */
+async function reclaimStale(records: SubRecord[]): Promise<void> {
+  for (const rec of records) {
+    if (!isStaleRunning(rec)) continue
+    rec.status = 'failed'
+    // The reap reason goes in `note` (metadata), NOT `result` (the child's output,
+    // which stays null) — so if this child was only PRESUMED dead and later completes
+    // with no --text, its `subagent done` doesn't surface a stale "abandoned…" result.
+    rec.note = `abandoned: no completion within ${Math.round(STALE_SUBAGENT_MS / 60_000)}m (driver presumed dead)`
+    rec.updatedAt = new Date().toISOString()
+    await writeRecord(rec).catch(() => {})
+  }
 }
 
 /** Highest `sa<N>` in use + 1 (scans existing records so ids never collide). The
@@ -208,7 +265,13 @@ async function subagentSpawn(flags: ParsedFlags): Promise<Envelope<unknown>> {
   return withSessionLock(SPAWN_LOCK_NAME, async () => {
     const records = await allRecords()
 
-    // CONCURRENCY CAP: count RUNNING children; refuse the 6th.
+    // 3b — reap abandoned children FIRST (a dead driver never called done/fail),
+    // so a stale slot is reclaimed instead of wedging the cap forever. In-lock,
+    // so the reap + cap-count + clash-check stay atomic.
+    await reclaimStale(records)
+
+    // CONCURRENCY CAP: count RUNNING children; refuse the 6th. Post-reclaim, so
+    // `running` no longer includes an abandoned child (its status is now failed).
     const running = records.filter((r) => r.status === 'running')
     if (running.length >= CONCURRENCY_CAP) {
       return badRequest(`too many active subagents (limit ${CONCURRENCY_CAP}); wait for one to finish`)
@@ -333,15 +396,19 @@ async function subagentWait(flags: ParsedFlags): Promise<Envelope<unknown>> {
 async function subagentMark(flags: ParsedFlags, status: 'done' | 'failed'): Promise<Envelope<unknown>> {
   const id = sanitizeSegment(flags.args[1])
   if (!id) return badRequest(`usage: silver subagent ${status === 'done' ? 'done' : 'fail'} <id> [--text <result>] [--result-file <path>]`)
-  const rec = await readRecord(id)
-  if (!rec) return badRequest('no such subagent; run `subagent list` to see ids')
 
+  // READ the result payload OUTSIDE the lock (an external `--result-file` read is
+  // I/O independent of the record and must not hold the lock), but DEFER the
+  // writeResultFile SIDE EFFECT until AFTER the in-lock existence check — else a
+  // bogus/typoed id would leave an orphan `<id>.result.txt` on disk.
+  //
   // O1 — result-file handoff. `subagent done --text` USED to `capOutput(…,
   // MAX_PROMPT)` and SILENTLY truncate a long result. Now: if `--result-file`
   // is given (host-wired flag `resultFile`, or a trailing positional path), or
   // `--text` exceeds MAX_PROMPT, write the FULL result into the subagents dir
   // and record `resultPath`; `result` keeps only a bounded preview. The parent
   // reads the file only if it needs the whole thing.
+  let pending: { content: string; spill: boolean } | null = null
   const explicitFile =
     (flags as ParsedFlags & { resultFile?: string }).resultFile ?? flags.args[2] ?? null
   if (explicitFile) {
@@ -362,21 +429,38 @@ async function subagentMark(flags: ParsedFlags, status: 'done' | 'failed'): Prom
       // No path in the error string (no-leak invariant).
       return badRequest('could not read --result-file (no such file or not readable)')
     }
-    rec.resultPath = await writeResultFile(id, content)
-    rec.result = capOutput(content, MAX_PROMPT)
+    pending = { content, spill: true } // a --result-file always spills to disk
   } else if (flags.text !== undefined) {
-    if (flags.text.length > MAX_PROMPT) {
-      rec.resultPath = await writeResultFile(id, flags.text)
-      rec.result = capOutput(flags.text, MAX_PROMPT) // bounded preview; full is on disk
-    } else {
-      rec.result = flags.text
-    }
+    pending = { content: flags.text, spill: flags.text.length > MAX_PROMPT }
   }
 
-  rec.status = status
-  rec.updatedAt = new Date().toISOString()
-  await writeRecord(rec)
-  return ok({ id, status, result: present(rec.result), resultPath: rec.resultPath ?? null })
+  // 3b — hold the SAME spawn lock across read → mutate → write, so an explicit
+  // done/fail cannot be clobbered by a concurrent spawn's `reclaimStale` (which
+  // also writes records under this lock). Read the record FRESH inside the lock so
+  // we act on the latest state — a reap may have just flipped it to failed.
+  return withSessionLock(SPAWN_LOCK_NAME, async () => {
+    const rec = await readRecord(id)
+    if (!rec) return badRequest('no such subagent; run `subagent list` to see ids')
+    if (pending) {
+      // Now the record EXISTS — materialize the result (spill to disk only when a
+      // file was supplied or the text exceeds MAX_PROMPT), so no orphan file is
+      // ever written for a missing id.
+      if (pending.spill) {
+        rec.resultPath = await writeResultFile(id, pending.content)
+        rec.result = capOutput(pending.content, MAX_PROMPT)
+      } else {
+        rec.result = pending.content
+      }
+    }
+    // An explicit mark is authoritative: clear any reap `note` (a child that
+    // answers done/fail was NOT abandoned), so a falsely-reaped-then-revived child
+    // never surfaces the stale "abandoned…" reason.
+    rec.note = null
+    rec.status = status
+    rec.updatedAt = new Date().toISOString()
+    await writeRecord(rec)
+    return ok({ id, status, result: present(rec.result), resultPath: rec.resultPath ?? null })
+  })
 }
 
 async function subagentStatus(flags: ParsedFlags): Promise<Envelope<unknown>> {
@@ -390,7 +474,10 @@ async function subagentStatus(flags: ParsedFlags): Promise<Envelope<unknown>> {
 async function subagentList(): Promise<Envelope<unknown>> {
   const records = await allRecords()
   records.sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true }))
-  const running = records.filter((r) => r.status === 'running').length
+  // 3b — report the LIVE count (a stale `running` no longer holds a slot; the
+  // next spawn will reap it). Display-only here — the authoritative reap writes
+  // under the spawn lock, so `list` never mutates and never races a `done`.
+  const running = records.filter((r) => r.status === 'running' && !isStaleRunning(r)).length
   return ok({
     cap: CONCURRENCY_CAP,
     running,
@@ -405,12 +492,17 @@ function view(rec: SubRecord): Record<string, unknown> {
     session: rec.session,
     tab: rec.tab,
     status: rec.status,
+    // 3b — a `running` child past the TTL is abandoned; surface it so the host
+    // sees the truth before the next spawn reaps it. Only ever true on `running`.
+    stale: isStaleRunning(rec),
     readOnly: rec.readOnly,
     allow: rec.allow,
     background: rec.background,
     ageMs: Date.now() - Date.parse(rec.createdAt),
     result: present(rec.result),
     resultPath: rec.resultPath ?? null,
+    // 3b — the reap reason for an abandoned (stale-reclaimed) child; null otherwise.
+    note: rec.note ?? null,
   }
 }
 

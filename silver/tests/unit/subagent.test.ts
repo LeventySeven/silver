@@ -66,6 +66,70 @@ describe('silver subagent — keyless scoped-child orchestration', () => {
     await nuke(ns)
   })
 
+  it('3b: a stale running child (dead driver) is reaped so the cap slot is reclaimed', async () => {
+    const ns = `${NS}-stale`
+    // Fill the cap.
+    for (let i = 0; i < CONCURRENCY_CAP; i++) {
+      const ok = await run(['subagent', 'spawn', `child ${i}`, '--enable-actions', '--namespace', ns])
+      expect(ok.env.success).toBe(true)
+    }
+    // 6th refused — cap full, no stale children yet.
+    const blocked = await run(['subagent', 'spawn', 'blocked', '--enable-actions', '--namespace', ns])
+    expect(blocked.env.success).toBe(false)
+    expect(blocked.env.error).toContain('too many active subagents')
+
+    // Simulate a DEAD driver: age sa1's record past the TTL (it never called
+    // done/fail, so it stays `running` — the exact wedge 3b reclaims). Records are
+    // plain JSON on disk (not sidecars), so this is a faithful stand-in for a
+    // real 30-min-stale child without waiting.
+    const rec1 = path.join(os.homedir(), '.silver', sanitizeNamespace(ns), 'subagents', 'sa1.json')
+    const r = JSON.parse(await fs.readFile(rec1, 'utf8')) as { updatedAt: string; status: string }
+    r.updatedAt = new Date(Date.now() - 60 * 60_000).toISOString() // 60m ago > 30m TTL
+    await fs.writeFile(rec1, JSON.stringify(r, null, 2), 'utf8')
+
+    // list surfaces the staleness (display-only) and drops it from the live count.
+    const listed = await run(['subagent', 'list', '--namespace', ns])
+    const l = data<{ running: number; subagents: Array<{ id: string; stale: boolean }> }>(listed)
+    expect(l.running).toBe(CONCURRENCY_CAP - 1)
+    expect(l.subagents.find((s) => s.id === 'sa1')?.stale).toBe(true)
+
+    // The next spawn REAPS sa1 (under the spawn lock) and succeeds — slot reclaimed.
+    const reopened = await run(['subagent', 'spawn', 'reclaimed', '--enable-actions', '--namespace', ns])
+    expect(reopened.env.success).toBe(true)
+
+    // sa1 is now `failed` (abandoned), no longer wedging the cap; the reason lives
+    // in `note` (metadata), NOT `result` (which stays null — it produced no output).
+    const after = await run(['subagent', 'list', '--namespace', ns])
+    const a = data<{ subagents: Array<{ id: string; status: string; result: string | null; note: string | null }> }>(after)
+    const sa1 = a.subagents.find((s) => s.id === 'sa1')
+    expect(sa1?.status).toBe('failed')
+    expect(sa1?.note).toContain('abandoned')
+    expect(sa1?.result).toBeNull()
+    await nuke(ns)
+  })
+
+  it('3b: a falsely-reaped child that later completes (no --text) shows its real result, not the reap note', async () => {
+    const ns = `${NS}-revive`
+    await run(['subagent', 'spawn', 'slow child', '--enable-actions', '--namespace', ns])
+    // Age it past the TTL and reap it via a subsequent spawn.
+    const rec1 = path.join(os.homedir(), '.silver', sanitizeNamespace(ns), 'subagents', 'sa1.json')
+    const r = JSON.parse(await fs.readFile(rec1, 'utf8')) as { updatedAt: string }
+    r.updatedAt = new Date(Date.now() - 60 * 60_000).toISOString()
+    await fs.writeFile(rec1, JSON.stringify(r, null, 2), 'utf8')
+    await run(['subagent', 'spawn', 'trigger reap', '--enable-actions', '--namespace', ns])
+
+    // The still-alive child now completes with NO --text. It must come back `done`
+    // with a null result and the reap note cleared — never the stale "abandoned…".
+    const done = await run(['subagent', 'done', 'sa1', '--namespace', ns])
+    expect(done.env.success).toBe(true)
+    const listed = await run(['subagent', 'list', '--namespace', ns])
+    const sa1 = data<{ subagents: Array<{ id: string; status: string; result: string | null; note: string | null }> }>(listed).subagents.find((s) => s.id === 'sa1')
+    expect(sa1?.status).toBe('done')
+    expect(sa1?.result).toBeNull()
+    expect(sa1?.note).toBeNull()
+    await nuke(ns)
+  })
+
   it('CAP + id/session invariants hold under interleaved concurrent spawns (namespace lock)', async () => {
     const ns = `${NS}-race`
     // Fire CAP+4 spawns CONCURRENTLY. Without the namespace-scoped lock the
@@ -204,6 +268,25 @@ describe('silver subagent — keyless scoped-child orchestration', () => {
     const waited = await run(['subagent', 'wait', 'sa1', '--timeout', '2000', '--namespace', ns])
     const w = data<{ results: Array<{ id: string; resultPath: string | null }> }>(waited)
     expect(w.results[0].resultPath).toBe(d.resultPath)
+    await nuke(ns)
+  })
+
+  it('O1: done <nonexistent-id> --result-file (valid in-cwd) fails cleanly and leaves NO orphan result file', async () => {
+    const ns = `${NS}-orphan`
+    // Note: no spawn — the id does not exist.
+    const src = path.join(process.cwd(), `silver-orphan-${process.pid}-${Date.now()}.txt`)
+    await fs.writeFile(src, 'a valid, contained result file', 'utf8')
+
+    const done = await run(['subagent', 'done', 'sa999', '--result-file', src, '--namespace', ns])
+    expect(done.env.success).toBe(false)
+    expect(done.env.error).toContain('no such subagent')
+
+    // The side effect (writeResultFile) must NOT have run for a missing record —
+    // no <id>.result.txt orphan under the subagents dir.
+    const orphan = path.join(os.homedir(), '.silver', sanitizeNamespace(ns), 'subagents', 'sa999.result.txt')
+    await expect(fs.access(orphan)).rejects.toThrow()
+
+    await fs.rm(src, { force: true }).catch(() => {})
     await nuke(ns)
   })
 

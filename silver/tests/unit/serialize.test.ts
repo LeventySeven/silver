@@ -137,6 +137,64 @@ describe('render — golden line format + ref minting', () => {
   })
 })
 
+describe('render — design 2b duplicate-label disambiguation (near= hints)', () => {
+  // One "card": a container generic holding a distinctive heading then an
+  // identical action button (heading precedes the button → preceding-sibling win).
+  const card = (buttonId: number, w: string, base: number): SnapNode[] => [
+    mk({ backendNodeId: base, role: 'generic', level: 1 }),
+    mk({ backendNodeId: base + 1, role: 'heading', name: `Widget ${w}`, level: 2, refEligible: true }),
+    mk({ backendNodeId: buttonId, role: 'button', name: 'Add to cart', level: 2, refEligible: true }),
+  ]
+
+  it('3 identical buttons under Widget A/B/C get 3 distinct near= hints', () => {
+    const nodes = [
+      mk({ backendNodeId: 0, role: 'RootWebArea', level: 0 }),
+      ...card(10, 'A', 100),
+      ...card(20, 'B', 200),
+      ...card(30, 'C', 300),
+    ]
+    const { text } = render(nodes, emptyMap, { generation: 1, title: 'T', url: 'u' })
+    // buttons mint e2/e4/e6 (headings take e1/e3/e5); the dup group gets distinct hints.
+    expect(text).toContain('button "Add to cart" [ref=e2, level=1, near="Widget A"]')
+    expect(text).toContain('button "Add to cart" [ref=e4, level=1, near="Widget B"]')
+    expect(text).toContain('button "Add to cart" [ref=e6, level=1, near="Widget C"]')
+    // the UNIQUE headings never get a hint.
+    expect(text).not.toContain('heading "Widget A" [ref=e1, near')
+  })
+
+  it('a UNIQUE label gets no near= hint (token-lean; golden unchanged)', () => {
+    const { text } = render(fixture(), emptyMap, {
+      generation: 3,
+      title: 'Test Page',
+      url: 'https://example.com',
+    })
+    expect(text).not.toContain('near=')
+    expect(text).toBe(GOLDEN)
+  })
+
+  it('duplicates with NO distinctive ancestor get no hint (nothing beats a false hint)', () => {
+    const nodes = [
+      mk({ backendNodeId: 0, role: 'RootWebArea', level: 0 }),
+      mk({ backendNodeId: 1, role: 'button', name: 'Go', level: 1, refEligible: true }),
+      mk({ backendNodeId: 2, role: 'button', name: 'Go', level: 1, refEligible: true }),
+    ]
+    const { text } = render(nodes, emptyMap, { generation: 1, title: '', url: '' })
+    expect(text).not.toContain('near=')
+  })
+
+  it('an identical hint across the WHOLE group is dropped (disambiguates nothing)', () => {
+    // Two "Add to cart" buttons both nearest to the SAME region name → no hint.
+    const nodes = [
+      mk({ backendNodeId: 0, role: 'RootWebArea', level: 0 }),
+      mk({ backendNodeId: 1, role: 'region', name: 'Cart', level: 1, refEligible: true }),
+      mk({ backendNodeId: 2, role: 'button', name: 'Add to cart', level: 2, refEligible: true }),
+      mk({ backendNodeId: 3, role: 'button', name: 'Add to cart', level: 2, refEligible: true }),
+    ]
+    const { text } = render(nodes, emptyMap, { generation: 1, title: '', url: '' })
+    expect(text).not.toContain('near=')
+  })
+})
+
 describe('render — redaction at the value choke point', () => {
   it('a password node renders [redacted] and never leaks the raw value', () => {
     const { text } = render(fixture(), emptyMap, {

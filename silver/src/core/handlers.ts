@@ -46,6 +46,9 @@ import {
   noteAction,
   isRepeating,
   setBasicAuthResolver,
+  readRestoreSnapshot,
+  writeRestoreSnapshot,
+  captureRestoreSnapshot,
   type Connection,
   type OpenOptions,
 } from './session.js'
@@ -92,7 +95,7 @@ import { htmlToMarkdown } from '../perception/markdown.js'
 import { assertNavigableResolved, assertContainedPath, isLoopbackLiteralHost } from '../security/egress.js'
 import { neutralize, capOutput } from '../security/injection.js'
 import { redactValue, redactHtml, maskCards, REDACTED } from '../security/redact.js'
-import { requiresConfirm, confirmGateDecision, isDestructivePaidName } from '../security/confirm.js'
+import { requiresConfirm, confirmGateDecision, isDestructivePaidName, MUTATING_VERBS } from '../security/confirm.js'
 import {
   act,
   find,
@@ -537,6 +540,8 @@ function openOpts(flags: ParsedFlags): OpenOptions {
     engine: normalizeEngine(flags.engine),
     profile: flags.profile,
     proxy: flags.proxy,
+    execPath: flags.execPath,
+    restore: flags.restore,
   }
 }
 
@@ -544,6 +549,40 @@ function openOpts(flags: ParsedFlags): OpenOptions {
  * idle wait (engine-plan P1b); the common case uses the lowered default budget. */
 function settleModeFor(flags: ParsedFlags): SettleMode {
   return flags.waitNetworkidle ? 'full' : 'default'
+}
+
+/**
+ * 2c — verbs after which a --restore session autosaves its cookies+localStorage.
+ * The MUTATING set (form input / clicks / eval) plus navigation (which sets
+ * cookies) and the explicit storage verbs. Read-only verbs (snapshot/read/extract
+ * /screenshot) are excluded so the hot observation path never pays the capture;
+ * if a state change slips through, the NEXT mutating command captures it, and the
+ * common login flow always ends on a mutating submit. Over-inclusion is harmless
+ * (an extra capture); a verb not here just defers to the next one.
+ */
+const RESTORE_AUTOSAVE_VERBS: ReadonlySet<string> = new Set<string>([
+  ...MUTATING_VERBS,
+  'open',
+  'goto',
+  'navigate',
+  'back',
+  'forward',
+  'reload',
+  'cookies',
+  'storage',
+  'state',
+])
+
+/**
+ * 2c — is this a durable (--restore) session? True when --restore was passed on
+ * THIS command, or the session was marked restore on `open` (sticky sidecar flag,
+ * so a later bare mutating command still autosaves). The sidecar read is paid only
+ * after the cheap verb-set gate, and only when the flag is absent.
+ */
+async function isRestoreSession(flags: ParsedFlags): Promise<boolean> {
+  if (flags.restore) return true
+  const info = await readSidecar(flags.session).catch(() => null)
+  return info?.restore === true
 }
 
 /**
@@ -644,7 +683,22 @@ async function withConnection<T>(
     // command triggers (`open`) is seeded at document-start. Never throws.
     await applyStorageSeed(page, flags.session).catch(() => {})
     try {
-      return await fn({ ...conn, page })
+      const result = await fn({ ...conn, page })
+      // 2c — autosave the durable snapshot AFTER a mutating verb of a --restore
+      // session, INSIDE the try (before teardown) so the state that survives a
+      // daemon SIGKILL is as fresh as the last command. The cheap verb-set gate is
+      // checked FIRST, so READ-ONLY verbs (snapshot/read/extract/screenshot — the
+      // hot observation path) skip everything. A mutating/nav verb DOES pay one
+      // isRestoreSession sidecar read even on a non-restore session (needed to honor
+      // the sticky mark on a bare command) — in-idiom with the other per-command
+      // sidecar reads here (applyEmulation/applyRoutes/applyStorageSeed), ~sub-ms.
+      // captureRestoreSnapshot returns null on an untrusted capture → skip the write.
+      // Best-effort: a snapshot write must never fail the act (mirrors applyRoutes).
+      if (RESTORE_AUTOSAVE_VERBS.has(flags.verb) && (await isRestoreSession(flags))) {
+        const snap = await captureRestoreSnapshot(flags.session, conn.context, page).catch(() => null)
+        if (snap) await writeRestoreSnapshot(flags.session, snap).catch(() => {})
+      }
+      return result
     } finally {
       // Clear the per-command Basic-Auth resolver so it never bleeds into an
       // unrelated later command sharing this process (e.g. a `batch` sub-command).
@@ -981,7 +1035,29 @@ async function handleOpen(flags: ParsedFlags): Promise<Envelope<unknown>> {
   })
   if (!nav.ok) return navBlocked(url)
 
-  return withConnection(flags, async ({ page }) => {
+  // 2c — auto-load this session's durable snapshot for a restore session. Gated on
+  // isRestoreSession (the STICKY mark), NOT flags.restore alone: autosave is also
+  // sticky, so if load were flag-only a bare `open` (user forgot --restore) on a
+  // crashed durable session would come up logged-out and the sticky autosave would
+  // then OVERWRITE the good snapshot with empty state — destroying the saved login.
+  // Load-and-save must be symmetric. Seed localStorage BEFORE withConnection so
+  // applyStorageSeed registers the document-start init script for THIS command's
+  // goto; cookies are added INSIDE (before the goto) so the first request carries
+  // them. Mirrors the shipped `state load` order. No-op for a non-restore session.
+  const restoreSnap = (await isRestoreSession(flags))
+    ? await readRestoreSnapshot(flags.session).catch(() => null)
+    : null
+  if (restoreSnap && restoreSnap.origins.length > 0) {
+    await saveStorageSeed(flags.session, { origins: originsToSeed(restoreSnap.origins) })
+  }
+
+  return withConnection(flags, async ({ page, context }) => {
+    // 2c — replay the saved cookies into the user's own context before navigating.
+    if (restoreSnap && Array.isArray(restoreSnap.cookies) && restoreSnap.cookies.length > 0) {
+      await context
+        .addCookies(restoreSnap.cookies as Parameters<typeof context.addCookies>[0])
+        .catch(() => {})
+    }
     // Install the capture instrumentation BEFORE navigating so console/network
     // that fires during page load is hooked from document-start (see capture.ts).
     await ensureCapture(page, flags.session).catch(() => {})
