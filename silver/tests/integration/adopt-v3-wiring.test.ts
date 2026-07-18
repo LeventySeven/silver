@@ -81,6 +81,20 @@ describe('D5: unknown-verb typo suggestion is wired into the dispatch gate', () 
     expect(res.env.error).toBe(ERRORS.not_permitted.message)
   })
 
+  it('a truly-unknown verb (no close typo) is reported as UNKNOWN, not a permission dead-end', async () => {
+    // `run` is edit-distance-far from every real verb → no suggestion. Before the
+    // fix this fell through to not_permitted, so retrying with --enable-actions hit
+    // the identical error (a dead-end loop). Now it names the real problem.
+    const res = await run(['run'])
+    expect(res.env.success).toBe(false)
+    expect(res.env.error).toContain('unknown verb')
+    expect(res.env.error).toContain('silver help')
+    expect(res.env.error).not.toBe(ERRORS.not_permitted.message)
+    // ...and adding the grant does NOT change it (it's not a permission problem).
+    const withGrant = await run(['run', '--enable-actions'])
+    expect(withGrant.env.error).toContain('unknown verb')
+  })
+
   it('a URL passed as a verb never leaks past the sanitized prefix', async () => {
     const res = await run(['https://evil.example/pay?token=secret'])
     // Either no suggestion (not a bare token) or a suggestion that never contains

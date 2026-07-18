@@ -26,7 +26,7 @@ import type { ErrorCode } from './core/errors.js'
 import { ERRORS, classifyEngineError } from './core/errors.js'
 import { parseFlags, type ParsedFlags } from './core/flags.js'
 import { loadConfig, mergeConfig } from './core/config.js'
-import { suggestVerb } from './core/suggest.js'
+import { suggestVerb, sanitizeToken } from './core/suggest.js'
 import { buildRegistry } from './security/registry.js'
 import { buildSecretRegistry } from './security/secret.js'
 import { handle, setProcessSecrets } from './core/handlers.js'
@@ -150,7 +150,8 @@ export async function run(argv: string[]): Promise<RunResult> {
     // the plain not_permitted). The suggestion is derived from a SANITIZED token
     // prefix only and returns a verb from our own table, so no URL/selector/secret
     // ever reaches the error string (the load-bearing no-leak detail).
-    const sug = suggestVerb(flags.verb, knownVerbs())
+    const known = knownVerbs()
+    const sug = suggestVerb(flags.verb, known)
     if (sug) {
       return {
         env: {
@@ -162,7 +163,24 @@ export async function run(argv: string[]): Promise<RunResult> {
         json,
       }
     }
-    return { env: fail('not_permitted'), code: 1, json }
+    // Distinguish a REAL actor verb missing its grant (not_permitted is correct —
+    // adding --enable-actions fixes it) from a TRULY-UNKNOWN verb. Without this,
+    // an unknown verb (`silver run`/`do`) reports not_permitted, so the user/agent
+    // retries with --enable-actions and hits the identical error — a dead-end loop.
+    if (known.includes(flags.verb)) {
+      return { env: fail('not_permitted'), code: 1, json }
+    }
+    // Echo only the SAFE token PREFIX (the leading `[A-Za-z][\w-]*` run — the same
+    // sanitizer suggestVerb uses), so a URL/selector/secret passed as a verb (e.g.
+    // `https://evil/pay?token=SECRET`) is truncated at the first `:`/`/`/`=` and
+    // never rides the error string. Null (not a bare token) → echo no name.
+    const safeVerb = sanitizeToken(flags.verb)
+    const label = safeVerb ? `unknown verb "${safeVerb}"` : 'unknown verb'
+    return {
+      env: { success: false, data: null, error: `${label}; run \`silver help\` to list the verbs` },
+      code: 1,
+      json,
+    }
   }
 
   try {

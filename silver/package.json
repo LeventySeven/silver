@@ -10,13 +10,14 @@
     "agent-silver": "./dist/cli.js"
   },
   "engines": {
-    "node": ">=24"
+    "node": ">=20"
   },
   "files": [
     "dist",
     "skill-data",
     "commands",
     "SKILL.md",
+    "README.md",
     "NOTICE",
     "LICENSE"
   ],

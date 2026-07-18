@@ -4979,14 +4979,19 @@ function badRequest(message: string): Envelope<never> {
 const LOOPBACK_LITERAL_REMEDY =
   'a loopback IP literal (127.x / ::1) is blocked, but the loopback NAME is allowed — use `http://localhost:PORT` instead'
 
+const FILE_SCHEME_REMEDY =
+  '`file:` navigation is off by default — pass `--allow-file-access` to open a local file'
+
 /**
- * A `navigation_blocked` denial. The block itself is UNCHANGED; when the denied
- * target is a 127/8 or ::1 literal we additionally surface the loopback remedy as
- * a non-fatal warning. Metadata/private ranges get the plain denial (no hint).
+ * A `navigation_blocked` denial. The block itself is UNCHANGED; we additionally
+ * surface a non-fatal REMEDY warning for the two denials that HAVE an operator fix:
+ * a loopback IP literal (use the loopback NAME) and a `file:` URL (--allow-file-access).
+ * Metadata/private ranges get the plain denial (there is no safe fix to hint).
  */
 function navBlocked(url: string): Envelope<never> {
   const env = fail('navigation_blocked')
   if (isLoopbackLiteralHost(url)) return { ...env, warning: LOOPBACK_LITERAL_REMEDY }
+  if (/^\s*file:/i.test(url)) return { ...env, warning: FILE_SCHEME_REMEDY }
   return env
 }
 
