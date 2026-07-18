@@ -7,6 +7,42 @@ import { setFetchEgressPolicy, currentFetchEgressPolicy } from '../../src/core/s
 // the E2 --profile flag were implemented as functions but NOT wired into the CLI
 // flags path in production (the adversarial verifier's catch). These lock the wiring.
 
+describe('doctor --trifecta: keyless lethal-trifecta self-report (agent-security)', () => {
+  it('flags the HIGH-RISK config (actor + UNSCOPED secret + open egress) and leaks no value', async () => {
+    const r = await run(['doctor', '--trifecta', '--enable-actions', '--secret', 'GH_TOKEN=ghp_TOPSECRET'])
+    const d = r.env.data as {
+      legsArmed: number
+      lethalTrifectaRisk: boolean
+      trifecta: { actor: { armed: boolean }; exfil: { open: boolean }; secret: { unscopedCount: number } }
+    }
+    expect(d.trifecta.actor.armed).toBe(true)
+    expect(d.trifecta.exfil.open).toBe(true)
+    expect(d.trifecta.secret.unscopedCount).toBe(1)
+    expect(d.legsArmed).toBe(3)
+    expect(d.lethalTrifectaRisk).toBe(true)
+    // The report is keyless observability — a secret VALUE must never appear in it.
+    expect(JSON.stringify(d)).not.toContain('ghp_TOPSECRET')
+  })
+
+  it('a scoped secret + an egress allowlist is NOT flagged as a trifecta', async () => {
+    const r = await run(['doctor', '--trifecta', '--secret', 'TOK@bank.com=x', '--allowed-domains', 'bank.com'])
+    const d = r.env.data as {
+      lethalTrifectaRisk: boolean
+      trifecta: { exfil: { open: boolean }; secret: { unscopedCount: number } }
+    }
+    expect(d.trifecta.exfil.open).toBe(false)
+    expect(d.trifecta.secret.unscopedCount).toBe(0)
+    expect(d.lethalTrifectaRisk).toBe(false)
+  })
+
+  it('the read-only default is disarmed on the actor leg', async () => {
+    const r = await run(['doctor', '--trifecta'])
+    const d = r.env.data as { trifecta: { actor: { armed: boolean } }; lethalTrifectaRisk: boolean }
+    expect(d.trifecta.actor.armed).toBe(false)
+    expect(d.lethalTrifectaRisk).toBe(false)
+  })
+})
+
 describe('S2: --allowed-domains reaches the Fetch-layer egress policy via the CLI', () => {
   beforeEach(() => setFetchEgressPolicy({ allowFile: false, allowedDomains: [] }))
 

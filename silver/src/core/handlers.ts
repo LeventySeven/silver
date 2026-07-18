@@ -962,7 +962,7 @@ export async function handle(flags: ParsedFlags): Promise<Envelope<unknown>> {
     case 'version':
       return ok({ name: 'silver', version: VERSION })
     case 'doctor':
-      return handleDoctor()
+      return flags.trifecta ? doctorTrifecta(flags) : handleDoctor()
     case 'skill':
     case 'skills':
       return handleSkill(flags)
@@ -3211,6 +3211,66 @@ type DoctorCheck = {
  * ~/.silver writability, session-lock staleness, and CDP-reachability of any live
  * session. Each failing check ships a remediation command so a host self-repairs.
  */
+/**
+ * `doctor --trifecta` — the keyless lethal-trifecta self-report (agent-security).
+ *
+ * The exfil trifecta is: PRIVATE DATA + UNTRUSTED CONTENT + an OUTBOUND CHANNEL in
+ * one flow. For a browser agent, untrusted content (any page) is inherent, so the
+ * report names the three legs the operator DOES control this invocation — actor
+ * (can it mutate/spend), exfil (can data leave freely), secret (is private data
+ * present) — and flags the dangerous configuration (an UNSCOPED secret + open
+ * egress = a prompt-injected page could exfiltrate it). Reads only flags + the
+ * secret registry's SCOPES (never a value); makes no model call and no browser
+ * round-trip. Pure observability — it changes nothing, it just tells the truth.
+ */
+function doctorTrifecta(flags: ParsedFlags): Envelope<unknown> {
+  const scopes = currentSecrets().scopes()
+  const unscoped = scopes.filter((s) => s.domain === '*')
+  const actorArmed = flags.enableActions === true
+  const exfilOpen = (flags.allowedDomains?.length ?? 0) === 0
+  const secretPresent = scopes.length > 0
+  const exfilTrifecta = secretPresent && exfilOpen // untrusted content is inherent
+  const highRisk = exfilTrifecta && unscoped.length > 0
+
+  return ok({
+    trifecta: {
+      actor: {
+        armed: actorArmed,
+        detail: actorArmed
+          ? 'ARMED — --enable-actions is set: actor verbs (click/fill/type/press/upload/eval/…) can mutate, spend, or destroy'
+          : 'disarmed — read-only default: no actor verb runs without --enable-actions',
+      },
+      exfil: {
+        open: exfilOpen,
+        allowFileAccess: flags.allowFileAccess === true,
+        detail: exfilOpen
+          ? 'OPEN — no --allowed-domains: navigation may reach any public host (the egress guard still blocks loopback/metadata/private and arms the subresource Fetch guard)'
+          : `restricted — navigation allowlisted to: ${(flags.allowedDomains ?? []).join(', ')}`,
+      },
+      secret: {
+        present: secretPresent,
+        count: scopes.length,
+        unscopedCount: unscoped.length,
+        // Scopes only — NEVER a value. `*` = resolves on ANY host (the un-scoped leg).
+        scopes: scopes.map((s) => ({ name: s.name, domain: s.domain, unscoped: s.domain === '*' })),
+        detail: !secretPresent
+          ? 'no secrets registered'
+          : unscoped.length > 0
+            ? `${scopes.length} secret(s); ${unscoped.length} UNSCOPED (domain=*) — an unscoped secret resolves on ANY host the agent reaches; scope it with NAME@domain=…`
+            : `${scopes.length} secret(s), all domain-scoped`,
+      },
+    },
+    legsArmed: [actorArmed, exfilOpen, secretPresent].filter(Boolean).length,
+    lethalTrifectaRisk: highRisk,
+    assessment: highRisk
+      ? 'HIGH RISK: an UNSCOPED secret + open egress — a prompt-injected page could exfiltrate the secret. Scope every secret (NAME@domain=…) and/or set --allowed-domains.'
+      : exfilTrifecta
+        ? 'CAUTION: secrets present + open egress. Secrets are domain-scoped (good); add --allowed-domains for defense in depth.'
+        : 'no exfil trifecta this run: at least one of {private data present, open outbound channel} is absent.',
+    note: 'keyless self-report of THIS invocation’s posture — name the three legs, drop the one the task does not need (agent-security). No model call, no browser round-trip.',
+  })
+}
+
 async function handleDoctor(): Promise<Envelope<unknown>> {
   const checks: DoctorCheck[] = []
 

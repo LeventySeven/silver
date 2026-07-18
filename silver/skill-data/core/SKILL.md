@@ -306,6 +306,7 @@ independent reads.** Touching one shared account is not "independent."
 | `cookies delete <name>` · `cookies clear` | Drop one cookie (test logout) or wipe the jar. **Actor.** |
 | `confirm <id>` · `deny <id>` | Resolve a `--two-phase-confirm` pending action by id: `confirm` executes it (needs `--enable-actions`; one-shot), `deny` aborts it (idempotent). See §3. |
 | `version` · `doctor` | `{name, version}` / install check `{playwright, chromium, uab_writable}`. |
+| `doctor --trifecta` | Keyless **lethal-trifecta self-report** of THIS invocation: which of the actor (`--enable-actions`), exfil (`--allowed-domains` empty = open egress), and secret (any `--secret`, and whether any is UNSCOPED `*`) legs are armed. Flags the high-risk config (an unscoped secret + open egress = a prompt-injected page could exfiltrate it). Scopes only, never a value; no model call. |
 | `skill [--full]` | This guide (compact head, or the whole doc). |
 | `skill --list` · `skill <topic>` | List reference topics / print one (`reference/<topic>.md`). |
 | `skill install [dir]` | Copy the skill files into `<dir>/silver/` (default `./.claude/skills` if it exists, else `.`) — drop the skill into a project. Reports `{installed, target}`. |

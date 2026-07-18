@@ -526,6 +526,19 @@ describe('secret: buildSecretRegistry from env', () => {
   })
 })
 
+describe('secret: SecretRegistry.scopes() (audit — scopes, never values)', () => {
+  it('returns (name, domain) pairs and never a value; a `*` domain reads as unscoped', () => {
+    const reg = buildSecretRegistry(['BANK@bank.com=s3cret', 'LOOSE=anyval'])
+    const scopes = reg.scopes()
+    expect(scopes).toContainEqual({ name: 'BANK', domain: 'bank.com' })
+    expect(scopes).toContainEqual({ name: 'LOOSE', domain: '*' }) // no @DOMAIN → unscoped
+    // No value ever appears in the scope report.
+    expect(JSON.stringify(scopes)).not.toContain('s3cret')
+    expect(JSON.stringify(scopes)).not.toContain('anyval')
+    expect(scopes.filter((s) => s.domain === '*').length).toBe(1)
+  })
+})
+
 // ---------------------------------------------------------------------------
 // confirm: extractAmount + buildConfirmPreview (E2, keyless)
 // ---------------------------------------------------------------------------

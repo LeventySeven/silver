@@ -101,6 +101,15 @@ export class SecretRegistry {
     this.byName.set(entry.name.toUpperCase(), entry)
   }
 
+  /**
+   * The registered (name, domain) SCOPES — NEVER the values. For `doctor
+   * --trifecta` / audit: a `*` domain means the secret resolves on ANY host (the
+   * exfil leg is un-scoped), which the trifecta report flags as a risk.
+   */
+  scopes(): Array<{ name: string; domain: string }> {
+    return [...this.byName.values()].map((e) => ({ name: e.name, domain: e.domain }))
+  }
+
   private lookup(name: string): SecretEntry | undefined {
     return this.byName.get(String(name ?? '').toUpperCase())
   }
