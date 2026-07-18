@@ -3225,12 +3225,15 @@ type DoctorCheck = {
  */
 function doctorTrifecta(flags: ParsedFlags): Envelope<unknown> {
   const scopes = currentSecrets().scopes()
-  const unscoped = scopes.filter((s) => s.domain === '*')
+  // An unscoped secret only exfiltrates if it can actually RESOLVE — a fail-closed
+  // `blocked` one (registered `*` without --allow-unscoped-secrets) never does.
+  const unscopedActive = scopes.filter((s) => s.domain === '*' && !s.blocked)
+  const unscopedBlocked = scopes.filter((s) => s.domain === '*' && s.blocked)
   const actorArmed = flags.enableActions === true
   const exfilOpen = (flags.allowedDomains?.length ?? 0) === 0
   const secretPresent = scopes.length > 0
   const exfilTrifecta = secretPresent && exfilOpen // untrusted content is inherent
-  const highRisk = exfilTrifecta && unscoped.length > 0
+  const highRisk = exfilTrifecta && unscopedActive.length > 0
 
   return ok({
     trifecta: {
@@ -3250,22 +3253,26 @@ function doctorTrifecta(flags: ParsedFlags): Envelope<unknown> {
       secret: {
         present: secretPresent,
         count: scopes.length,
-        unscopedCount: unscoped.length,
-        // Scopes only — NEVER a value. `*` = resolves on ANY host (the un-scoped leg).
-        scopes: scopes.map((s) => ({ name: s.name, domain: s.domain, unscoped: s.domain === '*' })),
+        unscopedActiveCount: unscopedActive.length,
+        unscopedBlockedCount: unscopedBlocked.length,
+        // Scopes only — NEVER a value. `*` = would resolve on ANY host (the exfil
+        // leg); `blocked` = fail-closed, does NOT resolve without --allow-unscoped-secrets.
+        scopes: scopes.map((s) => ({ name: s.name, domain: s.domain, unscoped: s.domain === '*', blocked: s.blocked })),
         detail: !secretPresent
           ? 'no secrets registered'
-          : unscoped.length > 0
-            ? `${scopes.length} secret(s); ${unscoped.length} UNSCOPED (domain=*) — an unscoped secret resolves on ANY host the agent reaches; scope it with NAME@domain=…`
-            : `${scopes.length} secret(s), all domain-scoped`,
+          : unscopedActive.length > 0
+            ? `${scopes.length} secret(s); ${unscopedActive.length} UNSCOPED and ALLOWED (domain=* via --allow-unscoped-secrets) — resolves on ANY host the agent reaches; scope with NAME@domain=…`
+            : unscopedBlocked.length > 0
+              ? `${scopes.length} secret(s); ${unscopedBlocked.length} unscoped but BLOCKED (fail-closed — will not resolve until scoped or --allow-unscoped-secrets)`
+              : `${scopes.length} secret(s), all domain-scoped`,
       },
     },
     legsArmed: [actorArmed, exfilOpen, secretPresent].filter(Boolean).length,
     lethalTrifectaRisk: highRisk,
     assessment: highRisk
-      ? 'HIGH RISK: an UNSCOPED secret + open egress — a prompt-injected page could exfiltrate the secret. Scope every secret (NAME@domain=…) and/or set --allowed-domains.'
+      ? 'HIGH RISK: an UNSCOPED + ALLOWED secret + open egress — a prompt-injected page could exfiltrate the secret. Scope every secret (NAME@domain=…) and/or set --allowed-domains.'
       : exfilTrifecta
-        ? 'CAUTION: secrets present + open egress. Secrets are domain-scoped (good); add --allowed-domains for defense in depth.'
+        ? 'CAUTION: secrets present + open egress. Secrets are domain-scoped or fail-closed (good); add --allowed-domains for defense in depth.'
         : 'no exfil trifecta this run: at least one of {private data present, open outbound channel} is absent.',
     note: 'keyless self-report of THIS invocation’s posture — name the three legs, drop the one the task does not need (agent-security). No model call, no browser round-trip.',
   })

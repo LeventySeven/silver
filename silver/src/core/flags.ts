@@ -52,6 +52,9 @@ export type ParsedFlags = {
   /** `doctor --trifecta`: emit the keyless lethal-trifecta self-report (which of
    * actor / exfil / secret legs are armed this invocation) instead of health checks. */
   trifecta?: boolean
+  /** Opt in to registering an UNSCOPED (`*`-domain) secret. Off by default
+   * (fail-closed): an unscoped `--secret` is blocked from resolving unless set. */
+  allowUnscopedSecrets?: boolean
   maxOutput?: number
   /** ON by default; `--no-content-boundaries` disables. */
   contentBoundaries: boolean
@@ -360,6 +363,9 @@ const BOOL_FLAGS: Record<string, keyof ParsedFlags> = {
   'no-config': 'noConfig',
   // `doctor --trifecta`: the keyless lethal-trifecta self-report (actor/exfil/secret).
   trifecta: 'trifecta',
+  // Fail-closed secrets: opt IN to registering an UNSCOPED (`*`) secret (one that
+  // would resolve on ANY host). Without it, an unscoped `--secret` never resolves.
+  'allow-unscoped-secrets': 'allowUnscopedSecrets',
   // S1: opt-in data-provenance (taint) guard on mutating verbs.
   'taint-guard': 'taintGuard',
   // NOTE: `--wait` is handled explicitly in the parse loop (it is dual-purpose:

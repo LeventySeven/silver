@@ -28,8 +28,11 @@ export function hasSecretToken(value: string): boolean {
   return /<secret>/i.test(String(value ?? ''))
 }
 
-/** One registered secret: an uppercased NAME, its raw VALUE, and a domain glob. */
-export type SecretEntry = { name: string; value: string; domain: string }
+/** One registered secret: an uppercased NAME, its raw VALUE, and a domain glob.
+ * `blocked` marks an UNSCOPED (`domain==='*'`) secret registered WITHOUT the
+ * `--allow-unscoped-secrets` opt-in — it stays in the registry (so a use gives a
+ * precise error) but `resolveValue` refuses it, fail-closed. */
+export type SecretEntry = { name: string; value: string; domain: string; blocked?: boolean }
 
 /**
  * Glob-match a domain spec against a hostname (~20 lines, the whole scope check).
@@ -106,8 +109,12 @@ export class SecretRegistry {
    * --trifecta` / audit: a `*` domain means the secret resolves on ANY host (the
    * exfil leg is un-scoped), which the trifecta report flags as a risk.
    */
-  scopes(): Array<{ name: string; domain: string }> {
-    return [...this.byName.values()].map((e) => ({ name: e.name, domain: e.domain }))
+  scopes(): Array<{ name: string; domain: string; blocked: boolean }> {
+    return [...this.byName.values()].map((e) => ({
+      name: e.name,
+      domain: e.domain,
+      blocked: e.blocked === true,
+    }))
   }
 
   private lookup(name: string): SecretEntry | undefined {
@@ -149,6 +156,15 @@ export class SecretRegistry {
         reason = 'unknown secret'
         return _m
       }
+      if (entry.blocked) {
+        // Fail-closed: an UNSCOPED (`*`) secret registered without the explicit
+        // `--allow-unscoped-secrets` opt-in never resolves — an unscoped secret
+        // would otherwise fill on ANY host the agent reaches (the exfil leg). The
+        // fix is in the reason (scope it, or opt in), surfaced at the point of use.
+        refused = true
+        reason = 'unscoped secret blocked (scope it as NAME@domain=… or pass --allow-unscoped-secrets)'
+        return _m
+      }
       if (!domainMatches(entry.domain, host)) {
         refused = true
         reason = 'domain scope mismatch'
@@ -169,12 +185,20 @@ export class SecretRegistry {
  * Env form: `SILVER_SECRET_<NAME>=VALUE`, or `SILVER_SECRET_<NAME>=DOMAIN|VALUE`
  * to carry a domain glob (no `|` ⇒ domain `*`). Explicit `--secret` specs are
  * applied AFTER env, so a flag overrides an env secret of the same name.
+ *
+ * FAIL-CLOSED (`allowUnscoped=false`, the default): any secret whose domain is `*`
+ * (unscoped — no `@DOMAIN`) is marked `blocked` and will NOT resolve. An unscoped
+ * secret would otherwise fill on ANY host the agent reaches, so it must be an
+ * explicit choice: scope it (`NAME@domain=…`) or pass `--allow-unscoped-secrets`.
  */
 export function buildSecretRegistry(
   specs: string[] = [],
   env: NodeJS.ProcessEnv = process.env,
+  allowUnscoped = false,
 ): SecretRegistry {
   const reg = new SecretRegistry()
+  const mark = (e: SecretEntry): SecretEntry =>
+    e.domain === '*' && !allowUnscoped ? { ...e, blocked: true } : e
   const PREFIX = 'SILVER_SECRET_'
   for (const [key, rawVal] of Object.entries(env)) {
     if (!key.startsWith(PREFIX) || rawVal === undefined) continue
@@ -185,11 +209,11 @@ export function buildSecretRegistry(
       bar >= 0
         ? { name, domain: rawVal.slice(0, bar).trim() || '*', value: rawVal.slice(bar + 1) }
         : { name, domain: '*', value: rawVal }
-    reg.add(entry)
+    reg.add(mark(entry))
   }
   for (const spec of specs) {
     const entry = parseSecretSpec(spec)
-    if (entry) reg.add(entry)
+    if (entry) reg.add(mark(entry))
   }
   return reg
 }

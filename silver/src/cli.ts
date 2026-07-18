@@ -131,7 +131,7 @@ export async function run(argv: string[]): Promise<RunResult> {
   // handlers. The raw values live only in this process — a `<secret>NAME</secret>`
   // / `<totp>NAME</totp>` token in a fill/type value resolves at the actions.ts
   // choke point, so the credential never enters the host context or an envelope.
-  setProcessSecrets(buildSecretRegistry(flags.secrets, process.env))
+  setProcessSecrets(buildSecretRegistry(flags.secrets, process.env, flags.allowUnscopedSecrets === true))
 
   if (flags.verb === '' || flags.verb === 'help' || flags.verb === '--help') {
     return { env: usage(), code: 0, json }

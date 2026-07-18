@@ -8,30 +8,44 @@ import { setFetchEgressPolicy, currentFetchEgressPolicy } from '../../src/core/s
 // flags path in production (the adversarial verifier's catch). These lock the wiring.
 
 describe('doctor --trifecta: keyless lethal-trifecta self-report (agent-security)', () => {
-  it('flags the HIGH-RISK config (actor + UNSCOPED secret + open egress) and leaks no value', async () => {
-    const r = await run(['doctor', '--trifecta', '--enable-actions', '--secret', 'GH_TOKEN=ghp_TOPSECRET'])
+  it('flags HIGH-RISK only when the unscoped secret is ALLOWED (opt-in) + open egress; leaks no value', async () => {
+    const r = await run([
+      'doctor', '--trifecta', '--enable-actions',
+      '--secret', 'GH_TOKEN=ghp_TOPSECRET', '--allow-unscoped-secrets',
+    ])
     const d = r.env.data as {
       legsArmed: number
       lethalTrifectaRisk: boolean
-      trifecta: { actor: { armed: boolean }; exfil: { open: boolean }; secret: { unscopedCount: number } }
+      trifecta: { actor: { armed: boolean }; exfil: { open: boolean }; secret: { unscopedActiveCount: number } }
     }
     expect(d.trifecta.actor.armed).toBe(true)
     expect(d.trifecta.exfil.open).toBe(true)
-    expect(d.trifecta.secret.unscopedCount).toBe(1)
+    expect(d.trifecta.secret.unscopedActiveCount).toBe(1)
     expect(d.legsArmed).toBe(3)
     expect(d.lethalTrifectaRisk).toBe(true)
     // The report is keyless observability — a secret VALUE must never appear in it.
     expect(JSON.stringify(d)).not.toContain('ghp_TOPSECRET')
   })
 
+  it('the SAME unscoped secret WITHOUT the opt-in is fail-closed (blocked) → NOT high risk', async () => {
+    const r = await run(['doctor', '--trifecta', '--enable-actions', '--secret', 'GH_TOKEN=ghp_x'])
+    const d = r.env.data as {
+      lethalTrifectaRisk: boolean
+      trifecta: { secret: { unscopedActiveCount: number; unscopedBlockedCount: number } }
+    }
+    expect(d.trifecta.secret.unscopedActiveCount).toBe(0)
+    expect(d.trifecta.secret.unscopedBlockedCount).toBe(1)
+    expect(d.lethalTrifectaRisk).toBe(false) // fail-closed neutralizes the exfil leg
+  })
+
   it('a scoped secret + an egress allowlist is NOT flagged as a trifecta', async () => {
     const r = await run(['doctor', '--trifecta', '--secret', 'TOK@bank.com=x', '--allowed-domains', 'bank.com'])
     const d = r.env.data as {
       lethalTrifectaRisk: boolean
-      trifecta: { exfil: { open: boolean }; secret: { unscopedCount: number } }
+      trifecta: { exfil: { open: boolean }; secret: { unscopedActiveCount: number } }
     }
     expect(d.trifecta.exfil.open).toBe(false)
-    expect(d.trifecta.secret.unscopedCount).toBe(0)
+    expect(d.trifecta.secret.unscopedActiveCount).toBe(0)
     expect(d.lethalTrifectaRisk).toBe(false)
   })
 

@@ -588,7 +588,7 @@ describe('vercel-parity verbs (real Chromium via the run() entry)', () => {
 
   it('a <secret> header value is resolved at apply time but stored on disk as a reference', async () => {
     const set = await run([
-      '--secret', 'TK=secretval',
+      '--secret', 'TK@localhost=secretval',
       'set', 'headers', '{"Authorization":"Bearer <secret>TK</secret>"}',
       '--enable-actions', '--session', NAME,
     ])
@@ -608,8 +608,8 @@ describe('vercel-parity verbs (real Chromium via the run() entry)', () => {
     // At APPLY time (with the --secret available) the token resolves and the
     // real header reaches the server. A reload guarantees the resolve happens
     // against the known localhost origin (domain scope) rather than about:blank.
-    await run(['--secret', 'TK=secretval', 'open', `${baseUrl}/echo-headers`, '--enable-actions', '--session', NAME])
-    await run(['--secret', 'TK=secretval', 'reload', '--enable-actions', '--session', NAME])
+    await run(['--secret', 'TK@localhost=secretval', 'open', `${baseUrl}/echo-headers`, '--enable-actions', '--session', NAME])
+    await run(['--secret', 'TK@localhost=secretval', 'reload', '--enable-actions', '--session', NAME])
     const text = await run(['get', 'text', '--session', NAME])
     expect(text.env.data as string).toContain('"authorization":"Bearer secretval"')
 

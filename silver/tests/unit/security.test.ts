@@ -518,11 +518,35 @@ describe('secret: buildSecretRegistry from env', () => {
     expect(reg.resolveValue('<secret>ENV_ONE</secret>', 'https://bank.com/').value).toBe(
       'env-scoped',
     )
-    // no-domain env secret resolves anywhere (domain *)
-    expect(reg.resolveValue('<secret>ENV_TWO</secret>', 'https://anywhere.example/').value).toBe(
-      'no-domain',
-    )
+    // no-domain env secret is UNSCOPED (domain *) → fail-closed BLOCKED by default
+    // (was: resolved anywhere). It is registered but refuses to resolve.
+    const un = reg.resolveValue('<secret>ENV_TWO</secret>', 'https://anywhere.example/')
+    expect(un.refused).toBe(true)
+    expect(un.reason).toContain('unscoped')
     expect(reg.size).toBe(3)
+  })
+
+  it('allowUnscoped=true lets an unscoped secret resolve (the explicit opt-in)', () => {
+    const reg = buildSecretRegistry([], { SILVER_SECRET_LOOSE: 'anyval' } as NodeJS.ProcessEnv, true)
+    const r = reg.resolveValue('<secret>LOOSE</secret>', 'https://anywhere.example/')
+    expect(r.refused).toBe(false)
+    expect(r.value).toBe('anyval')
+  })
+})
+
+describe('secret: fail-closed on UNSCOPED secrets (anti-exfil default)', () => {
+  it('an unscoped `--secret NAME=VALUE` is blocked from resolving by default', () => {
+    const reg = buildSecretRegistry(['GH=ghp_x']) // no @domain → unscoped
+    const r = reg.resolveValue('<secret>GH</secret>', 'https://evil.example/')
+    expect(r.refused).toBe(true)
+    expect(r.usedSecret).toBe(false)
+    expect(r.reason).toContain('--allow-unscoped-secrets')
+  })
+
+  it('a domain-SCOPED secret is unaffected (resolves on its host, refuses elsewhere)', () => {
+    const reg = buildSecretRegistry(['GH@github.com=ghp_x'])
+    expect(reg.resolveValue('<secret>GH</secret>', 'https://github.com/').value).toBe('ghp_x')
+    expect(reg.resolveValue('<secret>GH</secret>', 'https://evil.example/').refused).toBe(true)
   })
 })
 
@@ -530,8 +554,8 @@ describe('secret: SecretRegistry.scopes() (audit — scopes, never values)', () 
   it('returns (name, domain) pairs and never a value; a `*` domain reads as unscoped', () => {
     const reg = buildSecretRegistry(['BANK@bank.com=s3cret', 'LOOSE=anyval'])
     const scopes = reg.scopes()
-    expect(scopes).toContainEqual({ name: 'BANK', domain: 'bank.com' })
-    expect(scopes).toContainEqual({ name: 'LOOSE', domain: '*' }) // no @DOMAIN → unscoped
+    expect(scopes).toContainEqual({ name: 'BANK', domain: 'bank.com', blocked: false })
+    expect(scopes).toContainEqual({ name: 'LOOSE', domain: '*', blocked: true }) // unscoped → fail-closed
     // No value ever appears in the scope report.
     expect(JSON.stringify(scopes)).not.toContain('s3cret')
     expect(JSON.stringify(scopes)).not.toContain('anyval')
