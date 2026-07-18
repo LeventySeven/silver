@@ -54,6 +54,16 @@ const PAGES: Record<string, string> = {
     <button id="pay">Pay</button>
     <button id="ok">Continue</button>
   </body></html>`,
+  // A file input, for the `upload` READ-path containment (exfil) check. The
+  // aria-label gives the control a stable accessible name to ground on.
+  '/upload.html': `<!doctype html><html><body>
+    <h1>Upload</h1>
+    <form onsubmit="document.getElementById('o').textContent='Uploaded: '+document.getElementById('f').files[0].name;return false">
+      <input id="f" type="file" aria-label="Pick file">
+      <button>Upload</button>
+    </form>
+    <div id="o">none</div>
+  </body></html>`,
 }
 
 let server: Server
@@ -173,6 +183,44 @@ describe('security hardening (real Chromium via the run() entry)', () => {
     const trav = await run(['screenshot', '../../silver-evil.png', '--session', NAME])
     expect(trav.env.success).toBe(false)
     expect(trav.env.error).toBe(ERRORS.path_denied.message)
+  })
+
+  // --- Fix P1-SEC4 (READ-path mirror): `upload` path containment. `setInputFiles`
+  //     reads a local file INTO the page, so an un-contained upload path is a
+  //     local-file EXFIL primitive — the filesystem mirror of the egress block.
+  //     Screenshot (a WRITE path) is covered above; this pins the READ path:
+  //     out-of-CWD absolute / traversal / $HOME-secret paths are all refused
+  //     fail-closed (the path is never echoed back), while an in-CWD file uploads
+  //     end-to-end — proving containment is the ONLY blocker. Verified against the
+  //     real error-analysis observation that `upload` is not a data-exfil vector.
+  it('upload refuses an out-of-CWD path (exfil block, fail-closed) and accepts an in-CWD file', async () => {
+    const map = await snapshotMap('/upload.html')
+    const fileRef = refByName(map, 'Pick file')
+
+    const home = process.env.HOME ?? '/root'
+    const attempts: Array<[string, string]> = [
+      ['absolute', '/etc/passwd'],
+      ['traversal', '../../../../../../etc/passwd'],
+      ['home-secret', `${home}/.ssh/id_rsa`],
+    ]
+    for (const [label, p] of attempts) {
+      const res = await run(['upload', `@${fileRef}`, p, '--enable-actions', '--session', NAME])
+      expect(res.env.success, `${label} must be denied`).toBe(false)
+      expect(res.env.error, `${label} → path_denied`).toBe(ERRORS.path_denied.message)
+      // Fail-closed: the attempted path is NEVER echoed back into the envelope.
+      expect(JSON.stringify(res.env)).not.toContain(p)
+    }
+
+    // POSITIVE: a throwaway file INSIDE cwd uploads end-to-end — proving the file
+    // input, grounding, and setInputFiles all work and containment is the only gate.
+    const inCwd = path.resolve(process.cwd(), `silver-upl-${process.pid}-${Date.now()}.txt`)
+    writeFileSync(inCwd, 'hello')
+    try {
+      const ok = await run(['upload', `@${fileRef}`, inCwd, '--enable-actions', '--session', NAME])
+      expect(ok.env.success).toBe(true)
+    } finally {
+      rmSync(inCwd, { force: true })
+    }
   })
 
   // --- Fix P0-4: narrowed confirm gate. A paid control is gated; ordinary ones
