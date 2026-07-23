@@ -46,7 +46,16 @@ export function fail(code: ErrorCode, ctx?: Record<string, unknown>): Envelope<n
  */
 export function print(env: Envelope<unknown>, json: boolean): void {
   const out = json ? JSON.stringify(env) : humanForm(env)
-  process.stdout.write(out + '\n')
+  try {
+    process.stdout.write(out + '\n')
+  } catch (err) {
+    // EPIPE: the reader closed the pipe first — `silver … | head`, `| grep -m1`,
+    // a killed pager. That is normal CLI usage, not an error: the default Node
+    // behavior (an unhandled 'error' event on the socket) crashes the process
+    // with a stack trace AFTER the useful output already reached the reader.
+    // Swallow it; re-throw anything else.
+    if ((err as NodeJS.ErrnoException)?.code !== 'EPIPE') throw err
+  }
 }
 
 function humanForm(env: Envelope<unknown>): string {

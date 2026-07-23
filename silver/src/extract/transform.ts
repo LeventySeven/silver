@@ -241,7 +241,14 @@ export function buildBundle(
   instruction?: string,
 ): ExtractBundle {
   void valueMap
-  const contained = ensureContainer(schema)
+  // Normalize shorthand BEFORE forcing the container: `ensureContainer` only wraps
+  // a node whose `type==='object'`, and a shorthand schema has no `type` yet — so
+  // without this a shorthand object is never wrapped into `list[T]`, its url paths
+  // lose the `*` array segment, and `extract resolve` (which the skill tells the
+  // host to run as an array) silently no-ops and echoes raw element IDs as data —
+  // the exact moat-bypass the ID transform exists to prevent. transformSchema's own
+  // internal normalizeShorthand is idempotent on the already-normalized schema.
+  const contained = ensureContainer(normalizeShorthand(schema))
   const { transformed, urlFieldPaths } = transformSchema(contained)
   const prompt =
     instruction && instruction.trim().length > 0
@@ -253,4 +260,41 @@ export function buildBundle(
     snapshot_with_ids: snapshotWithIds,
     url_field_paths: urlFieldPaths,
   }
+}
+
+/**
+ * Defense-in-depth for the moat: if the schema NAMES a link field (`url`/`href`/
+ * `link`) as a shorthand LEAF (a string value) but NOTHING grounded
+ * (`urlFieldPaths` empty), that field was not recognized as URL-bearing — the
+ * classic case is `{url:"uri"}`, where "uri" is a JSON-Schema *format*, not a
+ * type, so normalizeShorthand can't parse it. The transform then leaves the field
+ * as free text and `extract resolve` passes the raw element ID straight through as
+ * data (the silent bypass — IDs-as-URLs returned with success:true). Return a LOUD
+ * advisory (same fail-loud discipline as resolve.ts's unresolved-ID warning) so the
+ * host fixes the schema instead of shipping a leaked ID. Returns undefined when the
+ * moat did engage (paths non-empty) or no link field is named.
+ */
+export function ungroundedUrlWarning(schema: JsonSchema, urlFieldPaths: string[]): string | undefined {
+  if (urlFieldPaths.length > 0) return undefined
+  const names = new Set<string>()
+  const scan = (node: unknown): void => {
+    if (node === null || typeof node !== 'object') return
+    if (Array.isArray(node)) {
+      for (const v of node) scan(v)
+      return
+    }
+    for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+      if (URL_NAME_RE.test(k) && typeof v === 'string') names.add(k)
+      scan(v)
+    }
+  }
+  scan(schema)
+  if (names.size === 0) return undefined
+  return (
+    `the schema names a link field (${[...names].join(', ')}) but it was not recognized as ` +
+    `URL-bearing, so the ID-grounding moat is OFF for it and \`extract resolve\` will pass raw ` +
+    `element IDs through as data. A link field must be a JSON-Schema string — use ` +
+    `{"type":"string","format":"uri"} or the shorthand "string" (not "uri"/"url", which are ` +
+    `formats, not types).`
+  )
 }

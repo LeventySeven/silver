@@ -3,6 +3,7 @@ import {
   transformSchema,
   ensureContainer,
   buildBundle,
+  ungroundedUrlWarning,
   ID_PATTERN,
   type JsonSchema,
 } from '../../src/extract/transform.js'
@@ -224,6 +225,45 @@ describe('buildBundle — assembles the host bundle without calling a model', ()
       { '0-1': 'https://secret.example/leak' },
     )
     expect(JSON.stringify(bundle)).not.toContain('secret.example')
+  })
+
+  it('normalizes a SHORTHAND object BEFORE the container, so it wraps to list[T] and the url path gains `*`', () => {
+    // Real failure (agent-follows-skill e2e): a shorthand object slipped past
+    // ensureContainer (which only wraps a `type:object`), so it stayed a bare object,
+    // url_field_paths was ['url'] (no `*`), and `extract resolve` — run as an array
+    // per the skill — silently echoed raw element IDs as data. Now shorthand === canonical.
+    const bundle = buildBundle(
+      { rank: 'number', title: 'string', url: 'string' } as unknown as JsonSchema,
+      'S',
+      valueMap,
+    )
+    expect(bundle.id_transformed_schema.type).toBe('array') // list[T], not a bare object
+    expect(bundle.url_field_paths).toEqual(['*.url']) // was ['url'] — array resolve now works
+    expect(bundle.id_transformed_schema.items!.properties!.url.pattern).toBe(ID_PATTERN)
+  })
+})
+
+describe('ungroundedUrlWarning — fail loud when a link field silently escapes the moat', () => {
+  it('warns when a shorthand names a link field with a non-type value (e.g. "uri")', () => {
+    // `{url:"uri"}` — "uri" is a JSON-Schema *format*, not a type — so normalizeShorthand
+    // cannot parse it, the field never grounds, and resolve would pass the raw ID through.
+    const { urlFieldPaths } = transformSchema({ title: 'string', url: 'uri' } as unknown as JsonSchema)
+    const warn = ungroundedUrlWarning({ title: 'string', url: 'uri' } as unknown as JsonSchema, urlFieldPaths)
+    expect(warn).toBeDefined()
+    expect(warn).toContain('url')
+    expect(warn).toContain('format')
+  })
+
+  it('is silent when the link field DID ground, or when there is no link field', () => {
+    // Grounded shorthand (via the container fix) → no warning.
+    const g = transformSchema({ url: 'string' } as unknown as JsonSchema)
+    expect(ungroundedUrlWarning({ url: 'string' } as unknown as JsonSchema, g.urlFieldPaths)).toBeUndefined()
+    // No link field at all → no warning (no false positive).
+    const n = transformSchema({ name: 'string', price: 'string' } as unknown as JsonSchema)
+    expect(ungroundedUrlWarning({ name: 'string', price: 'string' } as unknown as JsonSchema, n.urlFieldPaths)).toBeUndefined()
+    // A url-NAMED container (object, not a leaf) is not a silent-leak case → no warning.
+    const c: JsonSchema = { type: 'object', properties: { url: { type: 'object', properties: { a: { type: 'string' } } } } }
+    expect(ungroundedUrlWarning(c, transformSchema(c).urlFieldPaths)).toBeUndefined()
   })
 })
 

@@ -227,6 +227,16 @@ A **session** is one detached browser (browser-as-daemon): `open` spawns it, lat
 connect over CDP and disconnect, and it keeps running between CLI invocations. State (refs,
 generation, tabs) lives in `~/.silver/[<ns>/]sessions/<name>/`.
 
+**Sessions are auto-reaped after 30 minutes idle.** Because the browser outlives the CLI, an
+`open` that is never paired with a `close` would otherwise leak a ~600 MB process forever — and
+a fleet of agents that each open a session leaks one apiece. Every command touches the session's
+`lastUsedAt`, so a session you are *using* never ages out; only an abandoned one does. `open`
+also sweeps idle sessions opportunistically, which makes the live count self-limiting instead of
+unbounded. Tune with `SILVER_SESSION_IDLE_MS` (`0` disables), or sweep on demand with
+`session gc [<idleMs>]`. **Still call `close` when you're done** — the reaper is the safety net,
+not the plan; a subagent that finishes its work should free its browser immediately rather than
+leave ~600 MB parked for half an hour.
+
 | Command | What it does |
 |---|---|
 | `--session <name>` | Target/create a named browser. **One detached browser per name.** Default: `default`. |
@@ -236,7 +246,7 @@ generation, tabs) lives in `~/.silver/[<ns>/]sessions/<name>/`.
 | `--namespace <ns>` | Isolate an entire agent-GROUP under `~/.silver/<ns>/…`. Two groups both using `--session default` never collide. |
 | `session id [--scope worktree] [--prefix <p>]` | A deterministic session name derived from the cwd (stable per project). |
 | `session list` | This namespace's sessions: name, `alive`, pid, tab count, age. |
-| `session gc` | Reap dead sessions (never touches a live pid or an external `connect`ed one). |
+| `session gc [<idleMs>]` | Reap **idle** sessions (kill the browser + remove the dir) **and** dead ones. Idle TTL: `<idleMs>` → `SILVER_SESSION_IDLE_MS` → **30 min** default; `0` disables the idle sweep (dead dirs only). Never touches an external `connect`ed session. |
 | `close [--all]` | Close this session (or every session in the namespace). |
 | `tab list` (or bare `tab`) | Tabs of the active session. |
 | `tab new [url] [--label <L>]` | Open a tab (optionally navigate + label); it becomes active. |

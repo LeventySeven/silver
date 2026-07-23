@@ -82,6 +82,18 @@ export type SessionInfo = {
   /** 2c: this session is a durable (--restore) session — its cookies+localStorage
    * are autosaved to the external restore file. Sticky across auto-respawn. */
   restore?: boolean
+  /**
+   * ISO timestamp of the last `connect()` against this session — i.e. the last
+   * command that actually touched the browser. Written best-effort on every
+   * connect (a failed touch never fails the command).
+   *
+   * This is the idle-reaper's clock. Absent on sidecars written before this
+   * field existed, and on a session that was opened but never used again; both
+   * cases fall back to `createdAt`, which is the conservative choice — it can
+   * only make a session look OLDER, never younger, so a stale sidecar is reaped
+   * rather than leaked.
+   */
+  lastUsedAt?: string
 }
 
 export type OpenOptions = {
@@ -715,6 +727,12 @@ export async function captureRestoreSnapshot(
  * persist the sidecar. Returns the sidecar contents.
  */
 export async function openSession(name: string, opts: OpenOptions = {}): Promise<SessionInfo> {
+  // Opportunistic idle sweep (leak fix). `open` is the moment new OS resources
+  // are committed, so it is the natural place to return abandoned ones — and it
+  // makes the live-session count self-limiting: a fleet can only ever accumulate
+  // one idle-TTL's worth of sessions, instead of growing without bound until the
+  // machine runs out of RAM. Excludes the session being opened, never throws.
+  await reapIdleSessions(resolveIdleTtlMs(opts.idleTimeoutMs), name).catch(() => {})
   const dir = sessionDir(name)
   // E2 real-Chrome-profile: `profile` (an EXISTING user-data-dir) wins over an
   // explicit userDataDir override, which wins over the throwaway per-session dir.
@@ -896,6 +914,105 @@ export async function readSidecar(name: string): Promise<SessionInfo> {
  * MUST `browser.close()` when done — for a connectOverCDP browser that only
  * disconnects the CDP transport; the detached browser process stays alive.
  */
+/**
+ * Default idle TTL before an unused session's browser is reaped: 30 minutes.
+ *
+ * Chosen against the two failure modes. Too short breaks the lean loop — silver's
+ * whole premise is that `open` spawns a daemon that OUTLIVES the CLI invocation,
+ * so a human (or an agent between tool calls) can take a break mid-task. Too long
+ * is what produced the incident this exists to prevent: 105 orphaned daemons,
+ * ~65 GB RSS, the oldest 25 hours dead. 30 min is longer than any real
+ * think-time gap and far shorter than an overnight leak.
+ *
+ * A session that is actively used never ages: `connect()` touches `lastUsedAt`
+ * on EVERY command, so the clock only runs while nothing is driving the browser.
+ */
+export const DEFAULT_SESSION_IDLE_MS = 30 * 60 * 1000
+
+/** Resolve the idle TTL: explicit arg → `SILVER_SESSION_IDLE_MS` → default.
+ * `0` (or any non-positive / unparseable value) DISABLES reaping — the documented
+ * escape hatch for a deliberately long-lived session. */
+export function resolveIdleTtlMs(explicit?: number): number {
+  if (typeof explicit === 'number' && Number.isFinite(explicit)) return explicit
+  const raw = process.env.SILVER_SESSION_IDLE_MS
+  if (raw !== undefined) {
+    const n = Number(raw)
+    if (Number.isFinite(n)) return n
+  }
+  return DEFAULT_SESSION_IDLE_MS
+}
+
+/** Best-effort: stamp `lastUsedAt` on the session's sidecar. Never throws. */
+export async function touchSession(name: string): Promise<void> {
+  try {
+    const info = await readSidecar(name)
+    await writeSidecar(sidecarPath(name), { ...info, lastUsedAt: new Date().toISOString() })
+  } catch {
+    /* a sidecar we cannot read or rewrite ages out on createdAt — see lastUsedAt */
+  }
+}
+
+/** Millis since this session was last touched (falls back to createdAt). */
+function idleMsOf(info: SessionInfo): number {
+  const stamp = info.lastUsedAt ?? info.createdAt
+  const t = Date.parse(stamp)
+  if (!Number.isFinite(t)) return Number.POSITIVE_INFINITY
+  return Date.now() - t
+}
+
+/**
+ * Kill the browsers of sessions idle longer than `ttlMs` and remove their dirs.
+ *
+ * This is the missing half of `session gc`: gc reaps sessions whose process is
+ * already DEAD (cleaning up disk), which by construction can never reclaim a
+ * live-but-abandoned daemon's memory. Without this, an `open` that is never
+ * paired with a `close` leaks a ~600 MB browser forever — and agents that spawn
+ * a session per unit of work leak one each.
+ *
+ * NEVER reaps: external (`connect`ed) sessions — we do not own that process —
+ * the session named by `exclude` (the caller's own, mid-command), or anything
+ * when `ttlMs <= 0`. Entirely best-effort: a failure to reap one session must
+ * not fail the command that opportunistically triggered the sweep.
+ */
+export async function reapIdleSessions(
+  ttlMs: number = resolveIdleTtlMs(),
+  exclude?: string,
+): Promise<{ reaped: string[]; keptAlive: string[] }> {
+  const reaped: string[] = []
+  const keptAlive: string[] = []
+  if (!Number.isFinite(ttlMs) || ttlMs <= 0) return { reaped, keptAlive }
+  let entries
+  try {
+    entries = await fs.readdir(sessionsRoot(), { withFileTypes: true })
+  } catch {
+    return { reaped, keptAlive }
+  }
+  for (const e of entries) {
+    if (!e.isDirectory() || e.name === exclude) continue
+    const name = e.name
+    let info: SessionInfo | null = null
+    try {
+      info = await readSidecar(name)
+    } catch {
+      continue // no/corrupt sidecar — that is plain `session gc`'s job, not ours
+    }
+    // We only reap browsers we own and that are still running.
+    if (info.external || !isPidAlive(info.pid)) continue
+    if (idleMsOf(info) < ttlMs) {
+      keptAlive.push(name)
+      continue
+    }
+    try {
+      process.kill(info.pid, 'SIGTERM')
+    } catch {
+      /* already gone between the liveness check and here */
+    }
+    await fs.rm(sessionDir(name), { recursive: true, force: true }).catch(() => {})
+    reaped.push(name)
+  }
+  return { reaped, keptAlive }
+}
+
 export async function connect(name: string): Promise<Connection> {
   const info = await readSidecar(name)
   // F1: a stale non-chromium sidecar (written before this engine was rejected)
@@ -918,6 +1035,10 @@ export async function connect(name: string): Promise<Connection> {
     throw new Error('the browser has no available context')
   }
   const page = context.pages()[0] ?? (await context.newPage())
+  // Idle-reaper clock: record that this session was actually touched. Strictly
+  // best-effort — a failed touch must never fail the command that triggered it,
+  // and a session whose sidecar we cannot rewrite simply ages out on createdAt.
+  await touchSession(name).catch(() => {})
   // Deterministic viewport (P0-8); best-effort over a CDP-connected page.
   await page.setViewportSize({ width: VIEWPORT.width, height: VIEWPORT.height }).catch(() => {})
   // S2: re-arm the CDP Fetch-layer subresource egress guard on EVERY connect (the

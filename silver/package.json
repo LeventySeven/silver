@@ -45,8 +45,8 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc -p . && chmod +x dist/cli.js",
-    "prepare": "tsc -p . && chmod +x dist/cli.js",
+    "build": "tsc -p . && node -e \"const f='dist/cli.js',fs=require('fs');fs.writeFileSync(f+'.tmp',fs.readFileSync(f));fs.renameSync(f+'.tmp',f)\" && chmod +x dist/cli.js && (xattr -c dist/cli.js 2>/dev/null || true)",
+    "prepare": "tsc -p . && node -e \"const f='dist/cli.js',fs=require('fs');fs.writeFileSync(f+'.tmp',fs.readFileSync(f));fs.renameSync(f+'.tmp',f)\" && chmod +x dist/cli.js && (xattr -c dist/cli.js 2>/dev/null || true)",
     "test": "vitest run",
     "eval": "npm run build && node evals/run.mjs",
     "dev": "tsx src/cli.ts"

@@ -438,7 +438,7 @@ async function applyVerb(
   const timeout = opts.timeout
   switch (verb) {
     case 'click':
-      await locator.click(withClickOpts(opts))
+      await selfVerifyingClick(locator, opts)
       return undefined
     case 'dblclick':
       await locator.dblclick(withClickOpts(opts))
@@ -574,6 +574,91 @@ function withForce(opts: ActOptions): { force?: boolean; timeout?: number } {
  * and held `modifiers`. Only set fields are included, so a plain click is
  * byte-identical to the old `withForce` call.
  */
+/** State we stamp on a target to count pointer/mouse-down events during a click. */
+type ClickProbe = { __silverDown?: number; __silverClickOff?: () => void }
+
+/**
+ * A grounded left-click that self-heals a SILENT CDP input DROP — without ever
+ * double-actuating a click the page merely consumed.
+ *
+ * Under Silver's connectOverCDP reconnect model, Chromium can silently DROP CDP
+ * Input events for a document reached via an in-page navigation: Playwright's
+ * `locator.click()` resolves with no error, yet NOTHING reaches the page — a SILENT
+ * no-op (success reported, no effect). Measured on saucedemo's post-login React
+ * inventory: a trusted click there fires ZERO events (pointerdown/mousedown/mouseup/
+ * click all 0), `--force` also no-ops, the element is un-occluded, and only a DOM
+ * `el.click()` works. On a normal page every one of those events fires once.
+ *
+ * So the drop has a POSITIVE, unambiguous signature: no pointer/mouse-DOWN event
+ * reaches the page at all. We arm a WINDOW-level capture-phase counter for
+ * `pointerdown`/`mousedown` (via an elementHandle so a navigating click's post-check
+ * fails fast), do the normal trusted click, and self-heal with `el.click()` ONLY
+ * when the count is still zero. Crucially, a click the page DELIVERS but then
+ * consumes (any `stopPropagation()`/`stopImmediatePropagation()` on the click, at
+ * any level) still fires mousedown first — count > 0 — so it is NEVER re-fired. That
+ * is the key over an "did the click event reach X?" probe, which a capture-phase
+ * stopper defeats into a double-actuation. A click that navigated (handle detached)
+ * reads as delivered. The check step removes the listeners, so nothing leaks.
+ *
+ * Residual (documented, not claimed away): a page that registers a window-capture
+ * `pointerdown` AND `mousedown` listener that `stopImmediatePropagation()`s before
+ * ours AND is itself the actuator would read as a drop; no real framework does this.
+ *
+ * Scope: ONLY a plain left click with no modifiers. A right/middle click fires
+ * `contextmenu`/`auxclick` (not the mouse-down path we count the same way), and a
+ * modifier-click (e.g. Meta-click to open a new tab) can't be replicated by a plain
+ * DOM `el.click()` — those keep the unmodified trusted path.
+ */
+async function selfVerifyingClick(locator: Locator, opts: ActOptions): Promise<void> {
+  const plainLeft =
+    (opts.button === undefined || opts.button === 'left') &&
+    !(opts.modifiers !== undefined && opts.modifiers.length > 0)
+  if (!plainLeft) {
+    await locator.click(withClickOpts(opts))
+    return
+  }
+  const handle = await locator.elementHandle({ timeout: opts.timeout ?? 5_000 }).catch(() => null)
+  if (handle) {
+    await handle
+      .evaluate((el) => {
+        const probe = el as unknown as ClickProbe
+        probe.__silverDown = 0
+        const w = el.ownerDocument.defaultView
+        if (w === null) return
+        // Window-level capture: fires at the very top of propagation, before any
+        // page handler at any level can consume the event. A delivered click fires
+        // these even if the page later stops the `click`; a CDP drop fires none.
+        const bump = (): void => {
+          probe.__silverDown = (probe.__silverDown ?? 0) + 1
+        }
+        w.addEventListener('pointerdown', bump, true)
+        w.addEventListener('mousedown', bump, true)
+        probe.__silverClickOff = () => {
+          w.removeEventListener('pointerdown', bump, true)
+          w.removeEventListener('mousedown', bump, true)
+        }
+      })
+      .catch(() => {})
+  }
+  await locator.click(withClickOpts(opts))
+  // Delivered if any mouse-down reached the page (input arrived, even if consumed),
+  // or if we can't read the count (the click navigated → node detached). Only a
+  // count of zero — the positive drop signature — triggers the self-heal.
+  const delivered = handle
+    ? await handle
+        .evaluate((el) => {
+          const probe = el as unknown as ClickProbe
+          probe.__silverClickOff?.()
+          return (probe.__silverDown ?? 0) > 0
+        })
+        .catch(() => true)
+    : true
+  if (!delivered && handle) {
+    await handle.evaluate((el) => (el as unknown as { click(): void }).click()).catch(() => {})
+  }
+  await handle?.dispose().catch(() => {})
+}
+
 function withClickOpts(
   opts: ActOptions,
 ): {

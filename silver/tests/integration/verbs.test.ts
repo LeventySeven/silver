@@ -290,10 +290,15 @@ describe('vercel-parity verbs (real Chromium via the run() entry)', () => {
     expect(batched.env.success).toBe(true)
     const data = batched.env.data as {
       count: number
-      results: Array<{ command: string; success: boolean }>
+      results: Array<{ command: string; success: boolean; data?: unknown }>
     }
     expect(data.count).toBe(2)
     expect(data.results.every((r) => r.success)).toBe(true)
+    // A read sub-command's `data` is carried through (not silently dropped), so a
+    // batch of reads is usable for QA/assert — here `get title` returns its title.
+    const title = data.results.find((r) => r.command === 'get title')
+    expect(title?.data).toBeDefined()
+    expect(JSON.stringify(title?.data)).toContain('Silver')
 
     // --bail stops after the first failing sub-command (an unschemed nav is denied).
     const bailed = await run(['batch', 'open notascheme', 'get title', '--bail', '--session', NAME])

@@ -34,6 +34,8 @@ import {
   saveRefMap,
   loadRefMap,
   readSidecar,
+  reapIdleSessions,
+  resolveIdleTtlMs,
   writeSidecar,
   readSidecarObject,
   sessionDir,
@@ -125,7 +127,7 @@ import { hasTotpToken } from '../security/totp.js'
 import { taintGuardCheck } from '../security/taint.js'
 import { resolveSkills, type Skill } from './skillmatch.js'
 import { waitFor, WaitError, type WaitSpec, type WaitState } from '../actuation/wait.js'
-import { buildBundle, type JsonSchema } from '../extract/transform.js'
+import { buildBundle, ungroundedUrlWarning, type JsonSchema } from '../extract/transform.js'
 import { resolveIds } from '../extract/resolve.js'
 
 const VERSION = '0.1.0'
@@ -2778,7 +2780,7 @@ async function handleExtract(flags: ParsedFlags): Promise<Envelope<unknown>> {
       extract: { urlFieldPaths: bundle.url_field_paths, valueMap, generation: gen },
     })
 
-    return ok(bundle)
+    return ok(bundle, ungroundedUrlWarning(schema, bundle.url_field_paths))
   })
 }
 
@@ -3103,8 +3105,26 @@ async function handleSession(flags: ParsedFlags): Promise<Envelope<unknown>> {
     return ok({ id, scope: flags.scope ?? 'cwd' })
   }
   if (sub === 'list') return sessionList()
-  if (sub === 'gc') return sessionGc()
-  return badRequest('usage: silver session id|list|gc')
+  if (sub === 'gc') {
+    // `session gc [<idleMs>]` — override the idle TTL for this sweep only.
+    // Positional (not a flag) so this needs no flag-parser change. `0` disables
+    // the live-session reap, restoring pre-fix behavior (dead dirs only).
+    // Non-numeric is a usage error, not a silent 30-min default: quietly killing
+    // live browsers because of a typo is exactly the surprise this must not have.
+    const raw = flags.args[1]
+    let idleMs: number | undefined
+    if (raw !== undefined) {
+      const n = Number(raw)
+      if (!Number.isFinite(n) || n < 0) {
+        return badRequest(
+          'usage: silver session gc [<idleMs>]  (non-negative number of ms; 0 disables the idle reap)',
+        )
+      }
+      idleMs = n
+    }
+    return sessionGc(idleMs)
+  }
+  return badRequest('usage: silver session id|list|gc [<idleMs>]')
 }
 
 /**
@@ -3139,12 +3159,20 @@ async function sessionList(): Promise<Envelope<unknown>> {
  * (port of the Rust fork's walk_daemons/cleanup_stale_files). Never touches an
  * external (connect'd) session or a session with a live pid.
  */
-async function sessionGc(): Promise<Envelope<unknown>> {
+async function sessionGc(idleMs?: number): Promise<Envelope<unknown>> {
+  // Live-but-idle sweep FIRST: plain gc only removes dirs whose process is already
+  // dead, so on its own it can never reclaim an abandoned daemon's memory. Reaping
+  // idle sessions here turns their pids dead, and the dead-session pass below then
+  // cleans up whatever it left. `idleMs: 0` disables (explicit opt-out).
+  const idle = await reapIdleSessions(resolveIdleTtlMs(idleMs)).catch(() => ({
+    reaped: [] as string[],
+    keptAlive: [] as string[],
+  }))
   let entries
   try {
     entries = await fs.readdir(sessionsRoot(), { withFileTypes: true })
   } catch {
-    return ok({ removed: [], kept: [] })
+    return ok({ removed: [], kept: [], reapedIdle: idle.reaped })
   }
   const removed: string[] = []
   const kept: string[] = []
@@ -3164,7 +3192,7 @@ async function sessionGc(): Promise<Envelope<unknown>> {
       kept.push(name)
     }
   }
-  return ok({ removed, kept })
+  return ok({ removed, kept, reapedIdle: idle.reaped })
 }
 
 function worktreeRoot(start: string): string {
@@ -4870,12 +4898,24 @@ async function handleBatch(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const { run } = await import('../cli.js')
   const shared = sharedGlobals(flags)
 
-  const results: Array<{ command: string; success: boolean; error: string | null }> = []
+  // Each entry carries the sub-command's `data` when it produced any (a read verb:
+  // get value / is / get count / get text / console / …), so a batch of reads is
+  // actually usable for QA/assert — without this the answer was silently dropped and
+  // only success/error survived. `data` is already redacted/neutralized by the
+  // sub-command's own envelope path, so co-locating it leaks nothing new. Action
+  // verbs (no data) stay lean: the field is omitted when undefined.
+  const results: Array<{ command: string; success: boolean; error: string | null; data?: unknown }> = []
   let failed = false
   for (const argv of commands) {
     if (argv.length === 0) continue
     const res = await run([...argv, ...shared])
-    results.push({ command: argv.join(' '), success: res.env.success, error: res.env.error })
+    const entry: { command: string; success: boolean; error: string | null; data?: unknown } = {
+      command: argv.join(' '),
+      success: res.env.success,
+      error: res.env.error,
+    }
+    if (res.env.data !== undefined) entry.data = res.env.data
+    results.push(entry)
     if (!res.env.success) {
       failed = true
       if (flags.bail) break

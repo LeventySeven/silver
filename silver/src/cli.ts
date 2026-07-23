@@ -303,6 +303,16 @@ function isMainModule(): boolean {
 }
 
 if (isMainModule()) {
+  // `silver … | head` (or any reader that exits early) closes the pipe under us.
+  // Node surfaces that as an asynchronous 'error' event on the stdout socket,
+  // which is UNHANDLED by default and crashes with a stack trace — after the
+  // reader already got the bytes it wanted. Piping a CLI into `head`/`grep -m1`
+  // is normal usage, so treat a broken pipe as a clean exit and let anything
+  // else keep crashing loudly.
+  process.stdout.on('error', (err: NodeJS.ErrnoException) => {
+    if (err?.code === 'EPIPE') process.exit(0)
+    throw err
+  })
   run(process.argv.slice(2))
     .then(({ env, code, json }) => {
       print(env, json)

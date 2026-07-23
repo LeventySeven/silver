@@ -31,3 +31,6 @@ profiles/
 # if a future ignore pattern is added — always keep the whole skill-data tree.
 !silver/skill-data/
 !silver/skill-data/**
+
+# Local-only session handoff note (human scratch; never committed/shipped).
+/SESSION_HANDOFF.md
