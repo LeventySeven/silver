@@ -227,15 +227,42 @@ A **session** is one detached browser (browser-as-daemon): `open` spawns it, lat
 connect over CDP and disconnect, and it keeps running between CLI invocations. State (refs,
 generation, tabs) lives in `~/.silver/[<ns>/]sessions/<name>/`.
 
-**Sessions are auto-reaped after 30 minutes idle.** Because the browser outlives the CLI, an
-`open` that is never paired with a `close` would otherwise leak a ~600 MB process forever — and
-a fleet of agents that each open a session leaks one apiece. Every command touches the session's
-`lastUsedAt`, so a session you are *using* never ages out; only an abandoned one does. `open`
-also sweeps idle sessions opportunistically, which makes the live count self-limiting instead of
-unbounded. Tune with `SILVER_SESSION_IDLE_MS` (`0` disables), or sweep on demand with
-`session gc [<idleMs>]`. **Still call `close` when you're done** — the reaper is the safety net,
-not the plan; a subagent that finishes its work should free its browser immediately rather than
-leave ~600 MB parked for half an hour.
+**Sessions are auto-reaped after 30 minutes idle, MACHINE-WIDE.** Because the browser outlives
+the CLI, an `open` that is never paired with a `close` would otherwise leak a ~600 MB process
+forever — and a fleet of agents that each open a session leaks one apiece. Every command touches
+the session's `lastUsedAt`, so a session you are *using* never ages out; only an abandoned one
+does. Two things make that a real guarantee rather than a hope:
+
+- **The sweep spans every namespace, not just yours.** Namespaces isolate *state* so two agent
+  groups never collide on `--session default`; they were never a boundary over each other's OS
+  processes. A namespace-scoped sweep could not see a sibling agent's abandoned browser at all,
+  so a fleet leaked one browser per agent with nothing able to reclaim them.
+- **Every command sweeps, not just `open`.** A fleet that finishes its work never calls `open`
+  again, so piggybacking the sweep there left the last browsers running indefinitely. The sweep
+  is throttled to once a minute machine-wide, so it costs nothing on the hot path.
+- **Each browser also carries its own kill switch**, so it dies on time even if no silver command
+  ever runs again. `open` gives Chromium a `--remote-debugging-pipe` whose other end is held by a
+  ~2 MB `sh` process; Chromium shuts *itself* down the instant that pipe closes. The holder exits
+  when the session's deadline passes (renewed by every command) or when its session dir goes away.
+  Because the trigger is the kernel's file-descriptor refcount, it fires even if the holder is
+  `kill -9`ed, the machine is idle, or every silver process is long gone. Reconnection is
+  unaffected — the TCP debugging port still works exactly as before.
+
+Never reaped: a session an `external` `connect` owns (not our process to kill), one whose lock a
+live command is holding (a long `wait` is still working even though its idle stamp is aging), and
+nothing at all when the TTL is `0` — `SILVER_SESSION_IDLE_MS=0` withholds the kill switch too, so
+that really does mean "this browser outlives everything".
+
+**A session is governed by the TTL it was opened with**, recorded on its sidecar. Because the sweep
+is global, the alternative would be that the shortest TTL anywhere on the machine silently governs
+every agent group. An explicit `session gc <idleMs>` is the deliberate override — an operator
+naming a number outranks another namespace's ambient policy. A reaped session is not a broken one — the next command on it
+transparently respawns the browser, and a `--restore` session comes back logged in, because the
+snapshot lives outside the session dir on purpose.
+
+**Still call `close` when you're done** — the reaper is the safety net, not the plan; a subagent
+that finishes its work should free its browser immediately rather than leave ~600 MB parked for
+half an hour.
 
 | Command | What it does |
 |---|---|
@@ -246,7 +273,7 @@ leave ~600 MB parked for half an hour.
 | `--namespace <ns>` | Isolate an entire agent-GROUP under `~/.silver/<ns>/…`. Two groups both using `--session default` never collide. |
 | `session id [--scope worktree] [--prefix <p>]` | A deterministic session name derived from the cwd (stable per project). |
 | `session list` | This namespace's sessions: name, `alive`, pid, tab count, age. |
-| `session gc [<idleMs>]` | Reap **idle** sessions (kill the browser + remove the dir) **and** dead ones. Idle TTL: `<idleMs>` → `SILVER_SESSION_IDLE_MS` → **30 min** default; `0` disables the idle sweep (dead dirs only). Never touches an external `connect`ed session. |
+| `session gc [<idleMs>]` | Reap **idle** sessions (kill the browser + remove the dir) **and** dead ones, **across every namespace on the machine** — a per-namespace gc was useless as an escape hatch, since reclaiming a fleet meant one invocation per namespace. Idle TTL: `<idleMs>` → `SILVER_SESSION_IDLE_MS` → **30 min** default; `0` disables the idle sweep (dead dirs only). Never touches an external `connect`ed session or one a live command holds. Sessions outside your namespace come back labelled `<ns>/<name>`. |
 | `close [--all]` | Close this session (or every session in the namespace). |
 | `tab list` (or bare `tab`) | Tabs of the active session. |
 | `tab new [url] [--label <L>]` | Open a tab (optionally navigate + label); it becomes active. |

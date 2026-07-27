@@ -11,7 +11,7 @@
  * NO model calls, ever. Errors thrown here are generic (no path / secret) to
  * honor the no-leak invariant.
  */
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { promises as fs, existsSync } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -94,6 +94,28 @@ export type SessionInfo = {
    * rather than leaked.
    */
   lastUsedAt?: string
+  /**
+   * PID of this session's LIFELINE HOLDER — the tiny `sh` process that owns the
+   * browser's `--remote-debugging-pipe` file descriptors and thereby its life.
+   * Absent when no lifeline was attached (reaping disabled, win32, or the fds
+   * could not be handed over — all of which degrade to sweep-only reclamation).
+   * See `spawnLifelineHolder`.
+   */
+  holderPid?: number
+  /**
+   * Filename (inside the session dir) of the clock THIS generation's holder polls.
+   * Generation-unique so an auto-respawn retires the previous holder by unlinking
+   * its file instead of signalling a possibly-recycled pid.
+   */
+  deadlineFile?: string
+  /**
+   * The idle TTL this session was OPENED with, in ms. The sweep is global, so
+   * without this the sweeping process's own TTL would govern every other
+   * namespace's sessions — and a session deliberately opened with
+   * `SILVER_SESSION_IDLE_MS=0` ("outlives everything") would still be reaped by
+   * any unrelated command running with the default. `0` means never reap.
+   */
+  idleTtlMs?: number
 }
 
 export type OpenOptions = {
@@ -745,8 +767,9 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
   // would drop restore=false and silence autosave. OR it with the existing
   // sidecar's mark so a session opened with --restore stays a restore session for
   // its whole life. (Fresh open: no prior sidecar → just opts.restore.)
-  const stickyRestore =
-    Boolean(opts.restore) || (await readSidecar(name).catch(() => null))?.restore === true
+  const prior = await readSidecar(name).catch(() => null)
+  const stickyRestore = Boolean(opts.restore) || prior?.restore === true
+
 
   // BUG #9: delete any STALE `DevToolsActivePort` left in the profile dir. Chromium
   // removes this file on clean exit but LEAVES it on crash/SIGKILL/OOM/sleep. When
@@ -785,6 +808,10 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
     throw Object.assign(new Error(code), { code })
   }
 
+  // Resolve ONCE and persist: this is the TTL that governs this session for its
+  // whole life, including when some other namespace's command sweeps it.
+  const sessionTtlMs = resolveIdleTtlMs(opts.idleTimeoutMs)
+  const withLifeline = lifelineEnabled(sessionTtlMs)
   const args = [
     `--remote-debugging-port=${requestedPort}`,
     `--user-data-dir=${userDataDir}`,
@@ -804,7 +831,19 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
     // is a stable launch FLAG (authenticity: don't advertise automation), NOT fragile
     // JS canvas/WebGL spoofing (deliberately NOT reimplemented — see OpenOptions.execPath
     // for the real fingerprint fixes, which live in a stealth binary's compiled C++).
+    // NOTE: this flag is now LOAD-BEARING for stealth, not merely nice-to-have.
+    // `--remote-debugging-pipe` (added just below for the lifeline) maps straight
+    // to Blink's EnableAutomationControlled feature, i.e. it turns
+    // `navigator.webdriver` back ON. Chromium applies the explicitly-disabled
+    // list LAST, so this line is what keeps it off — measured both ways, and
+    // locked by a regression test. Never reorder these two.
     '--disable-blink-features=AutomationControlled',
+    // The kill switch. Chromium's pipe thread blocks reading fd 3; when the last
+    // writer closes, it reads EOF and shuts ITSELF down. The holder spawned after
+    // this owns that fd, so an abandoned browser dies on its own clock instead of
+    // waiting for some future CLI invocation to sweep it. The TCP debugging port
+    // above is untouched — that is still how every later command reconnects.
+    ...(withLifeline ? ['--remote-debugging-pipe'] : []),
     ...(opts.headed ? [] : ['--headless=new']),
     // Vercel-alignment: route through a proxy (unauthenticated). Applied at launch,
     // so it only affects a FRESH session. The value is operator-supplied argv, not
@@ -816,13 +855,44 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
 
   const child = spawn(execPath, args, {
     detached: true,
-    stdio: 'ignore',
+    // fds 3/4 carry `--remote-debugging-pipe` when the lifeline is on. Chromium
+    // requires BOTH to be real pipes: pointing fd 4 at /dev/null instead makes
+    // the browser exit the moment this CLI does (measured on Chrome 149).
+    stdio: withLifeline
+      ? ['ignore', 'ignore', 'ignore', 'pipe', 'pipe']
+      : ['ignore', 'ignore', 'ignore'],
   })
   child.unref()
 
   const pid = child.pid
   if (pid === undefined) {
     throw new Error('failed to spawn the browser process')
+  }
+
+  // Arm the death clock BEFORE handing the fds over, so the holder's very first
+  // poll reads a real deadline instead of racing an absent file and exiting
+  // immediately — which would take the browser with it. The session dir is
+  // created here rather than later because a custom `--profile`/`userDataDir`
+  // means the default `<dir>/profile` mkdir above never created it.
+  let holderPid: number | undefined
+  const deadlineFile = newDeadlineFile()
+  if (withLifeline) {
+    const armed = await fs
+      .mkdir(dir, { recursive: true })
+      .then(() => renewDeadline(dir, deadlineFile, sessionTtlMs))
+      .then(() => true)
+      .catch(() => false)
+    // No deadline file means no clock to read; spawning the holder anyway would
+    // have it exit on its first poll and kill a browser we just started.
+    if (armed) holderPid = spawnLifelineHolder(child, dir, deadlineFile)
+    // Unconditional: see releasePipeEnds. A failed arm still leaves this process
+    // holding both ends, which would both pin the lifeline open and hang the CLI.
+    releasePipeEnds(child)
+    // The previous generation's holder is retired by removing ITS clock — never
+    // by signalling its recorded pid, which may have been recycled since.
+    if (prior?.deadlineFile && prior.deadlineFile !== deadlineFile) {
+      await fs.rm(path.join(dir, prior.deadlineFile), { force: true }).catch(() => {})
+    }
   }
 
   try {
@@ -843,6 +913,8 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
       headed: Boolean(opts.headed),
       ...(customExec ? { execPath: customExec } : {}),
       ...(stickyRestore ? { restore: true } : {}),
+      ...(holderPid !== undefined ? { holderPid, deadlineFile } : {}),
+      idleTtlMs: sessionTtlMs,
     }
     await fs.mkdir(dir, { recursive: true })
     await writeSidecar(sidecarPath(name), info)
@@ -854,6 +926,10 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
     } catch {
       /* already gone */
     }
+    // The holder we just spawned is watching a browser that never came up. Remove
+    // the clock we minted for it and it exits on its next poll — no pid signal, so
+    // nothing can be misdirected if that pid were ever recycled.
+    await fs.rm(path.join(dir, deadlineFile), { force: true }).catch(() => {})
     throw err
   }
 }
@@ -944,12 +1020,213 @@ export function resolveIdleTtlMs(explicit?: number): number {
 
 /** Best-effort: stamp `lastUsedAt` on the session's sidecar. Never throws. */
 export async function touchSession(name: string): Promise<void> {
+  let info: SessionInfo | null = null
   try {
-    const info = await readSidecar(name)
+    info = await readSidecar(name)
     await writeSidecar(sidecarPath(name), { ...info, lastUsedAt: new Date().toISOString() })
   } catch {
     /* a sidecar we cannot read or rewrite ages out on createdAt — see lastUsedAt */
   }
+  // Renew THIS generation's clock with THIS session's own TTL, so a command run
+  // with a different `SILVER_SESSION_IDLE_MS` cannot re-time someone else's
+  // browser. No recorded file means no lifeline was attached; nothing to feed.
+  if (info?.deadlineFile) {
+    await renewDeadline(sessionDir(name), info.deadlineFile, info.idleTtlMs).catch(() => {})
+  }
+}
+
+/**
+ * The lifeline holder's clock: `<sessionDir>/.deadline`, epoch SECONDS, plaintext.
+ *
+ * Deliberately NOT the encrypted sidecar. The holder is three lines of `sh` and
+ * must read this on a timer; a wall-clock deadline is not secret, and keeping the
+ * holder unable to decrypt anything is the point. Precomputing the deadline rather
+ * than storing a last-used stamp is Aside's `routines.next_run_at` shape — the
+ * watcher does one integer compare and needs no policy of its own.
+ */
+function deadlinePath(dir: string, file: string): string {
+  return path.join(dir, file)
+}
+
+/**
+ * A fresh, generation-unique clock filename.
+ *
+ * Each `openSession` mints a new one so the PREVIOUS generation's holder can be
+ * retired by unlinking ITS file — never by signalling a pid. A holder pid read
+ * back off a sidecar can be stale (the sidecar outlives reboots, and pids are
+ * recycled), so signalling it risks SIGTERMing an unrelated process the user
+ * owns. Unlinking a path we minted cannot be misdirected.
+ */
+function newDeadlineFile(): string {
+  return `.deadline-${process.pid}-${Date.now()}`
+}
+
+/**
+ * A deadline far enough out that the holder will never fire it.
+ *
+ * Used when the TTL is disabled AFTER a session was opened with one. Returning
+ * early would leave the ORIGINAL deadline on disk and the already-attached holder
+ * would still kill the browser at it — turning the documented "this browser
+ * outlives everything" escape hatch into a timed execution.
+ */
+const NEVER_SECONDS = 100 * 365 * 24 * 60 * 60
+
+/**
+ * Push this session's death clock out by one idle TTL. Called on every `connect`
+ * (via `touchSession`), so a session actively being driven never reaches its
+ * deadline — the same "in use never ages" rule the sweeper follows, enforced by
+ * the holder instead of by a future CLI invocation.
+ *
+ * A TTL of `0` (reaping disabled) writes no deadline at all: no lifeline is
+ * attached in that mode, so there is no holder to feed.
+ */
+async function renewDeadline(dir: string, file: string, ttlMs?: number): Promise<void> {
+  const ttl = ttlMs ?? resolveIdleTtlMs()
+  // Disabled TTL still writes — a far-future clock, so an ALREADY-ATTACHED holder
+  // is disarmed rather than left counting down to the previous deadline.
+  const seconds =
+    Number.isFinite(ttl) && ttl > 0
+      ? Math.floor((Date.now() + ttl) / 1000)
+      : Math.floor(Date.now() / 1000) + NEVER_SECONDS
+  // ATOMIC. `fs.writeFile` truncates and then writes in a later turn, so a holder
+  // polling mid-renewal can read a ZERO-LENGTH file — which its validity check
+  // reads as "no clock, exit now", killing a healthy browser that is actively
+  // being driven. Measured at ~1.5% of wall time under a tight renew loop. Write
+  // to a temp file and rename: rename(2) is atomic within a directory, so the
+  // holder always sees a complete old-or-new value. Same discipline as the
+  // sidecars' `atomicWrite`.
+  const target = deadlinePath(dir, file)
+  const tmp = `${target}.tmp.${process.pid}`
+  await fs.writeFile(tmp, `${seconds}\n`, 'utf8')
+  try {
+    await fs.rename(tmp, target)
+  } catch (err) {
+    await fs.rm(tmp, { force: true }).catch(() => {})
+    throw err
+  }
+}
+
+/**
+ * The lifeline holder, as POSIX `sh`. Passed inline via `sh -c` so nothing has to
+ * be packaged, installed, or found on disk at runtime.
+ *
+ * It inherits two file descriptors from the browser's `--remote-debugging-pipe`:
+ *   fd 3 — the write end of Chromium's CDP READ pipe. **This is the lifeline.**
+ *          Chromium's pipe thread blocks on `read()`; when the last writer closes,
+ *          it reads EOF and runs its own `CloseBrowserSoon`. So the browser dies
+ *          because the kernel refcounted this fd to zero — no signal, no timer, no
+ *          cooperation, and it fires even on `kill -9` of everything else.
+ *   fd 4 — the read end of Chromium's CDP WRITE pipe. Drained to `/dev/null` so a
+ *          full pipe buffer can never block Chromium's writer thread. Measured:
+ *          Chromium REQUIRES both to be real pipes — pointing fd 4 at `/dev/null`
+ *          at spawn makes the browser exit as soon as the CLI does.
+ *
+ * The drainer runs as a background subshell that **closes fd 3 first** (`exec 3<&-`).
+ * That detail is load-bearing: a `trap` cannot run on SIGKILL, so if the drainer
+ * still held fd 3, `kill -9` on the holder would leave the lifeline open and the
+ * browser immortal. With fd 3 closed there, SIGKILLing the holder drops the last
+ * writer and the browser dies anyway — verified. The orphaned drainer then reads
+ * EOF on fd 4 as the browser exits and terminates itself.
+ *
+ * Exit conditions: the deadline passes, or the deadline file disappears (which is
+ * how `close` and the sweeper's `rm -rf` also collapse the lifeline).
+ */
+const HOLDER_SH = `
+( exec 3<&- ; cat <&4 >/dev/null 2>&1 ) &
+DRAIN=$!
+exec 4<&-
+trap 'kill "$DRAIN" 2>/dev/null' EXIT
+trap 'exit 0' INT TERM HUP
+miss=0
+while :; do
+  if [ ! -e "$1" ]; then exit 0; fi
+  d=""
+  read -r d < "$1" 2>/dev/null
+  case "$d" in
+    ''|*[!0-9]*)
+      miss=$((miss+1))
+      [ "$miss" -ge 3 ] && exit 0
+      sleep 1
+      continue
+      ;;
+  esac
+  miss=0
+  if [ "$(date +%s)" -ge "$d" ]; then
+    p=$(sed -n 's/.*"pid":\\([0-9]*\\).*/\\1/p' "$2" 2>/dev/null)
+    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+      sleep 5
+      continue
+    fi
+    exit 0
+  fi
+  sleep 5
+done
+`
+
+/** How often the holder re-reads its deadline. Matches HOLDER_SH's `sleep`. */
+export const HOLDER_POLL_SECONDS = 5
+
+/**
+ * Hand the browser's pipe file descriptors to a detached holder process.
+ *
+ * Returns the holder's pid, or `undefined` if no lifeline could be attached — in
+ * which case the caller simply keeps the sweep-only behavior. Every failure here
+ * is non-fatal by design: a browser with no lifeline is exactly what Silver
+ * shipped before, not a broken one.
+ */
+function spawnLifelineHolder(
+  child: ChildProcess,
+  dir: string,
+  file: string,
+): number | undefined {
+  try {
+    const rd = child.stdio[3] as { _handle?: { fd?: number } } | null | undefined
+    const wr = child.stdio[4] as { _handle?: { fd?: number } } | null | undefined
+    const fd3 = rd?._handle?.fd
+    const fd4 = wr?._handle?.fd
+    if (typeof fd3 !== 'number' || typeof fd4 !== 'number') return undefined
+    const holder = spawn(
+      '/bin/sh',
+      ['-c', HOLDER_SH, 'silver-holder', deadlinePath(dir, file), path.join(dir, '.lock')],
+      {
+        detached: true,
+        stdio: ['ignore', 'ignore', 'ignore', fd3, fd4],
+      },
+    )
+    holder.unref()
+    return holder.pid
+  } catch {
+    return undefined // no lifeline; the global sweep remains the backstop
+  }
+}
+
+/**
+ * Release THIS process's copies of the browser's pipe ends.
+ *
+ * Must run on every path once the handover attempt is over — success or failure.
+ * Two things go wrong otherwise: the CLI stays a writer on fd 3, so the lifeline
+ * never reaches EOF (and an in-process caller like the test suite masks a holder
+ * that already exited); and the sockets stay referenced by the event loop, so
+ * `silver open` never exits. The second is why this cannot live only on the
+ * success path — the failure path is exactly the full-disk machine this feature
+ * exists for.
+ */
+function releasePipeEnds(child: ChildProcess): void {
+  ;(child.stdio[3] as { destroy?: () => void } | null)?.destroy?.()
+  ;(child.stdio[4] as { destroy?: () => void } | null)?.destroy?.()
+}
+
+/**
+ * Should this session get a kernel-enforced lifeline?
+ *
+ * No when reaping is disabled (`SILVER_SESSION_IDLE_MS=0` is the documented "this
+ * browser must outlive everything" escape hatch — attaching a death switch there
+ * would silently break it), and no on win32, where extra-fd inheritance and
+ * process detachment do not work the way this depends on.
+ */
+function lifelineEnabled(ttl: number): boolean {
+  if (process.platform === 'win32') return false
+  return Number.isFinite(ttl) && ttl > 0
 }
 
 /** Millis since this session was last touched (falls back to createdAt). */
@@ -960,8 +1237,143 @@ function idleMsOf(info: SessionInfo): number {
   return Date.now() - t
 }
 
+/** A session located on disk by absolute path, independent of the ACTIVE namespace. */
+type DiscoveredSession = {
+  /** Owning namespace ('' for the un-namespaced root). */
+  ns: string
+  /** Session name (the dir name under that namespace's `sessions/`). */
+  name: string
+  /** Absolute session dir. */
+  dir: string
+  /**
+   * Display label. Bare `<name>` for the caller's OWN namespace and for the
+   * un-namespaced root (both unambiguous from where the caller stands);
+   * `<ns>/<name>` for anything else, so two `default`s are never confused.
+   * Keeping own-namespace labels bare preserves the pre-global output contract.
+   */
+  key: string
+}
+
+/** True while a live process holds this session's advisory lock — see `isSessionBusy`. */
+export async function isSessionDirBusy(dir: string): Promise<boolean> {
+  return isSessionBusy(dir)
+}
+
 /**
- * Kill the browsers of sessions idle longer than `ttlMs` and remove their dirs.
+ * Grace before a SIDECAR-LESS dir in ANOTHER namespace may be removed as an orphan.
+ *
+ * `openSession` creates the profile dir and only writes the sidecar once the
+ * browser's CDP endpoint answers (up to `READY_BUDGET_MS`), so a mid-spawn session
+ * is briefly indistinguishable on disk from an abandoned one. Inside the caller's
+ * OWN namespace that window is covered by the session lock and gc stays immediate
+ * (the long-standing contract). Across namespaces — dirs this caller did not create
+ * and cannot reason about — we additionally wait out the grace rather than risk
+ * deleting a sibling's profile mid-spawn.
+ */
+export const ORPHAN_GRACE_MS = 60_000
+
+/**
+ * Enumerate EVERY session on this machine — across ALL namespaces.
+ *
+ * This is the fix for the parallel-agent leak. `sessionsRoot()` is scoped to the
+ * ACTIVE namespace, and SKILL.md tells a fleet to isolate agent-GROUPS with
+ * `--namespace`, so N parallel agents put their browsers under N different roots.
+ * A namespace-scoped sweep therefore cannot see any browser but its own group's:
+ * the reaper was self-limiting WITHIN a namespace and unbounded ACROSS them,
+ * which is exactly the shape a fleet produces (226 namespaces on the machine that
+ * motivated this, with a 3-hour-idle orphan still holding ~1.5 GB).
+ *
+ * Layout: `~/.silver/sessions/<name>` (un-namespaced) and `~/.silver/<ns>/sessions/<name>`.
+ * A dir under `~/.silver` with no `sessions/` child (`memory`, `tasks`, …) is skipped.
+ * Best-effort throughout: an unreadable root yields no sessions rather than throwing.
+ */
+export async function discoverAllSessions(): Promise<DiscoveredSession[]> {
+  const base = path.join(os.homedir(), '.silver')
+  const found: DiscoveredSession[] = []
+
+  const activeNs = currentNamespace()
+  /** A relocated `~/.silver` commonly symlinks a root onto another volume; a
+   * Dirent for a symlink reports isDirectory() === false, which would silently
+   * turn the whole sweep into a no-op. Fall back to a stat that follows it. */
+  const isDir = async (parent: string, e: { name: string; isDirectory(): boolean }) =>
+    e.isDirectory() ||
+    (await fs
+      .stat(path.join(parent, e.name))
+      .then((st) => st.isDirectory())
+      .catch(() => false))
+
+  const collect = async (ns: string, root: string): Promise<void> => {
+    let entries
+    try {
+      entries = await fs.readdir(root, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const e of entries) {
+      if (!(await isDir(root, e))) continue
+      const dir = path.join(root, e.name)
+      // POSITIVE evidence required. Every top-level dir under ~/.silver is treated
+      // as a candidate namespace, so a sibling layer whose own subdir happens to be
+      // named `sessions` — `~/.silver/tasks/<id>/…`, and `sessions` is a legal task
+      // id — would otherwise present its run dirs as sidecar-less "sessions" and be
+      // rm -rf'd as orphans. `session list` already uses exactly this test.
+      const looksLikeSession =
+        existsSync(path.join(dir, 'session.json')) || existsSync(path.join(dir, 'profile'))
+      if (!looksLikeSession) continue
+      found.push({
+        ns,
+        name: e.name,
+        dir,
+        // Bare ONLY for the caller's own namespace. Labelling the un-namespaced
+        // root bare as well made `~/.silver/sessions/default` and
+        // `~/.silver/<ns>/sessions/default` collide on one key in gc output.
+        key: ns === activeNs ? e.name : `${ns || '(root)'}/${e.name}`,
+      })
+    }
+  }
+
+  let top
+  try {
+    top = await fs.readdir(base, { withFileTypes: true })
+  } catch {
+    return found
+  }
+  for (const e of top) {
+    if (!(await isDir(base, e))) continue
+    // `~/.silver/sessions` is the un-namespaced root; every other dir is a
+    // candidate namespace whose sessions live one level deeper.
+    if (e.name === 'sessions') await collect('', path.join(base, 'sessions'))
+    else await collect(e.name, path.join(base, e.name, 'sessions'))
+  }
+  return found
+}
+
+/**
+ * Is a live command currently holding this session's lock?
+ *
+ * The idle clock (`lastUsedAt`) is stamped by `connect()` at the START of a
+ * command, so a single long-running command (`wait --timeout 200000`, a slow
+ * `extract`) keeps aging while it runs. Under a short `SILVER_SESSION_IDLE_MS`
+ * a concurrent global sweep could therefore kill a browser out from under a
+ * command that is actively driving it. The per-session lockfile is the existing,
+ * authoritative "someone is working here" signal — a LIVE holder means hands off,
+ * whatever the idle stamp says. Reads the raw record directly (not lock.ts's
+ * namespace-scoped helpers) because we sweep by absolute path.
+ */
+async function isSessionBusy(dir: string): Promise<boolean> {
+  try {
+    const rec = JSON.parse(await fs.readFile(path.join(dir, '.lock'), 'utf8')) as {
+      pid?: number
+    }
+    return typeof rec.pid === 'number' && rec.pid > 0 && isPidAlive(rec.pid)
+  } catch {
+    return false // no lock, or a corrupt/unreadable one — not a reason to keep a leak
+  }
+}
+
+/**
+ * Kill the browsers of sessions idle longer than `ttlMs` and remove their dirs,
+ * ACROSS EVERY NAMESPACE on this machine.
  *
  * This is the missing half of `session gc`: gc reaps sessions whose process is
  * already DEAD (cleaning up disk), which by construction can never reclaim a
@@ -969,37 +1381,65 @@ function idleMsOf(info: SessionInfo): number {
  * paired with a `close` leaks a ~600 MB browser forever — and agents that spawn
  * a session per unit of work leak one each.
  *
- * NEVER reaps: external (`connect`ed) sessions — we do not own that process —
- * the session named by `exclude` (the caller's own, mid-command), or anything
- * when `ttlMs <= 0`. Entirely best-effort: a failure to reap one session must
- * not fail the command that opportunistically triggered the sweep.
+ * The sweep is GLOBAL by design: a per-namespace sweep is structurally unable to
+ * reclaim a parallel fleet's browsers (see `discoverAllSessions`). The TTL, not
+ * the namespace boundary, is what keeps it safe — namespaces isolate STATE so two
+ * agent-groups never collide on `--session default`; they were never a permission
+ * boundary over each other's OS processes, and treating them as one is what let
+ * the machine fill up.
+ *
+ * NEVER reaps: external (`connect`ed) sessions — we do not own that process — a
+ * session whose lockfile shows a LIVE holder (a command is mid-flight), the
+ * caller's own session (`exclude`, matched within the caller's namespace only),
+ * or anything when `ttlMs <= 0`. Entirely best-effort: a failure to reap one
+ * session must not fail the command that opportunistically triggered the sweep.
+ *
+ * Returned names are namespace-qualified (`<ns>/<name>`) for anything outside the
+ * active namespace, so a caller can tell two `default`s apart.
  */
 export async function reapIdleSessions(
   ttlMs: number = resolveIdleTtlMs(),
   exclude?: string,
+  opts: { overrideSessionTtl?: boolean } = {},
 ): Promise<{ reaped: string[]; keptAlive: string[] }> {
   const reaped: string[] = []
   const keptAlive: string[] = []
   if (!Number.isFinite(ttlMs) || ttlMs <= 0) return { reaped, keptAlive }
-  let entries
-  try {
-    entries = await fs.readdir(sessionsRoot(), { withFileTypes: true })
-  } catch {
-    return { reaped, keptAlive }
-  }
-  for (const e of entries) {
-    if (!e.isDirectory() || e.name === exclude) continue
-    const name = e.name
+
+  const activeNs = currentNamespace()
+  for (const s of await discoverAllSessions()) {
+    // `exclude` is the caller's OWN session, mid-`open`. Match it namespace-
+    // qualified: `default` is the most common session name, so a bare-name
+    // exclude would shield every other agent's `default` and reopen the leak.
+    if (exclude !== undefined && s.name === exclude && s.ns === activeNs) continue
     let info: SessionInfo | null = null
     try {
-      info = await readSidecar(name)
+      info = await readSidecarObject<SessionInfo>(path.join(s.dir, 'session.json'))
     } catch {
       continue // no/corrupt sidecar — that is plain `session gc`'s job, not ours
     }
     // We only reap browsers we own and that are still running.
     if (info.external || !isPidAlive(info.pid)) continue
-    if (idleMsOf(info) < ttlMs) {
-      keptAlive.push(name)
+    // The session's OWN TTL wins over the sweeping process's — but only for an
+    // AMBIENT sweep. The sweep is global, so without this the shortest TTL anywhere
+    // on the machine would govern every namespace, and a session opened with
+    // `SILVER_SESSION_IDLE_MS=0` ("outlives everything") would be reaped by any
+    // unrelated command running the default. An operator who types an explicit
+    // `session gc <idleMs>` is not ambient: they are asking for exactly this, on
+    // purpose, and their number wins. (Same split as a platform's renewable lease
+    // vs. its explicit release call.)
+    const effectiveTtl =
+      !opts.overrideSessionTtl && typeof info.idleTtlMs === 'number' ? info.idleTtlMs : ttlMs
+    if (!Number.isFinite(effectiveTtl) || effectiveTtl <= 0) {
+      keptAlive.push(s.key)
+      continue
+    }
+    if (idleMsOf(info) < effectiveTtl) {
+      keptAlive.push(s.key)
+      continue
+    }
+    if (await isSessionBusy(s.dir)) {
+      keptAlive.push(s.key)
       continue
     }
     try {
@@ -1007,10 +1447,60 @@ export async function reapIdleSessions(
     } catch {
       /* already gone between the liveness check and here */
     }
-    await fs.rm(sessionDir(name), { recursive: true, force: true }).catch(() => {})
-    reaped.push(name)
+    // Removing the dir takes the clock with it, so the lifeline holder exits on
+    // its next poll and drops the pipe — a second, independent route to killing a
+    // browser whose main pid ignored SIGTERM.
+    await fs.rm(s.dir, { recursive: true, force: true }).catch(() => {})
+    reaped.push(s.key)
   }
   return { reaped, keptAlive }
+}
+
+/**
+ * How often the opportunistic safety-net sweep may actually run, machine-wide.
+ * The sweep itself is a readdir over `~/.silver` plus a stat per session, so it
+ * is cheap — but it is on the hot path of EVERY command, and a fleet can issue
+ * thousands per minute. Throttling to once every 60s amortizes it to nothing
+ * while still bounding an abandoned browser's life to ~one idle-TTL.
+ */
+const SWEEP_THROTTLE_MS = 60_000
+
+/** Machine-wide stamp of the last safety-net sweep (shared by every namespace). */
+function sweepStampPath(): string {
+  return path.join(os.homedir(), '.silver', '.last-sweep')
+}
+
+/**
+ * Run a global idle sweep at most once per `SWEEP_THROTTLE_MS`, machine-wide.
+ *
+ * Layer 2 of the leak fix, and explicitly the SAFETY NET rather than the primary
+ * path (the per-browser lease in `openSession` is primary — same two-layer shape
+ * Vercel uses: a bounded-at-birth timer backed by a periodic stale sweeper).
+ * Without it, reaping only ever happened on the next `open`, so the LAST browser
+ * a fleet abandoned lived until someone happened to run silver again.
+ *
+ * The stamp is written BEFORE sweeping so concurrent commands don't all sweep;
+ * if two race the window through, the sweep is idempotent (killing a dead pid
+ * and removing an absent dir are both no-ops). Entirely best-effort: never
+ * throws, never blocks the command that triggered it for long.
+ */
+export async function maybeSweepIdleSessions(exclude?: string): Promise<void> {
+  const ttl = resolveIdleTtlMs()
+  if (!Number.isFinite(ttl) || ttl <= 0) return // reaping disabled → no sweep either
+  const stamp = sweepStampPath()
+  try {
+    const last = await fs.readFile(stamp, 'utf8').then((s) => Number(s.trim()))
+    if (Number.isFinite(last) && Date.now() - last < SWEEP_THROTTLE_MS) return
+  } catch {
+    /* no stamp yet — this is the first sweep on this machine */
+  }
+  try {
+    await fs.mkdir(path.dirname(stamp), { recursive: true })
+    await fs.writeFile(stamp, String(Date.now()), 'utf8')
+  } catch {
+    return // cannot claim the sweep slot — skip rather than let every command sweep
+  }
+  await reapIdleSessions(ttl, exclude).catch(() => {})
 }
 
 export async function connect(name: string): Promise<Connection> {
@@ -1039,6 +1529,13 @@ export async function connect(name: string): Promise<Connection> {
   // best-effort — a failed touch must never fail the command that triggered it,
   // and a session whose sidecar we cannot rewrite simply ages out on createdAt.
   await touchSession(name).catch(() => {})
+  // Safety-net sweep (leak fix, layer 2). Deliberately AFTER the touch above, so
+  // this session's own clock is already reset and it cannot reap the browser it
+  // is connecting to; `name` is excluded as belt-and-braces. Piggybacking the
+  // sweep on `open` alone was not enough — a fleet that finishes its work never
+  // calls `open` again, so the last browsers were never reclaimed. Every command
+  // sweeps now, throttled so the cost is amortized to ~nothing.
+  await maybeSweepIdleSessions(name)
   // Deterministic viewport (P0-8); best-effort over a CDP-connected page.
   await page.setViewportSize({ width: VIEWPORT.width, height: VIEWPORT.height }).catch(() => {})
   // S2: re-arm the CDP Fetch-layer subresource egress guard on EVERY connect (the
@@ -1278,6 +1775,7 @@ async function waitForExit(pid: number, budgetMs: number): Promise<void> {
     }
     if (!escalated && Date.now() > deadline - budgetMs / 2) {
       escalated = true
+      killProcessGroup(pid, 'SIGKILL')
       try {
         process.kill(pid, 'SIGKILL')
       } catch {
@@ -1285,5 +1783,32 @@ async function waitForExit(pid: number, budgetMs: number): Promise<void> {
       }
     }
     await delay(50)
+  }
+}
+
+/**
+ * SIGKILL the browser's whole process GROUP, not just its main process.
+ *
+ * A graceful SIGTERM lets Chromium's browser process tear its own renderers down,
+ * so the ordinary path needs nothing extra. The SIGKILL escalation does not: the
+ * browser process dies instantly with no chance to reap its children, and the
+ * renderers — the actually-fat processes — are left orphaned to launchd. That is
+ * exactly the shape of the leak that motivated this work (an orphaned browser at
+ * ~284 MB whose surviving renderer alone held ~914 MB).
+ *
+ * `openSession` spawns with `detached: true`, which on POSIX puts the browser in
+ * a NEW process group led by the browser itself, so `kill(-pid)` reaches the whole
+ * tree and nothing else. Safety rails, both load-bearing: never negate a pid ≤ 1
+ * (`kill(-1)` signals every process the user owns, and `kill(-0)` signals OUR own
+ * group — either would be catastrophic), and only ever call this for a pid we have
+ * just observed alive, so a recycled pid cannot redirect the group kill at an
+ * unrelated tree. Best-effort: a missing group is not an error.
+ */
+function killProcessGroup(pid: number, signal: NodeJS.Signals): void {
+  if (!Number.isInteger(pid) || pid <= 1) return
+  try {
+    process.kill(-pid, signal)
+  } catch {
+    /* no such group, or not ours to signal — the direct kill below still runs */
   }
 }

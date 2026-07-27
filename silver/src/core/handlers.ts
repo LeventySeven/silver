@@ -16,7 +16,15 @@
  * KEYLESS: no model / provider call anywhere. Every "smart" step is a keyless
  * heuristic or a bundle handed to the host.
  */
-import { promises as fs, existsSync, readFileSync, readdirSync, mkdirSync, copyFileSync } from 'node:fs'
+import {
+  promises as fs,
+  existsSync,
+  readFileSync,
+  readdirSync,
+  mkdirSync,
+  copyFileSync,
+  type Dirent,
+} from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -35,6 +43,9 @@ import {
   loadRefMap,
   readSidecar,
   reapIdleSessions,
+  discoverAllSessions,
+  isSessionDirBusy,
+  ORPHAN_GRACE_MS,
   resolveIdleTtlMs,
   writeSidecar,
   readSidecarObject,
@@ -53,6 +64,7 @@ import {
   captureRestoreSnapshot,
   type Connection,
   type OpenOptions,
+  type SessionInfo,
 } from './session.js'
 import { withSessionLock } from './lock.js'
 import {
@@ -3158,40 +3170,95 @@ async function sessionList(): Promise<Envelope<unknown>> {
  * browser process is gone, plus orphaned dirs missing/with a corrupt sidecar
  * (port of the Rust fork's walk_daemons/cleanup_stale_files). Never touches an
  * external (connect'd) session or a session with a live pid.
+ *
+ * GLOBAL across namespaces, like the idle reap it wraps. A namespace-scoped gc
+ * was unusable as the operator's escape hatch: the machine that motivated this
+ * had 226 namespaces, so reclaiming by hand meant 226 invocations with a
+ * different `SILVER_NAMESPACE` each — which is why nothing was ever reclaimed.
+ * Names outside the active namespace come back qualified as `<ns>/<name>`.
  */
 async function sessionGc(idleMs?: number): Promise<Envelope<unknown>> {
   // Live-but-idle sweep FIRST: plain gc only removes dirs whose process is already
   // dead, so on its own it can never reclaim an abandoned daemon's memory. Reaping
   // idle sessions here turns their pids dead, and the dead-session pass below then
   // cleans up whatever it left. `idleMs: 0` disables (explicit opt-out).
-  const idle = await reapIdleSessions(resolveIdleTtlMs(idleMs)).catch(() => ({
+  // An explicit `session gc <idleMs>` overrides each session's recorded TTL; a
+  // bare `session gc` sweeps on the ambient policy and leaves pinned sessions be.
+  const idle = await reapIdleSessions(resolveIdleTtlMs(idleMs), undefined, {
+    overrideSessionTtl: idleMs !== undefined,
+  }).catch(() => ({
     reaped: [] as string[],
     keptAlive: [] as string[],
   }))
-  let entries
-  try {
-    entries = await fs.readdir(sessionsRoot(), { withFileTypes: true })
-  } catch {
-    return ok({ removed: [], kept: [], reapedIdle: idle.reaped })
-  }
   const removed: string[] = []
   const kept: string[] = []
-  for (const e of entries) {
-    if (!e.isDirectory()) continue
-    const name = e.name
-    const hasSidecar = existsSync(path.join(sessionsRoot(), name, 'session.json'))
-    const info = hasSidecar ? await readSidecar(name).catch(() => null) : null
+  const activeNs = currentNamespace()
+  for (const s of await discoverAllSessions().catch(() => [])) {
+    const sidecar = path.join(s.dir, 'session.json')
+    const info = existsSync(sidecar)
+      ? await readSidecarObject<SessionInfo>(sidecar).catch(() => null)
+      : null
     if (info?.external) {
-      kept.push(name)
+      kept.push(s.key)
       continue
     }
-    if (!info || !isPidAlive(info.pid)) {
-      await fs.rm(sessionDir(name), { recursive: true, force: true }).catch(() => {})
-      removed.push(name)
-    } else {
-      kept.push(name)
+    if (info && isPidAlive(info.pid)) {
+      kept.push(s.key)
+      continue
     }
+    // A live command holds this session's lock — hands off, in ANY namespace. The
+    // rail is unconditional so the documented promise ("never touches one a live
+    // command holds") is actually true; scoping it to foreign namespaces left a
+    // concurrent `gc` free to delete a sibling command's session mid-spawn.
+    if (await isSessionDirBusy(s.dir)) {
+      kept.push(s.key)
+      continue
+    }
+    // Cross-namespace conservatism. Inside our OWN namespace gc stays exactly as
+    // it shipped: immediate, because the caller owns that scope. For a dir some
+    // OTHER agent-group created we cannot tell "abandoned" from "mid-spawn" by
+    // absence alone, so a sidecar-less dir must also be old enough that no spawn
+    // could still be in flight. Aside's allow-list stance: reap only what is
+    // provably in a safe state, never everything that isn't provably unsafe.
+    if (s.ns !== activeNs) {
+      if (!info) {
+        const age = await fs
+          .stat(s.dir)
+          .then((st) => Date.now() - st.mtimeMs)
+          .catch(() => Number.POSITIVE_INFINITY)
+        if (age < ORPHAN_GRACE_MS) {
+          kept.push(s.key)
+          continue
+        }
+      }
+    }
+    await fs.rm(s.dir, { recursive: true, force: true }).catch(() => {})
+    removed.push(s.key)
   }
+
+  // Local orphan pass — dirs in the caller's OWN sessions root that carry no
+  // sidecar at all. The global pass deliberately ignores these: it identifies a
+  // session by positive evidence, because every top-level dir under ~/.silver is
+  // treated as a candidate namespace and a sibling layer's `sessions` subdir
+  // (`~/.silver/tasks/<id>/…`) would otherwise be deleted as foreign junk. Inside
+  // your own namespace that ambiguity doesn't exist and the long-standing
+  // contract — gc cleans up orphaned session dirs — still holds.
+  const seen = new Set(removed.concat(kept))
+  const localEntries = await fs
+    .readdir(sessionsRoot(), { withFileTypes: true })
+    .catch(() => [] as Dirent[])
+  for (const e of localEntries) {
+    if (!e.isDirectory() || seen.has(e.name)) continue
+    const dir = path.join(sessionsRoot(), e.name)
+    if (existsSync(path.join(dir, 'session.json'))) continue // handled above
+    if (await isSessionDirBusy(dir)) {
+      kept.push(e.name)
+      continue
+    }
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {})
+    removed.push(e.name)
+  }
+
   return ok({ removed, kept, reapedIdle: idle.reaped })
 }
 
