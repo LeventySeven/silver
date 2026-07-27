@@ -4,7 +4,8 @@ import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { run } from '../../src/cli.js'
-import { sanitizeNamespace } from '../../src/core/session.js'
+import { sanitizeNamespace ,
+  silverHome} from '../../src/core/session.js'
 // The eval corpus + driver live in evals/ (a standalone, model-free harness). The
 // metrics runner (evals/run.mjs) drives them via the built CLI; this test drives
 // the SAME fixtures via src as a CI gate: passK must stay 1.0 (a perception /
@@ -25,7 +26,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await run(['close', '--all', '--namespace', NS]).catch(() => {})
-  await fs.rm(path.join(os.homedir(), '.silver', sanitizeNamespace(NS)), { recursive: true, force: true }).catch(() => {})
+  await fs.rm(path.join(silverHome(), sanitizeNamespace(NS)), { recursive: true, force: true }).catch(() => {})
   await new Promise<void>((resolve) => server.close(() => resolve()))
 })
 

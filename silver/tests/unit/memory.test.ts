@@ -3,7 +3,8 @@ import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { run } from '../../src/cli.js'
-import { sanitizeNamespace } from '../../src/core/session.js'
+import { sanitizeNamespace ,
+  silverHome} from '../../src/core/session.js'
 import { rank } from '../../src/memory/search.js'
 import type { Note } from '../../src/memory/store.js'
 
@@ -14,7 +15,7 @@ function data<T = Record<string, unknown>>(r: { env: { data: unknown } }): T {
 }
 
 afterAll(async () => {
-  await fs.rm(path.join(os.homedir(), '.silver', sanitizeNamespace(NS)), {
+  await fs.rm(path.join(silverHome(), sanitizeNamespace(NS)), {
     recursive: true,
     force: true,
   }).catch(() => {})

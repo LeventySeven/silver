@@ -5,7 +5,8 @@ import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { run } from '../../src/cli.js'
-import { closeSession, sanitizeNamespace } from '../../src/core/session.js'
+import { closeSession, sanitizeNamespace ,
+  silverHome} from '../../src/core/session.js'
 
 // F11 (network har coverage) + F13 (task exec markers for string envelopes).
 // Both drive real Chromium through the run() entry, like the sibling network
@@ -48,7 +49,7 @@ afterAll(async () => {
       /* ignore */
     }
   }
-  await fs.rm(path.join(os.homedir(), '.silver', sanitizeNamespace(NS)), {
+  await fs.rm(path.join(silverHome(), sanitizeNamespace(NS)), {
     recursive: true,
     force: true,
   }).catch(() => {})
@@ -129,8 +130,7 @@ describe('network har + task exec markers (real Chromium via run())', () => {
 
     // The exec was recorded to the action_log too.
     const logPath = path.join(
-      os.homedir(),
-      '.silver',
+      silverHome(),
       sanitizeNamespace(NS),
       'tasks',
       'sn',

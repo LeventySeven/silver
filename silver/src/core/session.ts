@@ -587,8 +587,22 @@ export async function readSidecarObject<T>(filePath: string): Promise<T> {
  * namespace `ns`: `~/.silver/<ns>/sessions` — so independent agent-groups do not
  * collide even when they both use `--session default`.
  */
+/**
+ * Silver's data root — `$SILVER_HOME`, else `~/.silver`.
+ *
+ * Exists so a test run (or a throwaway sandbox) can relocate EVERYTHING silver
+ * owns without touching `$HOME`. That matters more since the reaper went global:
+ * a suite that swept the real root would SIGTERM whatever browsers the developer
+ * had parked elsewhere. Redirecting `$HOME` instead is NOT a substitute — on
+ * macOS it breaks Chromium's keychain lookup and pops a modal on every launch.
+ */
+export function silverHome(): string {
+  const override = process.env.SILVER_HOME?.trim()
+  return override ? override : path.join(os.homedir(), '.silver')
+}
+
 export function sessionsRoot(): string {
-  const base = path.join(os.homedir(), '.silver')
+  const base = silverHome()
   return activeNamespace
     ? path.join(base, activeNamespace, 'sessions')
     : path.join(base, 'sessions')
@@ -1288,7 +1302,7 @@ export const ORPHAN_GRACE_MS = 60_000
  * Best-effort throughout: an unreadable root yields no sessions rather than throwing.
  */
 export async function discoverAllSessions(): Promise<DiscoveredSession[]> {
-  const base = path.join(os.homedir(), '.silver')
+  const base = silverHome()
   const found: DiscoveredSession[] = []
 
   const activeNs = currentNamespace()
@@ -1467,7 +1481,7 @@ const SWEEP_THROTTLE_MS = 60_000
 
 /** Machine-wide stamp of the last safety-net sweep (shared by every namespace). */
 function sweepStampPath(): string {
-  return path.join(os.homedir(), '.silver', '.last-sweep')
+  return path.join(silverHome(), '.last-sweep')
 }
 
 /**

@@ -45,6 +45,7 @@ import {
   reapIdleSessions,
   discoverAllSessions,
   isSessionDirBusy,
+  silverHome,
   ORPHAN_GRACE_MS,
   resolveIdleTtlMs,
   writeSidecar,
@@ -3453,7 +3454,7 @@ async function handleDoctor(): Promise<Envelope<unknown>> {
 
   // 4. ~/.silver writability.
   try {
-    const root = path.join(os.homedir(), '.silver')
+    const root = silverHome()
     await fs.mkdir(root, { recursive: true })
     const probe = path.join(root, `.doctor-${process.pid}`)
     await fs.writeFile(probe, 'ok', 'utf8')

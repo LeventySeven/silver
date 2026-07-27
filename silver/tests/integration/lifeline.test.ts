@@ -5,7 +5,8 @@ import { promises as fs, existsSync } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { run } from '../../src/cli.js'
-import { sanitizeNamespace, isPidAlive, readSidecar, setNamespace } from '../../src/core/session.js'
+import { sanitizeNamespace, isPidAlive, readSidecar, setNamespace ,
+  silverHome} from '../../src/core/session.js'
 
 /**
  * The LIFELINE: a kernel-enforced kill switch for an abandoned browser.
@@ -30,7 +31,7 @@ let server: Server
 let base: string
 
 function nsDir(ns: string): string {
-  return path.join(os.homedir(), '.silver', sanitizeNamespace(ns))
+  return path.join(silverHome(), sanitizeNamespace(ns))
 }
 
 /** Poll until `fn()` is true or the budget runs out. Returns whether it became true. */

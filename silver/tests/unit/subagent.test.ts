@@ -3,7 +3,8 @@ import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { run } from '../../src/cli.js'
-import { sanitizeNamespace } from '../../src/core/session.js'
+import { sanitizeNamespace ,
+  silverHome} from '../../src/core/session.js'
 import { ERRORS } from '../../src/core/errors.js'
 import { CONCURRENCY_CAP } from '../../src/orchestration/subagent.js'
 
@@ -13,7 +14,7 @@ function data<T = Record<string, unknown>>(r: { env: { data: unknown } }): T {
   return r.env.data as T
 }
 async function nuke(ns: string): Promise<void> {
-  await fs.rm(path.join(os.homedir(), '.silver', sanitizeNamespace(ns)), {
+  await fs.rm(path.join(silverHome(), sanitizeNamespace(ns)), {
     recursive: true,
     force: true,
   }).catch(() => {})
@@ -82,7 +83,7 @@ describe('silver subagent — keyless scoped-child orchestration', () => {
     // done/fail, so it stays `running` — the exact wedge 3b reclaims). Records are
     // plain JSON on disk (not sidecars), so this is a faithful stand-in for a
     // real 30-min-stale child without waiting.
-    const rec1 = path.join(os.homedir(), '.silver', sanitizeNamespace(ns), 'subagents', 'sa1.json')
+    const rec1 = path.join(silverHome(), sanitizeNamespace(ns), 'subagents', 'sa1.json')
     const r = JSON.parse(await fs.readFile(rec1, 'utf8')) as { updatedAt: string; status: string }
     r.updatedAt = new Date(Date.now() - 60 * 60_000).toISOString() // 60m ago > 30m TTL
     await fs.writeFile(rec1, JSON.stringify(r, null, 2), 'utf8')
@@ -112,7 +113,7 @@ describe('silver subagent — keyless scoped-child orchestration', () => {
     const ns = `${NS}-revive`
     await run(['subagent', 'spawn', 'slow child', '--enable-actions', '--namespace', ns])
     // Age it past the TTL and reap it via a subsequent spawn.
-    const rec1 = path.join(os.homedir(), '.silver', sanitizeNamespace(ns), 'subagents', 'sa1.json')
+    const rec1 = path.join(silverHome(), sanitizeNamespace(ns), 'subagents', 'sa1.json')
     const r = JSON.parse(await fs.readFile(rec1, 'utf8')) as { updatedAt: string }
     r.updatedAt = new Date(Date.now() - 60 * 60_000).toISOString()
     await fs.writeFile(rec1, JSON.stringify(r, null, 2), 'utf8')
@@ -283,7 +284,7 @@ describe('silver subagent — keyless scoped-child orchestration', () => {
 
     // The side effect (writeResultFile) must NOT have run for a missing record —
     // no <id>.result.txt orphan under the subagents dir.
-    const orphan = path.join(os.homedir(), '.silver', sanitizeNamespace(ns), 'subagents', 'sa999.result.txt')
+    const orphan = path.join(silverHome(), sanitizeNamespace(ns), 'subagents', 'sa999.result.txt')
     await expect(fs.access(orphan)).rejects.toThrow()
 
     await fs.rm(src, { force: true }).catch(() => {})

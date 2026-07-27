@@ -5,7 +5,8 @@ import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { run } from '../../src/cli.js'
-import { closeSession, sanitizeNamespace } from '../../src/core/session.js'
+import { closeSession, sanitizeNamespace ,
+  silverHome} from '../../src/core/session.js'
 
 // The keyless completion gate: `task criteria` pre-commits grounded `expect`
 // predicates; `task done` re-runs each LIVE and REFUSES unless every one passes.
@@ -46,7 +47,7 @@ afterAll(async () => {
   } catch {
     /* ignore */
   }
-  await fs.rm(path.join(os.homedir(), '.silver', sanitizeNamespace(NS)), { recursive: true, force: true }).catch(() => {})
+  await fs.rm(path.join(silverHome(), sanitizeNamespace(NS)), { recursive: true, force: true }).catch(() => {})
   await new Promise<void>((resolve) => server.close(() => resolve()))
 })
 

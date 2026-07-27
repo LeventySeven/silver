@@ -5,7 +5,8 @@ import { promises as fs, existsSync } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { run } from '../../src/cli.js'
-import { sanitizeNamespace } from '../../src/core/session.js'
+import { sanitizeNamespace ,
+  silverHome} from '../../src/core/session.js'
 
 const SUFFIX = `${process.pid}-${Date.now()}`
 // Every destructive `session gc` here runs inside a UNIQUE namespace so it only
@@ -22,7 +23,7 @@ const ORPHAN = 'orphan'
 const PAGE = `<!doctype html><html><body><h1>Session Mgmt</h1></body></html>`
 
 function nsRoot(ns: string): string {
-  return path.join(os.homedir(), '.silver', sanitizeNamespace(ns), 'sessions')
+  return path.join(silverHome(), sanitizeNamespace(ns), 'sessions')
 }
 function nsSessionJson(ns: string, session: string): string {
   return path.join(nsRoot(ns), session, 'session.json')
@@ -50,7 +51,7 @@ describe('session list / gc + namespace isolation (real Chromium)', () => {
     await run(['close', '--session', 'shared', '--namespace', NS_A]).catch(() => {})
     await run(['close', '--session', 'shared', '--namespace', NS_B]).catch(() => {})
     for (const ns of [NS_GC, NS_A, NS_B]) {
-      await fs.rm(path.join(os.homedir(), '.silver', sanitizeNamespace(ns)), {
+      await fs.rm(path.join(silverHome(), sanitizeNamespace(ns)), {
         recursive: true,
         force: true,
       }).catch(() => {})

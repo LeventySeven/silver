@@ -61,7 +61,7 @@ export function isStateEncryptionEnabled(): boolean {
 
 /** Path to the per-machine key file (mode 0600). */
 function stateKeyPath(): string {
-  return path.join(os.homedir(), '.silver', '.state-key')
+  return path.join(process.env.SILVER_HOME?.trim() || path.join(os.homedir(), '.silver'), '.state-key')
 }
 
 /**

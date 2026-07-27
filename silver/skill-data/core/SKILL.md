@@ -253,6 +253,10 @@ live command is holding (a long `wait` is still working even though its idle sta
 nothing at all when the TTL is `0` — `SILVER_SESSION_IDLE_MS=0` withholds the kill switch too, so
 that really does mean "this browser outlives everything".
 
+`SILVER_HOME` relocates everything silver owns (default `~/.silver`) — useful for a sandbox or a
+test run that must not touch your real sessions. Prefer it over redirecting `$HOME`, which breaks
+Chromium's keychain lookup and pops a modal on every launch.
+
 **A session is governed by the TTL it was opened with**, recorded on its sidecar. Because the sweep
 is global, the alternative would be that the shortest TTL anywhere on the machine silently governs
 every agent group. An explicit `session gc <idleMs>` is the deliberate override — an operator

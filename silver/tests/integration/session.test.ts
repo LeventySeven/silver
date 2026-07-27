@@ -224,7 +224,10 @@ describe('E2: --profile launches against an existing user-data-dir', () => {
 // ---------------------------------------------------------------------------
 describe('BUG #9: openSession clears a stale DevToolsActivePort before spawn', () => {
   const RNAME = `${NAME}-stale-port`
-  const profileDir = path.join(sessionDir(RNAME), 'profile')
+  // Resolved lazily: the silver root is set by the suite's setup file, which runs
+  // AFTER this describe body is evaluated. Capturing it here would point at the
+  // developer's real root while the code under test used the test root.
+  const profileDirOf = (): string => path.join(sessionDir(RNAME), 'profile')
 
   afterAll(async () => {
     try {
@@ -239,6 +242,7 @@ describe('BUG #9: openSession clears a stale DevToolsActivePort before spawn', (
     async () => {
       // Simulate a crashed browser: the profile dir survives with a DevToolsActivePort
       // pointing at a now-dead port (Chromium leaves this file on SIGKILL).
+      const profileDir = profileDirOf()
       await fs.mkdir(profileDir, { recursive: true })
       const stalePortFile = path.join(profileDir, 'DevToolsActivePort')
       const STALE_PORT = 1 // privileged + unbound: no CDP endpoint will ever answer

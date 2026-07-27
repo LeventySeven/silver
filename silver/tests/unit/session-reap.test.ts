@@ -13,6 +13,7 @@ import {
   maybeSweepIdleSessions,
   DEFAULT_SESSION_IDLE_MS,
   type SessionInfo,
+  silverHome
 } from '../../src/core/session.js'
 import * as path from 'node:path'
 import * as os from 'node:os'
@@ -194,7 +195,7 @@ describe('reapIdleSessions — across namespaces (the parallel-agent leak)', () 
     await new Promise((r) => setTimeout(r, 250))
     expect(isPidAlive(victim.pid!)).toBe(false)
     expect(await fs.stat(dirA).then(() => true).catch(() => false)).toBe(false)
-    await fs.rm(path.join(os.homedir(), '.silver', nsA), { recursive: true, force: true })
+    await fs.rm(path.join(silverHome(), nsA), { recursive: true, force: true })
   })
 
   it('reaps the un-namespaced root too, when sweeping from inside a namespace', async () => {
@@ -226,7 +227,7 @@ describe('reapIdleSessions — across namespaces (the parallel-agent leak)', () 
     const res = await reapIdleSessions(TINY_TTL_MS)
 
     expect(res.reaped).not.toContain(`${nsD}/${name}`)
-    await fs.rm(path.join(os.homedir(), '.silver', nsD), { recursive: true, force: true })
+    await fs.rm(path.join(silverHome(), nsD), { recursive: true, force: true })
   })
 
   it('`exclude` protects the caller’s own session in its own namespace only', async () => {
@@ -245,7 +246,7 @@ describe('reapIdleSessions — across namespaces (the parallel-agent leak)', () 
     const res = await reapIdleSessions(TINY_TTL_MS, shared)
 
     expect(res.reaped).toContain(`${nsE}/${shared}`)
-    await fs.rm(path.join(os.homedir(), '.silver', nsE), { recursive: true, force: true })
+    await fs.rm(path.join(silverHome(), nsE), { recursive: true, force: true })
   })
 })
 
@@ -366,7 +367,7 @@ describe('reapIdleSessions — a session is governed by ITS OWN recorded TTL', (
 })
 
 describe('maybeSweepIdleSessions — throttled so every command can sweep for free', () => {
-  const stamp = (): string => path.join(os.homedir(), '.silver', '.last-sweep')
+  const stamp = (): string => path.join(silverHome(), '.last-sweep')
   let saved: string | null = null
 
   beforeEach(async () => {

@@ -10,13 +10,12 @@
  *
  * KEYLESS: pure path math + a tiny sanitizer, no model, no network.
  */
-import * as os from 'node:os'
 import * as path from 'node:path'
-import { currentNamespace } from './session.js'
+import { currentNamespace, silverHome } from './session.js'
 
 /** `~/.silver` (un-namespaced) or `~/.silver/<ns>`. */
 export function silverRoot(): string {
-  const base = path.join(os.homedir(), '.silver')
+  const base = silverHome()
   const ns = currentNamespace()
   return ns ? path.join(base, ns) : base
 }

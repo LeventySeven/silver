@@ -3,7 +3,8 @@ import { promises as fs, existsSync } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { run } from '../../src/cli.js'
-import { sanitizeNamespace, setNamespace } from '../../src/core/session.js'
+import { sanitizeNamespace, setNamespace ,
+  silverHome} from '../../src/core/session.js'
 import { ERRORS } from '../../src/core/errors.js'
 import { parseFlags } from '../../src/core/flags.js'
 import { scrubBase64String } from '../../src/task/store.js'
@@ -12,14 +13,14 @@ import { EXEC_FIXED_ENV, execTmpdir, handleTask } from '../../src/task/index.js'
 const NS = `task-${process.pid}-${Date.now()}`
 
 function nsTasks(): string {
-  return path.join(os.homedir(), '.silver', sanitizeNamespace(NS), 'tasks')
+  return path.join(silverHome(), sanitizeNamespace(NS), 'tasks')
 }
 function data<T = Record<string, unknown>>(r: { env: { data: unknown } }): T {
   return r.env.data as T
 }
 
 afterAll(async () => {
-  await fs.rm(path.join(os.homedir(), '.silver', sanitizeNamespace(NS)), {
+  await fs.rm(path.join(silverHome(), sanitizeNamespace(NS)), {
     recursive: true,
     force: true,
   }).catch(() => {})
