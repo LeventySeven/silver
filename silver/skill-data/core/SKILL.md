@@ -279,6 +279,7 @@ half an hour.
 | `session list` | This namespace's sessions: name, `alive`, pid, tab count, age. |
 | `session gc [<idleMs>]` | Reap **idle** sessions (kill the browser + remove the dir) **and** dead ones, **across every namespace on the machine** — a per-namespace gc was useless as an escape hatch, since reclaiming a fleet meant one invocation per namespace. Idle TTL: `<idleMs>` → `SILVER_SESSION_IDLE_MS` → **30 min** default; `0` disables the idle sweep (dead dirs only). Never touches an external `connect`ed session or one a live command holds. Sessions outside your namespace come back labelled `<ns>/<name>`. |
 | `close [--all]` | Close this session (or every session in the namespace). |
+| `tab close` on a `connect`ed browser | **Refuses any tab silver did not open.** A `connect`ed browser is someone's real one — the other tabs are their live work. Silver records ownership when IT creates a tab (`tab new`), scoped to that browser instance; a tab it merely found is never closable. Close it yourself in the browser instead. |
 | `tab list` (or bare `tab`) | Tabs of the active session. |
 | `tab new [url] [--label <L>]` | Open a tab (optionally navigate + label); it becomes active. |
 | `tab <tN\|label>` | Switch the active tab. |

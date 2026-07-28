@@ -77,6 +77,8 @@ import {
   isValidLabel,
   pageTargetId,
   resolveActivePage,
+  browserGuidOf,
+  isOwnedTab,
   type TabRecord,
   type TabRegistry,
 } from './tabs.js'
@@ -1284,11 +1286,15 @@ async function handleTabNew(flags: ParsedFlags): Promise<Envelope<unknown>> {
 
     const targetId = await pageTargetId(page)
     const id = `t${synced.reg.nextId}`
-    const record: TabRecord = label !== undefined ? { id, label, targetId } : { id, targetId }
+    // `owned: true` is stamped HERE and only here — this is the one code path that
+    // creates a tab, so it is the one place the claim can be made truthfully.
+    const record: TabRecord =
+      label !== undefined ? { id, label, targetId, owned: true } : { id, targetId, owned: true }
     const nextReg: TabRegistry = {
       nextId: synced.reg.nextId + 1,
       activeTargetId: targetId, // the new tab becomes active
       tabs: [...synced.reg.tabs, record],
+      ...(synced.reg.browserGuid ? { browserGuid: synced.reg.browserGuid } : {}),
     }
     await saveTabRegistry(flags.session, nextReg)
     await invalidateRefs(flags.session, page)
@@ -1326,9 +1332,12 @@ async function handleTabSwitch(flags: ParsedFlags, ref: string): Promise<Envelop
 
 async function handleTabClose(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const ref = flags.args[1] // optional; default = the active tab
+  const sidecar = await readSidecar(flags.session).catch(() => null)
+  const isExternal = sidecar?.external === true
+  const guid = browserGuidOf(sidecar?.wsEndpoint)
   return withConnection(flags, async ({ context }) => {
     const reg = (await loadTabRegistry(flags.session)) ?? emptyRegistry()
-    const synced = await syncRegistry(context, reg)
+    const synced = await syncRegistry(context, reg, guid)
     if (synced.live.length <= 1) {
       return badRequest('cannot close the last tab; use `close` to end the session')
     }
@@ -1339,6 +1348,21 @@ async function handleTabClose(flags: ParsedFlags): Promise<Envelope<unknown>> {
         : synced.reg.tabs.find((t) => t.targetId === synced.reg.activeTargetId)
     const page = target ? synced.byId.get(target.id) : undefined
     if (!target || !page) return badRequest('no such tab; run `tab list` to see open tabs')
+
+    // THE HUMAN-TAB GUARD. In an EXTERNAL (`connect`ed) session the browser is
+    // someone's real one — the other tabs in that window are a person's live work
+    // (a checkout cart, a half-filled form, their mail). Closing a tab is
+    // irreversible and Silver has no claim on one it did not create, so refuse
+    // unless we recorded ourselves creating it, in THIS browser instance.
+    // Owned-vs-discovered is decided by which code path minted the record, never
+    // by a heuristic — see TabRecord.owned.
+    if (isExternal && !isOwnedTab(synced.reg, target, guid)) {
+      return badRequest(
+        'refusing to close a tab silver did not open — this session is attached to a browser ' +
+          'silver does not own, and that tab belongs to whoever is using it. Close tabs silver ' +
+          'opened (`tab new`), or close it yourself in the browser.',
+      )
+    }
 
     const wasActive = target.targetId === synced.reg.activeTargetId
     await page.close().catch(() => {})
@@ -1391,7 +1415,16 @@ async function handleConnect(flags: ParsedFlags): Promise<Envelope<unknown>> {
     await saveState(flags.session, { generation: 1, prevTree: null, fingerprint: null })
     const conn = await connect(flags.session)
     try {
-      const synced = await syncRegistry(conn.context, emptyRegistry())
+      // Stamp the browser INSTANCE identity now. Every tab discovered here is by
+      // definition someone else's — the registry starts owning nothing — and the
+      // guid is what lets a later `tab new` claim ownership that stays valid only
+      // while we are still talking to this same browser.
+      const attached = await readSidecar(flags.session).catch(() => null)
+      const synced = await syncRegistry(
+        conn.context,
+        emptyRegistry(),
+        browserGuidOf(attached?.wsEndpoint),
+      )
       await saveTabRegistry(flags.session, synced.reg)
       return ok({
         connected: true,

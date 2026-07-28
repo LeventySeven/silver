@@ -22,13 +22,72 @@ import * as path from 'node:path'
 import type { BrowserContext, Page } from 'playwright'
 import { sessionDir } from './session.js'
 
-export type TabRecord = { id: string; label?: string; targetId: string }
+export type TabRecord = {
+  id: string
+  label?: string
+  targetId: string
+  /**
+   * TRUE only for a tab SILVER ITSELF created (`tab new`). Absent means the tab
+   * was DISCOVERED — it already existed in the browser when we looked.
+   *
+   * This is the whole ownership model, and it has to be recorded at creation
+   * because it cannot be recovered afterwards: CDP exposes no opener, no creator,
+   * and no per-tab context that distinguishes ours from the user's (all 21 of the
+   * user's pages sit in one browserContextId). So the distinction is made by
+   * WHICH CODE PATH RAN — `tab new` sets it, `syncRegistry`'s discovery branch
+   * never does — exactly how Aside splits `openTab()` (ownership:'owned') from
+   * `attachBrowserTab()`. A heuristic over URLs or timestamps would be a guess,
+   * and the cost of guessing wrong is closing a human's work.
+   */
+  owned?: true
+}
 export type TabRegistry = {
   /** Next numeric suffix to mint (`t${nextId}`). Monotonic within a session. */
   nextId: number
   /** CDP targetId of the active tab (null only before any page exists). */
   activeTargetId: string | null
   tabs: TabRecord[]
+  /**
+   * Identity of the browser INSTANCE these targetIds belong to.
+   *
+   * targetIds are durable across CDP reconnects (measured: 21/21 stable over a
+   * 22.7-hour disconnect) but NOT across a browser restart — the browser mints a
+   * new GUID and new targetIds, so a persisted `owned` flag could otherwise land
+   * on one of the user's fresh tabs. On a GUID mismatch every ownership claim in
+   * this registry is void. Absent on registries written before this existed,
+   * which are therefore treated as owning nothing.
+   */
+  browserGuid?: string
+}
+
+/**
+ * The browser instance's identity, parsed from its CDP websocket endpoint
+ * (`ws://host:port/devtools/browser/<guid>`). Empty string when it can't be
+ * determined — which, being unequal to any recorded guid, fails closed.
+ */
+export function browserGuidOf(wsEndpoint: string | undefined): string {
+  if (typeof wsEndpoint !== 'string') return ''
+  const m = /\/devtools\/browser\/([0-9a-fA-F-]+)/.exec(wsEndpoint)
+  return m?.[1] ?? ''
+}
+
+/**
+ * Does this registry's recorded ownership still apply to the browser we are
+ * talking to? Fails closed: no recorded guid, or a different browser, means we
+ * own nothing here.
+ */
+export function ownershipValid(reg: TabRegistry, currentGuid: string): boolean {
+  return Boolean(reg.browserGuid) && reg.browserGuid === currentGuid && currentGuid !== ''
+}
+
+/**
+ * May Silver destroy this tab? True only for a tab it created, in a browser it
+ * still recognises. Used to keep `tab close` off a human's tabs in an EXTERNAL
+ * (`connect`ed) session, where every other tab in the window belongs to someone
+ * who is still using it.
+ */
+export function isOwnedTab(reg: TabRegistry, rec: TabRecord, currentGuid: string): boolean {
+  return rec.owned === true && ownershipValid(reg, currentGuid)
 }
 
 const TABS_SIDECAR = 'tabs.json'
@@ -89,7 +148,14 @@ export async function pageTargets(
 export type SyncResult = {
   reg: TabRegistry
   byId: Map<string, Page>
-  live: Array<{ id: string; page: Page; targetId: string; label?: string }>
+  live: Array<{ id: string; page: Page; targetId: string; label?: string; owned?: true }>
+}
+
+/** Drop an ownership claim we can no longer stand behind (browser instance changed). */
+function stripOwnership(rec: TabRecord): TabRecord {
+  if (rec.owned !== true) return rec
+  const { owned: _dropped, ...rest } = rec
+  return rest
 }
 
 /**
@@ -98,23 +164,44 @@ export type SyncResult = {
  * the active target is coerced to a live one. Returns the updated registry plus
  * id→page maps. Callers persist `result.reg`.
  */
-export async function syncRegistry(context: BrowserContext, reg: TabRegistry): Promise<SyncResult> {
+export async function syncRegistry(
+  context: BrowserContext,
+  reg: TabRegistry,
+  browserGuid?: string,
+): Promise<SyncResult> {
   const targets = await pageTargets(context)
   const liveIds = new Set(targets.map((t) => t.targetId))
 
-  const kept = reg.tabs.filter((t) => liveIds.has(t.targetId))
+  // A different browser instance invalidates every recorded ownership claim:
+  // targetIds do not survive a restart, so a stale `owned` could otherwise mark
+  // one of the user's brand-new tabs as ours to close.
+  const guid = browserGuid ?? reg.browserGuid ?? ''
+  const stillOurs = ownershipValid(reg, guid)
+
+  const kept = reg.tabs
+    .filter((t) => liveIds.has(t.targetId))
+    .map((t) => (stillOurs ? t : stripOwnership(t)))
   const known = new Set(kept.map((t) => t.targetId))
 
   let nextId = reg.nextId
   const records: TabRecord[] = [...kept]
   for (const t of targets) {
+    // DISCOVERY branch — a page that already existed. Deliberately never `owned`:
+    // this is the only place a tab can enter the registry without Silver having
+    // created it, and conflating the two is how an agent ends up closing a human's
+    // checkout page.
     if (!known.has(t.targetId)) records.push({ id: `t${nextId++}`, targetId: t.targetId })
   }
 
   let active = reg.activeTargetId
   if (!active || !liveIds.has(active)) active = targets[0]?.targetId ?? null
 
-  const next: TabRegistry = { nextId, activeTargetId: active, tabs: records }
+  const next: TabRegistry = {
+    nextId,
+    activeTargetId: active,
+    tabs: records,
+    ...(guid ? { browserGuid: guid } : {}),
+  }
 
   const byTarget = new Map(targets.map((t) => [t.targetId, t.page]))
   const byId = new Map<string, Page>()
@@ -125,6 +212,7 @@ export async function syncRegistry(context: BrowserContext, reg: TabRegistry): P
       byId.set(r.id, page)
       const entry: SyncResult['live'][number] = { id: r.id, page, targetId: r.targetId }
       if (r.label !== undefined) entry.label = r.label
+      if (r.owned === true) entry.owned = true
       live.push(entry)
     }
   }
