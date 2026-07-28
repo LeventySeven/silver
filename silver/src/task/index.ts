@@ -883,6 +883,8 @@ async function taskReplay(flags: ParsedFlags): Promise<Envelope<unknown>> {
 
   const dispatch = flags.enableActions
   let dispatchedAll = true
+  /** Index of the first step that dispatched and FAILED; halts the replay. */
+  let failedAt: number | null = null
   const steps = []
   for (const step of cache.steps) {
     const decision = decideReplay(step, currentDomHash)
@@ -895,6 +897,26 @@ async function taskReplay(flags: ParsedFlags): Promise<Envelope<unknown>> {
       const res = await run(argv)
       await appendLog(id, n, { kind: 'replay', command: step.argv, success: res.env.success })
       dispatched = true
+      // A FAILED step halts the replay. The success flag was written to the log
+      // and then thrown away, so the loop only ever stopped on a DOM-hash miss:
+      // a step that dispatched and failed (denied by policy, element gone, the
+      // page moved) let every LATER step run anyway, against a page the failed
+      // step was supposed to have changed. On an actor replay that means acting
+      // blind — the worst place to keep going. The remaining steps are reported
+      // as not dispatched rather than silently skipped.
+      if (!res.env.success) {
+        failedAt = step.index
+        steps.push({
+          index: step.index,
+          verb: step.verb,
+          ref: decision.ref,
+          reuse: decision.reuse,
+          reason: decision.reason,
+          dispatched,
+        })
+        dispatchedAll = false
+        break
+      }
     } else if (dispatch && !decision.reuse) {
       // First step that can't be reused halts live dispatch: the host must take a
       // fresh snapshot and self-heal from here (later steps' hashes are stale too).
@@ -920,6 +942,7 @@ async function taskReplay(flags: ParsedFlags): Promise<Envelope<unknown>> {
     reused,
     fallback: steps.length - reused,
     dispatched: dispatch,
+    ...(failedAt !== null ? { halted_at: failedAt } : {}),
     steps,
     note: dispatch
       ? 'reusable steps (matching DOM-hash) were dispatched with their known-good refs; take a fresh snapshot and re-resolve from the first fallback step'
