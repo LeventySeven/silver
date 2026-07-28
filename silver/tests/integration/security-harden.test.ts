@@ -527,3 +527,36 @@ describe('security hardening (real Chromium via the run() entry)', () => {
     expect(map?.generation).toBeGreaterThan(41)
   })
 })
+
+/**
+ * COORDINATE actions are subject to the same RESTRICTIONS as grounded ones.
+ *
+ * `click --at x,y` used to return before both the `--confirm-actions` gate and the
+ * S5 action-policy gate. The comment justified it with "already behind
+ * --enable-actions, so no extra grant gate is needed" — true of the GRANT, but
+ * those two gates are restrictions. An operator who set
+ * `--action-policy deny:click@...` had it enforced for `click @e5` and bypassed
+ * for `click --at 100,200`, which is the same action addressed by pixel.
+ */
+describe('coordinate actions honour the action policy (real Chromium)', () => {
+  it('a deny policy blocks `click --at` exactly as it blocks a grounded click', async () => {
+    const policy = path.resolve(process.cwd(), `silver-pol-${process.pid}-${Date.now()}.json`)
+    writeFileSync(policy, JSON.stringify({ deny: ['click'] }))
+    try {
+      const coord = await run([
+        'click', '--at', '10', '10', '--enable-actions', '--action-policy', policy,
+        '--session', NAME,
+      ])
+      expect(coord.env.success, 'coordinate click must be denied').toBe(false)
+      expect(coord.env.error).toBe(ERRORS.not_permitted.message)
+    } finally {
+      rmSync(policy, { force: true })
+    }
+  })
+
+  it('and still WORKS when the policy allows it — the gate is not a blanket block', async () => {
+    const res = await run(['click', '--at', '5', '5', '--enable-actions', '--session', NAME])
+    // No policy set: the coordinate path must remain fully usable.
+    expect(res.env.success).toBe(true)
+  })
+})

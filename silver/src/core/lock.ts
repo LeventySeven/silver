@@ -121,10 +121,25 @@ async function acquire(name: string, budgetMs: number): Promise<string> {
 
   for (;;) {
     try {
-      const fh = await fs.open(file, 'wx')
+      // Create the lock ALREADY POPULATED, via write-then-link.
+      //
+      // `fs.open(file,'wx')` + write was not atomic: the open creates a ZERO-BYTE
+      // file and the record lands in a second step, so a concurrent acquirer that
+      // hit EEXIST inside that window read an empty record — which `isStale`
+      // treats as stale and STEALS. Two holders, one lock, on the primitive whose
+      // whole job is preventing that.
+      //
+      // `link(2)` is the fix: it fails with EEXIST if the target exists (so it
+      // keeps the create-if-absent semantics `wx` gave us) and the name appears
+      // with its content already in place — there is no observable empty state.
       const rec: LockRecord = { pid: process.pid, token, at: Date.now() }
-      await fh.writeFile(JSON.stringify(rec), 'utf8')
-      await fh.close()
+      const staging = `${file}.new.${process.pid}.${token}`
+      await fs.writeFile(staging, JSON.stringify(rec), 'utf8')
+      try {
+        await fs.link(staging, file)
+      } finally {
+        await fs.rm(staging, { force: true }).catch(() => {})
+      }
       return token
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code

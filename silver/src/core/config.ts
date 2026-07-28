@@ -344,7 +344,17 @@ export function loadConfig(opts: LoadConfigOptions = {}): LoadedConfig {
   const sources: string[] = []
   const layers: SilverConfig[] = []
 
-  const userPath = join(home, '.silver', 'config.json')
+  // SILVER_HOME relocates everything silver owns, and the user config is part of
+  // that: without this it was the one file still resolved from the real home, so a
+  // sandboxed or test run read (and could be steered by) the developer's own
+  // config. An explicit `opts.home` still wins — that is how the tests inject one.
+  const silverDir =
+    opts.home !== undefined
+      ? join(opts.home, '.silver')
+      : (process.env.SILVER_HOME?.trim() ?? '') !== ''
+        ? (process.env.SILVER_HOME as string)
+        : join(home, '.silver')
+  const userPath = join(silverDir, 'config.json')
   const userCfg = readConfigFile(userPath, warnings, 'user')
   if (userCfg) {
     layers.push(userCfg)

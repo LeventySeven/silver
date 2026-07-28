@@ -1954,11 +1954,21 @@ async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
   // `drag --from x y --to x y`. Bypasses groundRef/toLocator entirely for canvas
   // widgets / custom controls with no AX node. Already behind --enable-actions
   // (click/type/drag are actor-registry verbs), so no extra grant gate is needed.
-  if ((verb === 'click' || verb === 'type') && flags.at) return handleCoordAct(flags, verb)
-  if (verb === 'drag' && flags.from && flags.to) return handleCoordAct(flags, verb)
+  // COORDINATE MODE is decided here but dispatched AFTER the gates below. It used
+  // to return immediately, and the comment above justified that with "already
+  // behind --enable-actions, so no extra grant gate is needed" — true of the GRANT,
+  // but the two gates below are RESTRICTIONS. An operator who set
+  // `--action-policy deny:click@bank.com` had it enforced for `click @e5` and
+  // bypassed for `click --at 100,200`, which is the same action by pixel.
+  const coordMode =
+    ((verb === 'click' || verb === 'type') && Boolean(flags.at)) ||
+    (verb === 'drag' && Boolean(flags.from) && Boolean(flags.to))
 
   const ref = flags.args[0]
-  if (!ref) return badRequest('a ref is required (usage: silver <verb> @eN [value])')
+  // A coordinate action has no ref by definition; everything else still needs one.
+  if (!coordMode && !ref) {
+    return badRequest('a ref is required (usage: silver <verb> @eN [value])')
+  }
 
   // Confirm gate: engaged only when the operator supplies --confirm-actions
   // (an explicit allowlist of auto-approved mutating verbs). Without it,
@@ -1991,6 +2001,12 @@ async function handleAct(flags: ParsedFlags): Promise<Envelope<unknown>> {
     if (decision === 'deny') return fail('not_permitted')
     if (decision === 'confirm') policyConfirm = true
   }
+
+  // Both restriction gates have now run, so a coordinate action is subject to the
+  // same policy and confirm rules as a grounded one. It cannot go further: there
+  // is no ref to ground, so the name-based paid/destructive heuristic below has
+  // nothing to inspect.
+  if (coordMode) return handleCoordAct(flags, verb)
 
   const refmap = await loadRefMap(flags.session)
   if (!refmap) return fail('element_not_found')
@@ -3653,7 +3669,16 @@ async function handleDoctor(): Promise<Envelope<unknown>> {
     ? firstFail.fix ?? firstFail.message
     : 'all checks passed — silver is ready'
 
-  return ok({ checks, verdict, next, passed, total })
+  // A FAILING doctor must exit non-zero. `run()` derives the exit code from
+  // `success`, so always returning ok() meant `silver doctor && npm start` sailed
+  // past a broken install — exactly the check whose entire purpose is to stop that.
+  // The payload is identical either way, so a host that reads `data` is unaffected;
+  // only the exit code and the `success` flag change.
+  const payload = { checks, verdict, next, passed, total }
+  if (verdict === 'issues') {
+    return { success: false, data: payload, error: next }
+  }
+  return ok(payload)
 }
 
 /** K4 check: scan session `.lock` files for a dead-holder (stale) lock. */

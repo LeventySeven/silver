@@ -531,7 +531,14 @@ export function parseFlags(argv: string[]): ParsedFlags {
         let ys: string | undefined
         if (inlineValue !== undefined) {
           ;[xs, ys] = inlineValue.split(',')
-        } else {
+        } else if (!looksLikeFlag(argv[i + 1]) && !looksLikeFlag(argv[i + 2])) {
+          // F7 parity: every other value-flag refuses to swallow a token that
+          // looks like a flag, and this branch did not — it took the next TWO
+          // unconditionally. `click --at 5,5 --enable-actions` therefore consumed
+          // `--enable-actions` as the y coordinate, and the command came back
+          // "read-only, pass --enable-actions" while the operator was staring at
+          // the flag they had just passed. Negative coordinates still work:
+          // looksLikeFlag exempts negative numbers.
           xs = argv[++i]
           ys = argv[++i]
         }

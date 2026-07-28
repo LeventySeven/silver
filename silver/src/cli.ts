@@ -101,9 +101,15 @@ export async function run(argv: string[]): Promise<RunResult> {
   // (config ∪ CLI); scalars the CLI set explicitly win; config fills the rest.
   // Default-ON; `--no-config` opts out. Fail-open: a malformed config is skipped
   // with a warning (never a thrown error), never bricking every command.
+  let configWarnings: string[] = []
   if (!flags.noConfig) {
     const loaded = loadConfig()
     flags = mergeConfig(loaded.config, flags).flags
+    // These were computed and thrown away. They are the only signal that a config
+    // file is malformed, or that a field was IGNORED because a project silver.json
+    // may not grant capability — silently dropping them meant the operator set a
+    // flag, saw success, and never learned it had not applied.
+    configWarnings = loaded.warnings
   }
 
   const json = flags.json
@@ -183,11 +189,19 @@ export async function run(argv: string[]): Promise<RunResult> {
     }
   }
 
+  // Surface a config warning on the envelope rather than dropping it. Prepended,
+  // so it cannot bury a warning the command itself produced.
+  const withConfigWarning = <T>(env: Envelope<T>): Envelope<T> => {
+    if (configWarnings.length === 0) return env
+    const own = env.warning
+    return { ...env, warning: own ? `${configWarnings.join('; ')}; ${own}` : configWarnings.join('; ') }
+  }
+
   try {
     const env = LAYER_VERBS.has(flags.verb) ? await dispatchLayer(flags) : await handle(flags)
-    return { env, code: env.success ? 0 : 1, json }
+    return { env: withConfigWarning(env), code: env.success ? 0 : 1, json }
   } catch (err) {
-    return { env: mapThrow(err), code: 1, json }
+    return { env: withConfigWarning(mapThrow(err)), code: 1, json }
   }
 }
 
