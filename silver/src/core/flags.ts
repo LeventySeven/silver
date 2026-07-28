@@ -451,6 +451,35 @@ function defaults(): ParsedFlags {
 }
 
 /** Parse argv (already sliced past `node script`). */
+/**
+ * The SECURITY ENVELOPE: the flags that must survive any re-dispatch.
+ *
+ * Several verbs run other silver commands by re-entering `run()` with a fresh
+ * argv — `batch`, `task exec`, `task replay`. Anything the operator set that
+ * CONSTRAINS what a command may do has to travel with it, because the inner
+ * command is parsed from scratch and a flag left behind is not "inherited", it is
+ * simply ABSENT. That failed silently and in the dangerous direction: an operator
+ * who ran `task exec … --allowed-domains example.com` got an inner command with
+ * no egress allowlist at all, i.e. unrestricted, with nothing in the output
+ * saying the fence had been dropped.
+ *
+ * Kept as ONE function so a newly-added restriction cannot be wired into one
+ * re-dispatch path and forgotten in the other. Permission-GRANTING flags
+ * (`--enable-actions`) are handled by each caller, since only they know whether
+ * the inner command is entitled to the grant; everything here only ever narrows.
+ */
+export function securityEnvelopeArgv(flags: ParsedFlags): string[] {
+  const g: string[] = []
+  if (flags.allowedDomains.length > 0) g.push('--allowed-domains', flags.allowedDomains.join(','))
+  if (flags.allowFileAccess) g.push('--allow-file-access')
+  if (flags.confirmActionsProvided) g.push('--confirm-actions', flags.confirmActions.join(','))
+  if (flags.actionPolicy !== undefined) g.push('--action-policy', flags.actionPolicy)
+  if (flags.taintGuard) g.push('--taint-guard')
+  for (const s of flags.secrets) g.push('--secret', s)
+  if (!flags.contentBoundaries) g.push('--no-content-boundaries')
+  return g
+}
+
 export function parseFlags(argv: string[]): ParsedFlags {
   const f = defaults()
   const positionals: string[] = []

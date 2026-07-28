@@ -33,7 +33,7 @@ import type { Page, Locator, CDPSession, Frame, BrowserContext } from 'playwrigh
 
 import { ok, fail, type Envelope } from './envelope.js'
 import { ERRORS } from './errors.js'
-import type { ParsedFlags } from './flags.js'
+import { securityEnvelopeArgv, type ParsedFlags } from './flags.js'
 import {
   openSession,
   connect,
@@ -5170,13 +5170,13 @@ function sharedGlobals(flags: ParsedFlags): string[] {
   const g: string[] = ['--session', flags.session]
   if (flags.namespace) g.push('--namespace', flags.namespace)
   if (flags.enableActions) g.push('--enable-actions')
-  if (flags.confirmActionsProvided) g.push('--confirm-actions', flags.confirmActions.join(','))
-  if (flags.allowFileAccess) g.push('--allow-file-access')
-  if (flags.allowedDomains.length > 0) g.push('--allowed-domains', flags.allowedDomains.join(','))
   if (flags.timeout !== undefined) g.push('--timeout', String(flags.timeout))
   if (flags.maxOutput !== undefined) g.push('--max-output', String(flags.maxOutput))
   if (flags.headed) g.push('--headed')
-  if (!flags.contentBoundaries) g.push('--no-content-boundaries')
+  // Every restriction the operator set travels with the sub-command — see
+  // securityEnvelopeArgv. Previously this list re-implemented a SUBSET of it and
+  // silently dropped --action-policy, --taint-guard and --secret.
+  g.push(...securityEnvelopeArgv(flags))
   return g
 }
 

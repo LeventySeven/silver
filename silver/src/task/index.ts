@@ -26,7 +26,7 @@
 import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
 import { ok, fail, type Envelope } from '../core/envelope.js'
-import type { ParsedFlags } from '../core/flags.js'
+import { securityEnvelopeArgv, type ParsedFlags } from '../core/flags.js'
 import { sanitizeSegment } from '../core/nsdirs.js'
 import { neutralize, capOutput } from '../security/injection.js'
 import { withSessionLock } from '../core/lock.js'
@@ -974,6 +974,23 @@ function buildInnerArgv(inner: string[], flags: ParsedFlags): string[] {
   // exec required --enable-actions; forward it so an actor inner command works
   // under the single operator grant (the inner registry still gates per-verb).
   if (!hasFlag(inner, '--enable-actions')) argv.push('--enable-actions')
+  // …and every RESTRICTION the operator set, which is the half that was missing.
+  // The inner command is parsed from scratch, so a dropped `--allowed-domains`
+  // did not mean "inherit the outer allowlist", it meant NO allowlist — the
+  // egress fence silently off, in the permissive direction, with nothing in the
+  // output saying so. A flag the caller already spelled out inline wins, and its
+  // VALUE must be skipped with it or it would land as a stray positional.
+  const envelope = securityEnvelopeArgv(flags)
+  for (let i = 0; i < envelope.length; i++) {
+    const arg = envelope[i] as string
+    const takesValue = i + 1 < envelope.length && !(envelope[i + 1] as string).startsWith('--')
+    if (hasFlag(inner, arg)) {
+      if (takesValue) i++
+      continue
+    }
+    argv.push(arg)
+    if (takesValue) argv.push(envelope[++i] as string)
+  }
   return argv
 }
 
