@@ -396,6 +396,7 @@ async function patchEmulation(name: string, patch: Partial<EmulationState>): Pro
   await writeSidecar(emulationPath(name), { ...cur, ...patch })
 }
 
+
 /**
  * Re-apply the persisted emulation overrides on a fresh connection (F8).
  * Best-effort per override — a failure to apply one never fails the command.
@@ -424,11 +425,6 @@ async function applyEmulation(
   // for. `null` disables the override and restores what the browser actually
   // reports. Done unconditionally so a session that never set anything behaves
   // like an ordinary browser; a persisted override below then re-applies on top.
-  if (!emu?.colorScheme) {
-    await page
-      .emulateMedia({ colorScheme: null, reducedMotion: null, forcedColors: null })
-      .catch(() => {})
-  }
   if (!emu) return
   if (emu.viewport) await page.setViewportSize(emu.viewport).catch(() => {})
   if (emu.colorScheme) await page.emulateMedia({ colorScheme: emu.colorScheme }).catch(() => {})

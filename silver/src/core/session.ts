@@ -1536,6 +1536,84 @@ export async function maybeSweepIdleSessions(exclude?: string): Promise<void> {
   await reapIdleSessions(ttl, exclude).catch(() => {})
 }
 
+
+/**
+ * Read the browser's REAL `prefers-color-scheme`, over raw CDP, BEFORE Playwright
+ * touches it.
+ *
+ * `connectOverCDP` silently applies its context default (`colorScheme: 'light'`)
+ * to EVERY page in the browser it attaches to, and drops it again on disconnect.
+ * On a browser silver owns nobody sees that. On the user's own browser it is
+ * glaring: with an agent working, every command flips all their tabs to light and
+ * back, so the whole browser strobes.
+ *
+ * It cannot be cleared once connected — measured, in this order, against a raw-CDP
+ * oracle rather than through Playwright (which reports its own emulated view and
+ * will happily tell you everything is fine):
+ *   - baseline                                  dark
+ *   - after connectOverCDP                      light
+ *   - after CDP setEmulatedMedia({features:[]}) light   (does NOT clear it)
+ *   - after emulateMedia({colorScheme:'dark'})  dark    (only this works)
+ * So the only way to leave the pages looking right is to know what they SHOULD
+ * say and assert it — which means asking before Playwright arrives.
+ *
+ * Best-effort and bounded: any failure returns null and the caller simply skips
+ * the correction. Never throws, never blocks a command for long.
+ */
+async function probeRealColorScheme(wsEndpoint: string): Promise<'dark' | 'light' | null> {
+  try {
+    const m = /^ws:\/\/([^/]+)\//.exec(wsEndpoint)
+    if (!m) return null
+    const res = await fetch(`http://${m[1]}/json/list`, { signal: AbortSignal.timeout(1500) })
+    const targets = (await res.json()) as Array<{ type?: string; url?: string; webSocketDebuggerUrl?: string }>
+    const page = targets.find(
+      (t) => t.type === 'page' && typeof t.webSocketDebuggerUrl === 'string' && /^https?:/.test(t.url ?? ''),
+    )
+    if (!page?.webSocketDebuggerUrl) return null
+    return await new Promise((resolve) => {
+      const ws = new WebSocket(page.webSocketDebuggerUrl as string)
+      const done = (v: 'dark' | 'light' | null): void => {
+        try {
+          ws.close()
+        } catch {
+          /* already closed */
+        }
+        resolve(v)
+      }
+      const timer = setTimeout(() => done(null), 1500)
+      ws.onerror = () => {
+        clearTimeout(timer)
+        done(null)
+      }
+      ws.onopen = () =>
+        ws.send(
+          JSON.stringify({
+            id: 1,
+            method: 'Runtime.evaluate',
+            params: {
+              expression: "matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'",
+              returnByValue: true,
+            },
+          }),
+        )
+      ws.onmessage = (e: MessageEvent) => {
+        try {
+          const msg = JSON.parse(String(e.data)) as { id?: number; result?: { result?: { value?: unknown } } }
+          if (msg.id !== 1) return
+          clearTimeout(timer)
+          const v = msg.result?.result?.value
+          done(v === 'dark' || v === 'light' ? v : null)
+        } catch {
+          clearTimeout(timer)
+          done(null)
+        }
+      }
+    })
+  } catch {
+    return null
+  }
+}
+
 export async function connect(name: string): Promise<Connection> {
   const info = await readSidecar(name)
   // F1: a stale non-chromium sidecar (written before this engine was rejected)
@@ -1551,11 +1629,33 @@ export async function connect(name: string): Promise<Connection> {
     throw new Error('the previous browser process is gone (reopen the session)')
   }
   const chromium = await loadChromium()
+  // Ask BEFORE Playwright arrives and overwrites the answer — external sessions
+  // only, since that is where a human is looking at these tabs.
+  const realScheme = info.external === true ? await probeRealColorScheme(info.wsEndpoint) : null
   const browser = await chromium.connectOverCDP(info.wsEndpoint)
   const context = browser.contexts()[0]
   if (!context) {
     await browser.close().catch(() => {})
     throw new Error('the browser has no available context')
+  }
+  // Put the pages back to what they really said. Playwright applied `light` to ALL
+  // of them the moment we connected, and only emulateMedia can override it.
+  //
+  // Order matters and is the whole point: the FIRST page is corrected and awaited
+  // (~60ms), the rest are fired without blocking the command (~300ms for a dozen
+  // tabs, all of it invisible because nobody is looking at a background tab). This
+  // is MITIGATION, not a cure — Playwright pushes the emulation as part of
+  // attaching, so a brief flash before the correction lands is unavoidable while
+  // silver reconnects per command. Eliminating it entirely would mean holding one
+  // Playwright connection open for the session's lifetime.
+  if (realScheme !== null) {
+    const open = context.pages()
+    if (open.length > 0) {
+      await open[0].emulateMedia({ colorScheme: realScheme }).catch(() => {})
+      void Promise.allSettled(
+        open.slice(1).map((p) => p.emulateMedia({ colorScheme: realScheme })),
+      )
+    }
   }
   const page = context.pages()[0] ?? (await context.newPage())
   // Idle-reaper clock: record that this session was actually touched. Strictly
