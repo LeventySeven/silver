@@ -2360,9 +2360,30 @@ async function handleFind(flags: ParsedFlags): Promise<Envelope<unknown>> {
   // subcommand — same in-handler pattern as `network route` / `storage set`).
   if (subaction !== undefined && !flags.enableActions) return fail('not_permitted')
 
+  // Path containment for `upload`, mirroring handleAct's P1-SEC4 rail. Without it
+  // this handler was a LOCAL-FILE EXFIL primitive: `find label "…" upload
+  // /etc/passwd --enable-actions` attached an arbitrary host file to the page's
+  // file input and returned success, while the grounded `upload @eN <same path>`
+  // correctly returned `path_denied` — same verb, same actuation, one gate.
+  //
+  // Setting `opts.files` is load-bearing, not decorative: `applyVerb`'s upload case
+  // is `opts.files ?? [value]`, so leaving it unset lets the RAW argv string reach
+  // `setInputFiles` and defeats the check we just ran. This handler already mirrors
+  // handleAct's confirm gate on purpose; the containment mirror was simply missing.
+  let uploadFiles: string[] | undefined
+  if (subaction === 'upload') {
+    uploadFiles = []
+    for (const fp of flags.args.slice(3)) {
+      const c = assertContainedPath(fp)
+      if (!c.ok) return fail('path_denied')
+      uploadFiles.push(c.resolved)
+    }
+  }
+
   return withConnection(flags, async ({ page }) => {
     const opts: Parameters<typeof find>[4] = {}
     if (subValue !== undefined) opts.value = subValue
+    if (uploadFiles !== undefined) opts.files = uploadFiles
     if (flags.name !== undefined) opts.name = flags.name
     if (flags.index !== undefined) opts.index = flags.index
     // E1/D2: thread the secret registry so a `find … fill "<secret>PW</secret>"`

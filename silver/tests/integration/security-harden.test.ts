@@ -223,6 +223,45 @@ describe('security hardening (real Chromium via the run() entry)', () => {
     }
   })
 
+  // --- The SAME containment, via the OTHER door. `find <kind> <value> upload <path>`
+  //     actuates the identical verb through a different handler, and that handler
+  //     had no containment at all — so the exfil block above was bypassable by
+  //     spelling the command differently. Reproduced before the fix: the host's
+  //     /etc/passwd genuinely attached to the page input and the command returned
+  //     success. Gate parity is the invariant; this pins it.
+  it('find <kind> <value> upload refuses an out-of-CWD path, exactly like the grounded form', async () => {
+    // Baseline: the preceding test leaves an in-CWD file attached, so the invariant
+    // is that a DENIED attempt changes nothing — not that the input is empty.
+    const filesNow = async (): Promise<string> =>
+      String(
+        (
+          await run([
+            'eval', "document.querySelector('input[type=file]').files.length",
+            '--enable-actions', '--session', NAME,
+          ])
+        ).env.data,
+      )
+    const before = await filesNow()
+    const home = process.env.HOME ?? '/root'
+    const attempts: Array<[string, string]> = [
+      ['absolute', '/etc/passwd'],
+      ['traversal', '../../../../../../etc/passwd'],
+      ['home-secret', `${home}/.ssh/id_rsa`],
+    ]
+    for (const [label, p] of attempts) {
+      const res = await run([
+        'find', 'label', 'Pick file', 'upload', p, '--enable-actions', '--session', NAME,
+      ])
+      expect(res.env.success, `${label} must be denied via find`).toBe(false)
+      expect(res.env.error, `${label} → path_denied`).toBe(ERRORS.path_denied.message)
+      expect(JSON.stringify(res.env)).not.toContain(p)
+    }
+
+    // And nothing reached the page: a denial that still attached the file would be
+    // the worst outcome of all.
+    expect(await filesNow()).toBe(before)
+  })
+
   // --- Fix P0-4: narrowed confirm gate. A paid control is gated; ordinary ones
   //     and a hallucinated ref are handled correctly.
   it('confirm gate: Buy is denied by default (non-TTY), approvable, and ordinary clicks pass', async () => {
