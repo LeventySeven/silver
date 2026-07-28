@@ -653,7 +653,11 @@ export type RestoreSnapshot = {
 /** Persistent restore dir, a SIBLING of `sessions/` so a session's teardown never
  * deletes it: `~/.silver/[<ns>/]restore`. */
 function restoreRoot(): string {
-  const base = path.join(os.homedir(), '.silver')
+  // Must go through silverHome(): this was the one path still reading os.homedir()
+  // directly, so a run with SILVER_HOME set relocated its sessions but kept
+  // writing durable login snapshots into the REAL ~/.silver — which is both a
+  // leak out of the sandbox and a way for a test run to clobber real snapshots.
+  const base = silverHome()
   return activeNamespace ? path.join(base, activeNamespace, 'restore') : path.join(base, 'restore')
 }
 
@@ -825,7 +829,20 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
   // Resolve ONCE and persist: this is the TTL that governs this session for its
   // whole life, including when some other namespace's command sweeps it.
   const sessionTtlMs = resolveIdleTtlMs(opts.idleTimeoutMs)
-  const withLifeline = lifelineEnabled(sessionTtlMs)
+  // Arm the lifeline's clock BEFORE deciding to use it. Once Chromium is running
+  // with `--remote-debugging-pipe` there is no safe recovery from a failed
+  // handover: holding our fd copies hangs the CLI, and dropping them leaves zero
+  // writers on fd 3, so Chromium reads EOF and exits a browser we just started.
+  // Arming first turns that unrecoverable state into a plain "no lifeline today".
+  const deadlineFile = newDeadlineFile()
+  const armed =
+    lifelineEnabled(sessionTtlMs) &&
+    (await fs
+      .mkdir(dir, { recursive: true })
+      .then(() => renewDeadline(dir, deadlineFile, sessionTtlMs))
+      .then(() => true)
+      .catch(() => false))
+  const withLifeline = armed
   const args = [
     `--remote-debugging-port=${requestedPort}`,
     `--user-data-dir=${userDataDir}`,
@@ -883,24 +900,26 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
     throw new Error('failed to spawn the browser process')
   }
 
-  // Arm the death clock BEFORE handing the fds over, so the holder's very first
-  // poll reads a real deadline instead of racing an absent file and exiting
-  // immediately — which would take the browser with it. The session dir is
-  // created here rather than later because a custom `--profile`/`userDataDir`
-  // means the default `<dir>/profile` mkdir above never created it.
   let holderPid: number | undefined
-  const deadlineFile = newDeadlineFile()
   if (withLifeline) {
-    const armed = await fs
-      .mkdir(dir, { recursive: true })
-      .then(() => renewDeadline(dir, deadlineFile, sessionTtlMs))
-      .then(() => true)
-      .catch(() => false)
-    // No deadline file means no clock to read; spawning the holder anyway would
-    // have it exit on its first poll and kill a browser we just started.
-    if (armed) holderPid = spawnLifelineHolder(child, dir, deadlineFile)
-    // Unconditional: see releasePipeEnds. A failed arm still leaves this process
-    // holding both ends, which would both pin the lifeline open and hang the CLI.
+    // The clock already exists (armed above), so the holder's first poll reads a
+    // real deadline rather than racing an absent file and exiting immediately.
+    holderPid = spawnLifelineHolder(child, dir, deadlineFile)
+    if (holderPid === undefined) {
+      // The fds could not be handed over. Chromium is already running with the
+      // pipe flag, so there is no version of this where it keeps working: kill it
+      // and let the caller's retry come back through with `armed` false.
+      releasePipeEnds(child)
+      try {
+        process.kill(pid, 'SIGKILL')
+      } catch {
+        /* already gone */
+      }
+      await fs.rm(path.join(dir, deadlineFile), { force: true }).catch(() => {})
+      throw new Error('failed to hand the browser lifeline to a holder process')
+    }
+    // Only now is it safe to drop our copies: the holder owns the lifeline, and
+    // holding them here would pin it open and keep the CLI's event loop alive.
     releasePipeEnds(child)
     // The previous generation's holder is retired by removing ITS clock — never
     // by signalling its recorded pid, which may have been recycled since.

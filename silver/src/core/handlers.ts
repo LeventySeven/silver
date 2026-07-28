@@ -689,11 +689,7 @@ async function withConnection<T>(
     // command would be silently lost by the next command's connect. The secret
     // registry is threaded in so a `<secret>`-tokened header value / password is
     // resolved at apply-time (never persisted or echoed raw).
-    await applyEmulation(page, conn.context, flags.session, currentSecrets()).catch(() => {})
-    // Register the dialog handler on the active page (fix P0-7): with no
-    // listener, Playwright silently CANCELS every alert/confirm/prompt, so a
-    // `confirm("delete?")` guard is auto-dismissed while the host still gets ok().
-    attachDialogHandler(page, flags.session)
+    await instrumentPage(page, conn.context, flags)
     // E4: opt-in permission auto-grant on connect so a task that hits a
     // geolocation/clipboard/notifications prompt does not hang. Flag-gated (OFF
     // by default); best-effort per engine.
@@ -710,16 +706,6 @@ async function withConnection<T>(
         path.join(sessionDir(flags.session), 'downloads'),
       ).drain
     }
-    // Re-materialize any persisted `network route` rules on this connection.
-    // `page.route` handlers are client-side and vanish on our per-command CDP
-    // reconnect, so routing is kept "on by default" by re-applying it here. A
-    // single cheap sidecar read + early return when no rules exist — zero effect
-    // on the common (no-route) path. Never throws.
-    await applyRoutes(page, flags.session).catch(() => {})
-    // Item #14: re-seed persisted storage-state origins' localStorage on this
-    // connection (mirrors applyRoutes). Registered BEFORE fn so a navigation this
-    // command triggers (`open`) is seeded at document-start. Never throws.
-    await applyStorageSeed(page, flags.session).catch(() => {})
     try {
       const result = await fn({ ...conn, page })
       // 2c — autosave the durable snapshot AFTER a mutating verb of a --restore
@@ -1093,6 +1079,8 @@ async function handleOpen(flags: ParsedFlags): Promise<Envelope<unknown>> {
     // Navigating REPLACES whatever is in the tab, so in a browser silver does not
     // own it must not land on a tab that merely happened to be active. Get our own.
     const { page, openedTab } = await navigationTarget(flags, context, resolved)
+    // Capture must be installed on the page we will actually navigate.
+    await ensureCapture(page, flags.session).catch(() => {})
     // 2c — replay the saved cookies into the user's own context before navigating.
     if (restoreSnap && Array.isArray(restoreSnap.cookies) && restoreSnap.cookies.length > 0) {
       await context
@@ -1364,6 +1352,41 @@ async function handleTabSwitch(flags: ParsedFlags, ref: string): Promise<Envelop
 }
 
 /**
+ * Install every per-PAGE override on `page`.
+ *
+ * Extracted so it can be applied to a page that is swapped in AFTER
+ * `withConnection` did its setup — `navigationTarget` opens a fresh tab in a
+ * `connect`ed browser, and that tab would otherwise silently run with no
+ * emulation, no dialog handler, no persisted routes and no storage seed. All of
+ * it is best-effort: instrumenting is never allowed to fail the command.
+ *
+ * Context-scoped setup (permission grants, the Fetch egress guard) is NOT here —
+ * it applies to the whole browser context and already ran on connect.
+ */
+async function instrumentPage(
+  page: Page,
+  context: BrowserContext,
+  flags: ParsedFlags,
+): Promise<void> {
+  // F8: re-apply persisted emulation overrides. The secret registry is threaded
+  // in so a `<secret>`-tokened header value / password is resolved at apply-time
+  // (never persisted or echoed raw).
+  await applyEmulation(page, context, flags.session, currentSecrets()).catch(() => {})
+  // P0-7: with no dialog listener Playwright silently CANCELS every
+  // alert/confirm/prompt, so a `confirm("delete?")` guard is auto-dismissed
+  // while the host still gets ok().
+  attachDialogHandler(page, flags.session)
+  // `page.route` handlers are client-side and vanish on our per-command CDP
+  // reconnect, so routing is kept "on by default" by re-applying it here. A
+  // single cheap sidecar read + early return when no rules exist.
+  await applyRoutes(page, flags.session).catch(() => {})
+  // Item #14: re-seed persisted storage-state origins' localStorage (mirrors
+  // applyRoutes). Registered BEFORE the verb runs so a navigation this command
+  // triggers is seeded at document-start.
+  await applyStorageSeed(page, flags.session).catch(() => {})
+}
+
+/**
  * Pick the page a NAVIGATION may land on, and open our own tab when it must not
  * reuse someone else's.
  *
@@ -1401,6 +1424,10 @@ async function navigationTarget(
   // Otherwise the active tab is a stranger's. Take our own and leave theirs alone.
   const page = await context.newPage()
   await page.setViewportSize({ width: 1280, height: 900 }).catch(() => {})
+  // This page did not exist when withConnection instrumented the session, so it
+  // carries none of the per-page overrides yet. Without this it would run with no
+  // dialog handler, no persisted routes, no storage seed and no emulation.
+  await instrumentPage(page, context, flags)
   const targetId = await pageTargetId(page)
   const id = `t${synced.reg.nextId}`
   await saveTabRegistry(flags.session, {
@@ -1452,7 +1479,16 @@ async function handleTabClose(flags: ParsedFlags): Promise<Envelope<unknown>> {
     const remaining = synced.reg.tabs.filter((t) => t.targetId !== target.targetId)
     let active = synced.reg.activeTargetId
     if (wasActive) active = remaining[remaining.length - 1]?.targetId ?? null
-    await saveTabRegistry(flags.session, { nextId: synced.reg.nextId, activeTargetId: active, tabs: remaining })
+    // Spread the synced registry rather than rebuilding it: a literal drops
+    // `browserGuid` and `activeExplicit`, and losing the guid silently voids every
+    // ownership claim in the session (fail-closed, so the next `tab close` would
+    // refuse a tab silver really does own).
+    await saveTabRegistry(flags.session, {
+      ...synced.reg,
+      nextId: synced.reg.nextId,
+      activeTargetId: active,
+      tabs: remaining,
+    })
 
     // Closing the active tab promotes a new active tab with a different DOM.
     if (wasActive && active) {
