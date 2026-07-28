@@ -1068,7 +1068,10 @@ async function handleOpen(flags: ParsedFlags): Promise<Envelope<unknown>> {
     await saveStorageSeed(flags.session, { origins: originsToSeed(restoreSnap.origins) })
   }
 
-  return withConnection(flags, async ({ page, context }) => {
+  return withConnection(flags, async ({ page: resolved, context }) => {
+    // Navigating REPLACES whatever is in the tab, so in a browser silver does not
+    // own it must not land on a tab that merely happened to be active. Get our own.
+    const { page, openedTab } = await navigationTarget(flags, context, resolved)
     // 2c — replay the saved cookies into the user's own context before navigating.
     if (restoreSnap && Array.isArray(restoreSnap.cookies) && restoreSnap.cookies.length > 0) {
       await context
@@ -1117,6 +1120,9 @@ async function handleOpen(flags: ParsedFlags): Promise<Envelope<unknown>> {
         url: page.url(),
         title: await page.title().catch(() => ''),
         page_changed: fp.page_changed,
+        // Surfaced so the host knows navigation did NOT reuse whatever tab was
+        // active — silver opened its own rather than overwrite someone else's.
+        ...(openedTab ? { opened_tab: openedTab } : {}),
         ...(hz.captcha ? { captcha_detected: true } : {}),
         ...(hz.auth ? { auth_required: true } : {}),
         ...(empty ? { page_empty: true } : {}),
@@ -1318,7 +1324,13 @@ async function handleTabSwitch(flags: ParsedFlags, ref: string): Promise<Envelop
     if (!rec || !page) return badRequest('no such tab; run `tab list` to see open tabs')
 
     await page.bringToFront().catch(() => {})
-    await saveTabRegistry(flags.session, { ...synced.reg, activeTargetId: rec.targetId })
+    // An explicit switch is CONSENT: from here on, navigation may reuse this tab
+    // even in a browser silver does not own.
+    await saveTabRegistry(flags.session, {
+      ...synced.reg,
+      activeTargetId: rec.targetId,
+      activeExplicit: true,
+    })
     await invalidateRefs(flags.session, page)
 
     return ok({
@@ -1328,6 +1340,55 @@ async function handleTabSwitch(flags: ParsedFlags, ref: string): Promise<Envelop
       title: await page.title().catch(() => ''),
     })
   })
+}
+
+/**
+ * Pick the page a NAVIGATION may land on, and open our own tab when it must not
+ * reuse someone else's.
+ *
+ * `syncRegistry` has to make some tab active and, absent anything better, picks
+ * `targets[0]` — in a `connect`ed browser that is simply whichever tab the user
+ * had first. Navigating it destroys what was there. That already happened once:
+ * an agent's `open` overwrote the user's tab 1 with its own page.
+ *
+ * So in an EXTERNAL session, navigation reuses the active tab only with a claim
+ * to it: either silver CREATED it (`owned`), or a human/agent explicitly selected
+ * it with `tab <ref>` (`activeExplicit`). Otherwise silver opens its own tab and
+ * navigates that, leaving the user's tabs exactly as they were.
+ *
+ * An OWNED session is untouched — that browser is entirely silver's, so its first
+ * tab is silver's too, and opening a second one on every `open` would be waste.
+ */
+async function navigationTarget(
+  flags: ParsedFlags,
+  context: BrowserContext,
+  resolved: Page,
+): Promise<{ page: Page; openedTab: string | null }> {
+  const sidecar = await readSidecar(flags.session).catch(() => null)
+  if (sidecar?.external !== true) return { page: resolved, openedTab: null }
+
+  const reg = (await loadTabRegistry(flags.session)) ?? emptyRegistry()
+  const guid = browserGuidOf(sidecar.wsEndpoint)
+  const synced = await syncRegistry(context, reg, guid)
+  const active = synced.reg.tabs.find((t) => t.targetId === synced.reg.activeTargetId)
+
+  // A tab we made, or one someone deliberately chose: reuse it.
+  if (synced.reg.activeExplicit === true || (active && isOwnedTab(synced.reg, active, guid))) {
+    return { page: resolved, openedTab: null }
+  }
+
+  // Otherwise the active tab is a stranger's. Take our own and leave theirs alone.
+  const page = await context.newPage()
+  await page.setViewportSize({ width: 1280, height: 900 }).catch(() => {})
+  const targetId = await pageTargetId(page)
+  const id = `t${synced.reg.nextId}`
+  await saveTabRegistry(flags.session, {
+    nextId: synced.reg.nextId + 1,
+    activeTargetId: targetId,
+    tabs: [...synced.reg.tabs, { id, targetId, owned: true }],
+    ...(synced.reg.browserGuid ? { browserGuid: synced.reg.browserGuid } : {}),
+  })
+  return { page, openedTab: id }
 }
 
 async function handleTabClose(flags: ParsedFlags): Promise<Envelope<unknown>> {

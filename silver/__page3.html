@@ -1,0 +1,19 @@
+<!doctype html><html><body>
+<h1>Checkout</h1>
+<button id="visible">Continue</button>
+
+<!-- closed drawer implemented with opacity:0 (very common fade pattern) -->
+<div id="drawer" style="opacity:0">
+  <h2>Danger zone</h2>
+  <button>Delete account</button>
+  <a href="/wire">Wire funds</a>
+  <input type="text" aria-label="Amount">
+</div>
+
+<!-- same thing with visibility:hidden, for contrast -->
+<div id="vis" style="visibility:hidden">
+  <button>VH Delete</button>
+</div>
+
+<div id="scopeme" style="display:none"><p>scoped away</p></div>
+</body></html>

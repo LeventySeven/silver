@@ -110,6 +110,61 @@ describe('tab ownership guard (real Chromium)', () => {
     expect(closed.env.success).toBe(true)
   })
 
+  it('`open` does NOT navigate a tab it merely found — it takes its own', async () => {
+    // The near-miss this prevents: an agent's `open` overwrote the user's tab 1,
+    // because syncRegistry had defaulted `activeTargetId` to targets[0]. A tab
+    // being active by default is a guess, not consent.
+    const guest = await run(['connect', endpoint, '--session', 'g2', '--namespace', NS])
+    expect(guest.env.success).toBe(true)
+
+    setNamespace(NS)
+    const before = await loadTabRegistry('g2')
+    setNamespace('')
+    const strangerTarget = before!.activeTargetId!
+    const strangerPage = data<{ tabs: Array<{ url: string; active: boolean }> }>(
+      await run(['tab', 'list', '--session', 'g2', '--namespace', NS]),
+    ).tabs.find((t) => t.active)!
+    const strangerUrl = strangerPage.url
+
+    const res = await run(['open', `${base}?navigated`, '--session', 'g2', '--namespace', NS])
+    expect(res.env.success).toBe(true)
+    // It says so, rather than silently doing something else than asked.
+    expect(data<{ opened_tab?: string }>(res).opened_tab).toBeTruthy()
+
+    setNamespace(NS)
+    const after = await loadTabRegistry('g2')
+    setNamespace('')
+    // A different tab is active now, and it is one we own.
+    expect(after!.activeTargetId).not.toBe(strangerTarget)
+    expect(after!.tabs.find((t) => t.targetId === after!.activeTargetId)?.owned).toBe(true)
+    // The stranger's tab still exists, still on its original URL.
+    const survivor = data<{ tabs: Array<{ url: string; targetId?: string }> }>(
+      await run(['tab', 'list', '--session', 'g2', '--namespace', NS]),
+    ).tabs
+    expect(survivor.some((t) => t.url === strangerUrl)).toBe(true)
+  })
+
+  it('but DOES reuse a tab that was explicitly selected — an explicit choice is consent', async () => {
+    // Silver must stay drivable against a real browser: `tab t1` then `open` is a
+    // deliberate "use this one", and it is honoured.
+    setNamespace(NS)
+    const reg = await loadTabRegistry('g2')
+    setNamespace('')
+    const stranger = reg!.tabs.find((t) => t.owned !== true)!
+
+    const sw = await run(['tab', stranger.id, '--session', 'g2', '--namespace', NS])
+    expect(sw.env.success).toBe(true)
+
+    const res = await run(['open', `${base}?consented`, '--session', 'g2', '--namespace', NS])
+    expect(res.env.success).toBe(true)
+    expect(data<{ opened_tab?: string }>(res).opened_tab).toBeUndefined()
+
+    setNamespace(NS)
+    const after = await loadTabRegistry('g2')
+    setNamespace('')
+    expect(after!.activeTargetId).toBe(stranger.targetId)
+  })
+
   it('an OWNED session may still close any of its own tabs', async () => {
     // The guard is scoped to external sessions: a browser Silver spawned is
     // entirely its own, and nothing here should have changed for it.

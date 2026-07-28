@@ -58,6 +58,16 @@ export type TabRegistry = {
    * which are therefore treated as owning nothing.
    */
   browserGuid?: string
+  /**
+   * TRUE only when a human/agent EXPLICITLY selected the active tab (`tab <ref>`).
+   *
+   * `syncRegistry` has to make some tab active, and with nothing better to go on
+   * it picks `targets[0]` — which in a `connect`ed browser is whatever the user
+   * happened to have first. That default is a guess, not consent, and treating it
+   * as consent is how `open` ended up navigating a user's tab out from under them.
+   * An explicit `tab t3` IS consent, and survives here so navigation can honour it.
+   */
+  activeExplicit?: true
 }
 
 /**
@@ -196,11 +206,17 @@ export async function syncRegistry(
   let active = reg.activeTargetId
   if (!active || !liveIds.has(active)) active = targets[0]?.targetId ?? null
 
+  // Consent is tied to the SPECIFIC tab that was chosen. If the chosen tab is
+  // gone and we had to fall back to another one, the new active tab was picked by
+  // us, not chosen by anyone — so the claim does not transfer to it.
+  const consentHolds = reg.activeExplicit === true && active === reg.activeTargetId
+
   const next: TabRegistry = {
     nextId,
     activeTargetId: active,
     tabs: records,
     ...(guid ? { browserGuid: guid } : {}),
+    ...(consentHolds ? { activeExplicit: true as const } : {}),
   }
 
   const byTarget = new Map(targets.map((t) => [t.targetId, t.page]))
