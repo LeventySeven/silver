@@ -72,6 +72,20 @@ npx agent-silver skill install
 npx playwright install chromium
 ```
 
+### As a Claude Code plugin
+
+The repo doubles as a Claude Code plugin — the skill plus the four `/quick`, `/extract`,
+`/parallel`, `/task` commands, versioned and uninstallable:
+
+```
+/plugin marketplace add Timmy-Lane/prd-pipeline
+/plugin install silver@prd-pipeline
+```
+
+The plugin ships the prompt layer only; it still needs the `silver` CLI on PATH
+(`npm i -g agent-silver`). The plugin surface at `skills/` and `commands/` is a copy of the
+canonical assets under `silver/`, kept honest by `scripts/sync-plugin.sh --check`.
+
 From source:
 
 ```bash
