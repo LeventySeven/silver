@@ -75,11 +75,11 @@ npx playwright install chromium
 ### As a Claude Code plugin
 
 The repo doubles as a Claude Code plugin — the skill plus the four `/quick`, `/extract`,
-`/parallel`, `/task` commands, versioned and uninstallable:
+`/parallel`, `/task` commands, versioned and uninstallable, served from this repo itself:
 
 ```
-/plugin marketplace add Timmy-Lane/prd-pipeline
-/plugin install silver@prd-pipeline
+/plugin marketplace add LeventySeven/silver
+/plugin install silver@silver
 ```
 
 The plugin ships the prompt layer only; it still needs the `silver` CLI on PATH

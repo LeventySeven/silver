@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "silver",
+  "description": "The silver keyless browser for AI agents, installable straight from this repo.",
+  "owner": {
+    "name": "LeventySeven",
+    "url": "https://github.com/LeventySeven/silver"
+  },
+  "plugins": [
+    {
+      "name": "silver",
+      "source": "./",
+      "category": "web",
+      "description": "A keyless local headless browser for AI agents (Playwright; never calls a model or an API). Drives live pages through accessibility-tree snapshots with stable @eN refs. Ships the skill and the /quick, /extract, /parallel, /task commands; needs the `silver` CLI on PATH (npm i -g agent-silver)."
+    }
+  ]
+}
