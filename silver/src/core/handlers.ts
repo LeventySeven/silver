@@ -408,6 +408,27 @@ async function applyEmulation(
   secrets: SecretRegistry,
 ): Promise<void> {
   const emu = await loadEmulation(name)
+  // Clear the media emulation Playwright imposes UNASKED before anything else.
+  //
+  // `connectOverCDP` applies Playwright's context defaults to the pages it drives
+  // — `colorScheme: 'light'`, `reducedMotion: 'no-preference'`, `forcedColors:
+  // 'none'` — even though silver never requested them. On a browser silver owns
+  // that is invisible; on the user's REAL browser it is not: their pages flipped
+  // to light for the duration of every command and back to dark on disconnect, so
+  // a working agent made the whole browser strobe. Measured on this machine:
+  // system Dark, raw CDP reports `dark`, the same page through Playwright reports
+  // `light`.
+  //
+  // It is also an authenticity tell — a browser insisting it prefers light while
+  // the OS is in dark mode is exactly the kind of mismatch fingerprinting looks
+  // for. `null` disables the override and restores what the browser actually
+  // reports. Done unconditionally so a session that never set anything behaves
+  // like an ordinary browser; a persisted override below then re-applies on top.
+  if (!emu?.colorScheme) {
+    await page
+      .emulateMedia({ colorScheme: null, reducedMotion: null, forcedColors: null })
+      .catch(() => {})
+  }
   if (!emu) return
   if (emu.viewport) await page.setViewportSize(emu.viewport).catch(() => {})
   if (emu.colorScheme) await page.emulateMedia({ colorScheme: emu.colorScheme }).catch(() => {})

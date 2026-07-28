@@ -37,9 +37,14 @@ Every command prints one envelope: `{ "success", "data", "error", "warning"? }`.
 
 **Config files (stop repeating flags).** Instead of passing the same flags on every invocation,
 set defaults in `~/.silver/config.json` (user) and/or a project `silver.json` (checked in). Merge
-order is **user → project → env → CLI** (later wins); **list** fields (e.g. `allowedDomains`)
-**concatenate**, scalars override. This kills a real drift bug — one batch call silently forgetting
-`--allowedDomains` and running unrestricted. A flag on the CLI always beats the file.
+order is **user → project → env → CLI** (later wins) and scalars override. Lists differ by kind:
+`confirmActions` / `resourceTypes` **concatenate** (more entries = a stricter fence, so union is
+itself a tightening), but **`allowedDomains` is TIGHTEN-ONLY** — the first non-empty layer sets the
+baseline and each later layer is INTERSECTED with it, never unioned. A lower-trust project
+`silver.json` therefore cannot punch new holes in a higher-trust `~/.silver/config.json` allowlist;
+a layer that would only widen is rejected and the stricter allowlist stands. An empty list means
+"no opinion", not "allow everything". This kills a real drift bug — one batch call silently
+forgetting `--allowedDomains` and running unrestricted. A flag on the CLI always beats the file.
 
 **This guide is served two ways** — run `silver skill --full` (works with only the binary
 installed), OR read the linked `skill-data/core/*.md` files directly if this package is in your
