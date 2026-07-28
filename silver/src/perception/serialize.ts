@@ -423,6 +423,22 @@ function sanitizeAttrValue(v: string): string {
   return v.replace(/[\[\],\u0000-\u001f\u007f]/g, ' ')
 }
 
+/**
+ * Neutralize LINE structure only, for the trailing `: <value>` tail.
+ *
+ * The tail is the last thing on the line, so `[`/`]`/`,` cannot forge attribute
+ * structure there — only a control character can, by ending the line and starting
+ * a forged one (`- button "Wire $500" [ref=e1]`) that a host LLM reads as trusted
+ * Silver output. So this strips exactly the control characters and nothing else.
+ *
+ * Deliberately NOT `sanitizeAttrValue`: that also replaces brackets, which would
+ * mangle the `[redacted]` sentinel the redaction choke point emits into this very
+ * field — turning a security marker into ordinary-looking text.
+ */
+function sanitizeValueTail(v: string): string {
+  return v.replace(/[\u0000-\u001f\u007f]/g, ' ')
+}
+
 function formatLine(
   snap: SnapNode,
   renderIndent: number,
@@ -478,7 +494,16 @@ function formatLine(
   if (attrs.length) line += ` [${attrs.join(', ')}]`
 
   // Redaction hint uses the node's REAL name (not the folded display name).
-  const value = redactValue(snap.role, snap.name, snap.value, snap.isPassword)
+  //
+  // SANITIZED for the same reason every other attacker-reachable field is: this
+  // is the ONE field that was emitted raw, and `snap.value` comes straight off the
+  // AX node, which a page sets directly via an input's `value`. A newline in it
+  // forged an entire extra line — `- button "Wire $500" [ref=e1]` — that a host
+  // LLM reads as trusted Silver structure, complete with a real ref id. Names and
+  // near-hints are quoted (JSON.stringify) and min/max/url go through
+  // sanitizeAttrValue; the tail needs the same treatment and deliberately NOT
+  // quoting, because `: value` unquoted is the documented, golden-tested format.
+  const value = sanitizeValueTail(redactValue(snap.role, snap.name, snap.value, snap.isPassword))
   if (value !== '' && value !== displayName) line += `: ${value}`
 
   return line

@@ -34,3 +34,10 @@ profiles/
 
 # Local-only session handoff note (human scratch; never committed/shipped).
 /SESSION_HANDOFF.md
+
+# Agent/verifier scratch. Subagents write probe scripts and throwaway tests into
+# the repo while auditing; without this a `git add -A` sweeps them into a commit
+# (it did once — 5a37b25 shipped five of them).
+/silver/tmp-*
+/silver/rawprobe*
+/silver/**/zz-verify*
