@@ -841,7 +841,25 @@ const SCAN_JS = `(function () {
     var style = getComputedStyle(el);
     var type = (el.getAttribute('type') || '').toLowerCase();
     var isRadioCheck = tag === 'input' && (type === 'radio' || type === 'checkbox');
-    var isHidden = style.visibility === 'hidden' || style.opacity === '0';
+    // ANCESTOR-AWARE visibility. The visibility property INHERITS, so a computed
+    // check on the element alone already catches a hidden container's descendants
+    // -- but opacity does NOT: every child of an opacity:0 box computes opacity 1.
+    // Closed modals, dropdowns and toasts are routinely hidden that way, so their
+    // buttons stayed ref-eligible and an agent could click something no human could
+    // see, with the action still reporting success. checkVisibility with
+    // opacityProperty walks the ancestor chain natively (one call, no manual parent
+    // loop). Falls back to the old per-element test if the API is unavailable.
+    // NOTE: this whole block lives inside a TEMPLATE LITERAL -- no backticks here.
+    var isHidden;
+    if (typeof el.checkVisibility === 'function') {
+      isHidden = !el.checkVisibility({
+        opacityProperty: true,
+        visibilityProperty: true,
+        contentVisibilityAuto: true,
+      });
+    } else {
+      isHidden = style.visibility === 'hidden' || style.opacity === '0';
+    }
     var prune = isHidden && !isRadioCheck;
 
     // Aside-alignment: a real scroll container = overflow(x|y) auto/scroll/overlay AND
