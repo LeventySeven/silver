@@ -44,7 +44,7 @@ baseline and each later layer is INTERSECTED with it, never unioned. A lower-tru
 `silver.json` therefore cannot punch new holes in a higher-trust `~/.silver/config.json` allowlist;
 a layer that would only widen is rejected and the stricter allowlist stands. An empty list means
 "no opinion", not "allow everything". This kills a real drift bug — one batch call silently
-forgetting `--allowedDomains` and running unrestricted. A flag on the CLI always beats the file.
+forgetting `--allowedDomains` and running unrestricted. A flag on the CLI always beats the file. **A project `silver.json` cannot GRANT capability** — `enableActions`, `allowFileAccess`, `grantPermissions`, `noEncryptState` and `contentBoundaries: false` are ignored there (with a warning) because that file arrives with whatever repo you cloned; set them on the CLI or in your own `~/.silver/config.json`.
 
 **This guide is served two ways** — run `silver skill --full` (works with only the binary
 installed), OR read the linked `skill-data/core/*.md` files directly if this package is in your

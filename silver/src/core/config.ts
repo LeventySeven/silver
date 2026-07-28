@@ -284,6 +284,54 @@ function mergeLayers(layers: SilverConfig[]): SilverConfig {
   return out
 }
 
+
+/**
+ * Fields a PROJECT config may not set, because setting them GRANTS capability or
+ * WEAKENS a fence rather than narrowing one.
+ *
+ * `silver.json` lives in the working directory, so it arrives with whatever
+ * repository you happen to have cloned — it is the lowest-trust layer there is.
+ * `enableActions` is the tool's central safety gate ("read-only is the default;
+ * state-changing verbs are quarantined behind --enable-actions"), and a checked-in
+ * file could arm it for every command run from that directory, silently. The same
+ * goes for opening up `file:` navigation, auto-granting browser permissions,
+ * writing session state unencrypted, or dropping the untrusted-content fence.
+ *
+ * This is the same trust ordering the allowlist merge already enforces — a
+ * lower-trust layer may only tighten — applied to the boolean grants. The USER
+ * layer (`~/.silver/config.json`) is deliberately still allowed to set them: the
+ * user wrote that file themselves. Dropping one WARNS rather than failing, so the
+ * config still loads and the operator is told what was ignored.
+ */
+const PROJECT_FORBIDDEN_FIELDS = [
+  'enableActions',
+  'allowFileAccess',
+  'grantPermissions',
+  'noEncryptState',
+] as const
+
+/** Strip grant-shaped fields from a project-layer config, warning for each. */
+function stripProjectGrants(cfg: SilverConfig, warnings: string[]): SilverConfig {
+  const out: SilverConfig = { ...cfg }
+  for (const field of PROJECT_FORBIDDEN_FIELDS) {
+    if (out[field] === true) {
+      delete out[field]
+      warnings.push(
+        `project config: ignoring "${field}" — a silver.json in the working directory cannot grant capability; pass the flag explicitly or set it in ~/.silver/config.json`,
+      )
+    }
+  }
+  // `contentBoundaries: false` is the same shape spelled the other way: it REMOVES
+  // the fence that marks page content untrusted.
+  if (out.contentBoundaries === false) {
+    delete out.contentBoundaries
+    warnings.push(
+      'project config: ignoring "contentBoundaries: false" — a silver.json in the working directory cannot remove the untrusted-content fence',
+    )
+  }
+  return out
+}
+
 /**
  * Load + merge the file/env config layers (user → project → env). The CLI layer
  * is applied later by {@link mergeConfig}. Never throws.
@@ -306,7 +354,7 @@ export function loadConfig(opts: LoadConfigOptions = {}): LoadedConfig {
   const projectPath = opts.projectFile ?? join(cwd, 'silver.json')
   const projectCfg = readConfigFile(projectPath, warnings, 'project')
   if (projectCfg) {
-    layers.push(projectCfg)
+    layers.push(stripProjectGrants(projectCfg, warnings))
     sources.push(projectPath)
   }
 
