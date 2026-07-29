@@ -127,7 +127,7 @@ These four are failure-prone and have exactly one correct form. Do not improvise
 | `page_crash` — reopen the session | `auth_required` — supply cookies/state first |
 | `output_overflow` — narrow with `-d`/`-s`/a ref | `captcha_detected` — human step; stop |
 | `session_busy` — another command holds the lock; retry | `retries_exhausted` — silver already spent its bounded internal retries; **do NOT loop** — re-plan or stop |
-| `navigation_failed` — site-side (`net::ERR_*`, DNS, refused); back off, may retry | |
+| `navigation_failed` — site-side (`net::ERR_*`, DNS, refused); back off, may retry | `http_error` — the server **answered** `>= 400`; the host is reachable, the route is not. Fix the path/branch/deployment — do NOT `reload` |
 
 **Advisory flags (surfaced on the envelope/warning, never a hard block — a read path never
 blocks).** These are signals to act on, not errors to retry blind:
@@ -140,7 +140,7 @@ blocks).** These are signals to act on, not errors to retry blind:
   vision for captcha; `cookies set`/`state load` for the login wall). Never loop through them.
 
 **Never blind-retry these (per-class non-retry rule).** `not_permitted`, `navigation_blocked`,
-`confirm_required`, `captcha_detected`, `auth_required`, and `retries_exhausted` are all
+`confirm_required`, `captcha_detected`, `auth_required`, `http_error`, and `retries_exhausted` are all
 **deterministic** — the *identical* command will fail the *identical* way. Retrying unchanged
 burns a turn and, on a rate-limited site, can get the account flagged. Do the fix in the
 right-hand column (or hand off), never the same call again.

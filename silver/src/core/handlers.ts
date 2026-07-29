@@ -1093,10 +1093,16 @@ async function handleOpen(flags: ParsedFlags): Promise<Envelope<unknown>> {
     // `navigation_failed` immediately. Exhausting the hard cap throws
     // `retries_exhausted` (never an unbounded loop). rate-limit retries disabled —
     // a nav rarely 429s and a load retry storm would only make it worse.
-    await withRetries(() => page.goto(url, gotoOpts(flags)), {
+    const resp = await withRetries(() => page.goto(url, gotoOpts(flags)), {
       transient: { maxRetries: 2 },
       rateLimit: { maxRetries: 0 },
     })
+    // The document response's HTTP status. Playwright returns `null` for a
+    // same-document navigation (a hash-only change), so this is genuinely
+    // nullable and MUST NOT be defaulted to 200 — inferring success from an
+    // unobserved status is exactly the bug being fixed. `null` means "not
+    // observed", never "OK".
+    const status = navStatus(resp)
     // Re-install on the freshly-loaded document so the page-side wrappers persist
     // into later commands (they live in the doc's JS, surviving our disconnect).
     await ensureCapture(page, flags.session).catch(() => {})
@@ -1125,14 +1131,19 @@ async function handleOpen(flags: ParsedFlags): Promise<Envelope<unknown>> {
         url: page.url(),
         title: await page.title().catch(() => ''),
         page_changed: fp.page_changed,
+        // The HTTP status silver ITSELF observed for this document. Without it a
+        // 404 came back as a plain `success:true` with a URL, so the host could
+        // hand a human a link silver had never proved. `null` = not observed.
+        status,
         // Surfaced so the host knows navigation did NOT reuse whatever tab was
         // active — silver opened its own rather than overwrite someone else's.
         ...(openedTab ? { opened_tab: openedTab } : {}),
+        ...(isHttpError(status) ? { http_error: true } : {}),
         ...(hz.captcha ? { captcha_detected: true } : {}),
         ...(hz.auth ? { auth_required: true } : {}),
         ...(empty ? { page_empty: true } : {}),
       },
-      hazardWarning(hz, false, empty),
+      hazardWarning(hz, false, empty, undefined, status),
     )
   })
 }
@@ -1163,9 +1174,15 @@ async function handleHistory(flags: ParsedFlags): Promise<Envelope<unknown>> {
     await ensureCapture(page, flags.session).catch(() => {})
 
     const isBackForward = flags.verb === 'back' || flags.verb === 'forward'
+    // `reload` re-requests the document, so it observes a real HTTP status — the
+    // same one `open` now surfaces. Without this a poll loop that reloads until a
+    // route comes up would be blind to the 404 an `open` loop would have seen.
+    // back/forward are NOT covered: a bfcache restore legitimately returns null,
+    // so a status there would be absent-or-stale rather than observed.
+    let status: number | null = null
     if (flags.verb === 'back') await page.goBack(historyNavOpts(flags))
     else if (flags.verb === 'forward') await page.goForward(historyNavOpts(flags))
-    else await page.reload(gotoOpts(flags))
+    else status = navStatus(await page.reload(gotoOpts(flags)))
 
     // Re-hook capture on the new document after a history navigation / reload.
     await ensureCapture(page, flags.session).catch(() => {})
@@ -1187,8 +1204,32 @@ async function handleHistory(flags: ParsedFlags): Promise<Envelope<unknown>> {
       prevTree: null,
       fingerprint: fp.fingerprint,
     })
-    return ok({ url: page.url(), page_changed: fp.page_changed })
+    return ok(
+      {
+        url: page.url(),
+        page_changed: fp.page_changed,
+        ...(isBackForward ? {} : { status }),
+        ...(isHttpError(status) ? { http_error: true } : {}),
+      },
+      isHttpError(status) ? `http_error: ${ERRORS.http_error.message}` : undefined,
+    )
   })
+}
+
+/**
+ * The HTTP status of a navigation's document response, or `null` when there is
+ * none to observe: Playwright's `goto`/`reload` resolve to `null` for a
+ * same-document navigation (e.g. a hash-only change). `null` means NOT OBSERVED
+ * — it must never be read, or defaulted, as 200.
+ */
+function navStatus(resp: { status(): number } | null): number | null {
+  const s = resp?.status()
+  return typeof s === 'number' && Number.isFinite(s) ? s : null
+}
+
+/** An observed status the server itself rejected the request with (>= 400). */
+function isHttpError(status: number | null): boolean {
+  return status !== null && status >= 400
 }
 
 function gotoOpts(flags: ParsedFlags): { waitUntil: 'domcontentloaded'; timeout?: number } {
@@ -1682,10 +1723,15 @@ function hazardWarning(
   pageChanged = false,
   empty = false,
   sparse?: { canvasCoverage: number; refEligibleCount: number },
+  status?: number | null,
 ): string | undefined {
   const parts: string[] = []
   if (hz.captcha) parts.push(`captcha_detected: ${ERRORS.captcha_detected.message}`)
   if (hz.auth) parts.push(`auth_required: ${ERRORS.auth_required.message}`)
+  // The server answered >= 400. The navigation still SUCCEEDED (there is a
+  // document to look at), so this is advisory like the others rather than a
+  // failure — but it must be loud in human mode too, not only in `--json`.
+  if (isHttpError(status ?? null)) parts.push(`http_error: ${ERRORS.http_error.message}`)
   // R5a: page_empty advisory (blank shell / interstitial / unrendered bundle).
   if (empty) parts.push(`page_empty: ${ERRORS.page_empty.message}`)
   // sparse_tree advisory: canvas-dominant + interactive-ref-poor. The percentage
@@ -1716,7 +1762,12 @@ async function handleRead(flags: ParsedFlags): Promise<Envelope<unknown>> {
     // fetched.code is always `navigation_blocked`; route through navBlocked so a
     // loopback-literal target carries the localhost remedy (S9).
     if (!fetched.ok) return navBlocked(url)
-    if (!fetched.res.ok) return fail('page_crash')
+    // The server ANSWERED, with an error status. This used to report `page_crash`,
+    // whose remedy ("run `reload` then re-snapshot") is destructive and useless
+    // for a 404/500 — nothing crashed and the same request returns the same
+    // status. `http_error` says what actually happened. Same root cause as the
+    // missing status on `open`: HTTP status was simply not modelled.
+    if (!fetched.res.ok) return fail('http_error')
     const html = await fetched.res.text()
     // S6: landmark-skipped markdown (headings/lists/links) — fewer tokens and far
     // more useful than the old bare tag-strip. STRING-based (no browser round-trip,
