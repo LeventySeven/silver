@@ -11,7 +11,7 @@
       "name": "silver",
       "source": "./",
       "category": "web",
-      "description": "A keyless local headless browser for AI agents (Playwright; never calls a model or an API). Drives live pages through accessibility-tree snapshots with stable @eN refs. Ships the skill and the /quick, /extract, /parallel, /task commands; needs the `silver` CLI on PATH (npm i -g agent-silver)."
+      "description": "A keyless local headless browser for AI agents (Playwright; never calls a model or an API). Drives live pages through accessibility-tree snapshots with stable @eN refs. Ships the skill and the /silver:quick, /silver:extract, /silver:parallel, /silver:task commands; needs the `silver` CLI on PATH (npm i -g agent-silver)."
     }
   ]
 }

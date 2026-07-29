@@ -5,7 +5,7 @@ argument-hint: <goal>
 
 # Long, crash-surviving browser task
 
-Load the guide (`silver skill --full`, or read `skill-data/core/reference/tasks.md`), then run
+Load the guide (`silver skill --full`, or read `silver/skill-data/core/reference/tasks.md`), then run
 the durable run-folder flow for: **$ARGUMENTS**
 
 `silver task start "<goal>" --id <id>` → fill `plan.md` Critical Points → drive THROUGH the task

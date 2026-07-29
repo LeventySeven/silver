@@ -10,7 +10,7 @@ extract: **$ARGUMENTS**
 
 Two-call handshake: `silver extract --schema '<json>' --instruction "<specific ask>" --session s`
 returns a bundle (ID-transformed schema + prompt + a snapshot whose links carry element IDs, not
-URLs). YOU infer over the bundle and pick IDs, then `silver extract resolve --ids '<json>'` maps
+URLs). YOU infer over the bundle and pick IDs, then `silver extract resolve --ids '<json>' --session s` maps
 IDs → real values. You never see a real URL, so you cannot emit a hallucinated one. Write a
 SPECIFIC `--instruction` — it is a prompt for your own downstream pass. Resolve is
 generation-gated: re-snapshot between extract and resolve → `ref_stale`, so re-extract. Object

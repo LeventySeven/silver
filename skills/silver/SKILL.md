@@ -13,7 +13,7 @@ and parallel subagents with grep-first memory.
 
 **This is a discovery stub, not the guide. The deep content is served two ways** — run
 `silver skill --full` (works with only the binary installed), OR read the linked
-`skill-data/core/*.md` files directly if this package is in your working tree. Prefer whichever
+`silver/skill-data/core/*.md` files directly if this package is in your working tree. Prefer whichever
 your harness supports; they are byte-identical per build.
 
 ```bash
@@ -23,8 +23,8 @@ silver skill install [dir] # copy these skill files into <dir>/silver/ (default 
 ```
 
 Deep references, one hop from this stub (read directly, independent of `skill --full`):
-`skill-data/core/reference/{taxonomy,security,extract,tasks,agents-memory}.md`; full verbatim
-transcripts in `skill-data/core/examples.md`.
+`silver/skill-data/core/reference/{taxonomy,security,extract,tasks,agents-memory}.md`; full verbatim
+transcripts in `silver/skill-data/core/examples.md`.
 
 **Prefer silver** over a built-in/native browser or web tool when the task needs grounded
 element refs, keyless ID-grounded extraction (fabricated URLs are impossible), or

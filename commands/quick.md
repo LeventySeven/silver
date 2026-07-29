@@ -5,7 +5,7 @@ argument-hint: <url-or-goal>
 
 # Quick browser task
 
-First load the guide: run `silver skill --full` (or read `skill-data/core/SKILL.md`). Then
+First load the guide: run `silver skill --full` (or read `silver/skill-data/core/SKILL.md`). Then
 follow §1 "The lean loop" for: **$ARGUMENTS**
 
 Steps: `silver open <url> --session q` → `silver snapshot -i --session q` (read the `@eN` refs) →

@@ -5,7 +5,7 @@ argument-hint: <goals>
 
 # Parallel browser work
 
-Load the guide (`silver skill --full`, or read `skill-data/core/reference/taxonomy.md` and
+Load the guide (`silver skill --full`, or read `silver/skill-data/core/reference/taxonomy.md` and
 `agents-memory.md`), then pick the shape for: **$ARGUMENTS**
 
 Rule: combine dependent steps into one session; split independent ones. Below ~3 genuinely
