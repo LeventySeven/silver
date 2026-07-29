@@ -5,7 +5,7 @@ argument-hint: <what-to-extract>
 
 # Structured, hallucination-proof extraction
 
-Load the guide (`silver skill --full`, or read `skill-data/core/reference/extract.md`), then
+Load the guide (`silver skill --full`, or read `silver/skill-data/core/reference/extract.md`), then
 extract: **$ARGUMENTS**
 
 Two-call handshake: `silver extract --schema '<json>' --instruction "<specific ask>" --session s`

@@ -72,6 +72,23 @@ npx agent-silver skill install
 npx playwright install chromium
 ```
 
+### As a Claude Code plugin
+
+The repo doubles as a Claude Code plugin — the skill plus four commands, versioned and
+uninstallable, served from this repo itself:
+
+```
+/plugin marketplace add LeventySeven/silver
+/plugin install silver@silver
+```
+
+Claude Code namespaces plugin components by plugin name, so the commands land as
+`/silver:quick`, `/silver:extract`, `/silver:parallel` and `/silver:task` — not bare `/quick`.
+
+The plugin ships the prompt layer only; it still needs the `silver` CLI on PATH
+(`npm i -g agent-silver`). The plugin surface at `skills/` and `commands/` is a copy of the
+canonical assets under `silver/`, kept honest by `scripts/sync-plugin.sh --check`.
+
 From source:
 
 ```bash
@@ -83,7 +100,7 @@ npm link
 
 ## Status
 
-589 tests, an eval suite that passes, and a lethal-trifecta security check that passes, all on every
+719 tests, an eval suite that passes, and a lethal-trifecta security check that passes, all on every
 commit. Keyless. No MCP.
 
 ## License

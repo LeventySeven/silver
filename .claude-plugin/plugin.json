@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "silver",
+  "displayName": "silver",
+  "version": "0.1.0",
+  "description": "A keyless local headless browser for AI agents (Playwright; never calls a model or an API). Drives live pages through accessibility-tree snapshots with stable @eN refs: open, click, fill, log in, extract a table to JSON with real links, monitor for change, QA-drive an app, or run a durable multi-step job that survives a crashed agent. The host is the brain; silver is grounded eyes and hands. Needs the `silver` CLI on PATH: npm i -g agent-silver.",
+  "author": { "name": "LeventySeven", "url": "https://github.com/LeventySeven" },
+  "homepage": "https://github.com/LeventySeven/silver",
+  "repository": "https://github.com/LeventySeven/silver",
+  "license": "MIT",
+  "keywords": ["browser", "playwright", "scraping", "extraction", "automation", "keyless", "qa"]
+}
