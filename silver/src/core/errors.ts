@@ -62,6 +62,19 @@ export const ERRORS = {
     message:
       'navigation could not reach the target (DNS did not resolve or the connection was refused/reset) — this is NOT a policy block; verify the URL/network and retry with backoff',
   },
+  // The transport worked and the server ANSWERED — with an HTTP error status
+  // (>= 400). DISTINCT from `navigation_failed` (the host was never reached, so a
+  // backoff retry can succeed) and from `navigation_blocked` (silver's own policy
+  // refused). Also DISTINCT from `page_crash`, whose `reload` advice is destructive
+  // and useless here: re-requesting a 404 returns the same 404. Not retryable —
+  // the URL/route/branch is wrong and only a different URL can fix it.
+  // The numeric status is NEVER interpolated into this message (no-leak invariant,
+  // see envelope.ts); it rides on `data.status` instead.
+  http_error: {
+    retryableByHost: false,
+    message:
+      'the server answered with an HTTP error status (>= 400) — the host is reachable but the route is not; check the path/branch/deployment. Do NOT treat this as transient and do NOT `reload`: the same request returns the same status',
+  },
   // R5a: after `open`/`goto` the DOM is (near-)empty — a blank shell, an anti-bot
   // interstitial, or a 429/403 body with no content. Advisory: the host should
   // reload/wait or change approach rather than act on a page that has not rendered.

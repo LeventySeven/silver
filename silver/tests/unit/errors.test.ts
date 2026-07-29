@@ -17,6 +17,7 @@ const REQUIRED_CODES = [
   'repetition_detected',
   'navigation_failed',
   'retries_exhausted',
+  'http_error',
 ] as const
 
 describe('error taxonomy', () => {
@@ -57,6 +58,26 @@ describe('envelope: fail() sanitization (no-leak invariant)', () => {
       expect(m).not.toContain('/home')
       expect(m.toLowerCase()).not.toContain('password=')
     }
+  })
+
+  // Issue #1: `read <url>` on a 404 used to report `page_crash`, whose remedy
+  // ("run `reload` then re-snapshot") is destructive and useless — re-requesting a
+  // 404 returns the same 404. `http_error` must never drift back into that advice.
+  it('http_error is distinct from page_crash and never advises a reload', () => {
+    expect(ERRORS.http_error.message).not.toBe(ERRORS.page_crash.message)
+    expect(ERRORS.http_error.message).not.toContain('crashed')
+    expect(ERRORS.http_error.message).not.toMatch(/run `reload`/)
+    // Not retryable: only a different URL fixes it, so a backoff loop is waste.
+    expect(ERRORS.http_error.retryableByHost).toBe(false)
+    expect(ERRORS.page_crash.retryableByHost).toBe(true)
+  })
+
+  // Also distinct from the two navigation outcomes it sits between: nobody
+  // answered (`navigation_failed`, retry with backoff) vs silver's own policy
+  // refused (`navigation_blocked`).
+  it('http_error is distinct from navigation_failed and navigation_blocked', () => {
+    expect(ERRORS.http_error.message).not.toBe(ERRORS.navigation_failed.message)
+    expect(ERRORS.http_error.message).not.toBe(ERRORS.navigation_blocked.message)
   })
 })
 

@@ -70,7 +70,11 @@ Full worked transcripts: `examples.md`.
 open <url>  →  snapshot -i  →  (--enable-actions) act on @eN  →  snapshot  →  …  →  extract
 ```
 
-1. **`silver open <url>`** — navigate (egress-guarded). Response: `{url, title, page_changed}`.
+1. **`silver open <url>`** — navigate (egress-guarded). Response:
+   `{url, title, page_changed, status}`. `status` is the HTTP status silver itself observed for
+   the document; it is `null` when there was nothing to observe (a same-document/hash
+   navigation) — **`null` means *not observed*, never *OK*.** A status `>= 400` also sets
+   `http_error: true` and warns: the page loaded, but the route did not exist.
 2. **`silver snapshot -i`** — the accessibility tree, interactive elements only. Each
    actionable node gets a ref `[ref=e1]`, `[ref=e2]`, …. (The refmap generation is tracked
    internally and echoed on **action-result** envelopes, not in the snapshot header.) The
@@ -111,8 +115,8 @@ or stop; don't retry.
 
 | Command | What it does |
 |---|---|
-| `open <url>` / `goto` / `navigate` | Navigate (aliases). Bumps generation, resets refs. |
-| `back` / `forward` / `reload` | History move / reload. Bumps generation. |
+| `open <url>` / `goto` / `navigate` | Navigate (aliases). Bumps generation, resets refs. Returns the document's HTTP `status` (`null` = not observed, e.g. a hash-only nav) + `http_error:true` on `>= 400`. |
+| `back` / `forward` / `reload` | History move / reload. Bumps generation. `reload` also returns `status` / `http_error`; back/forward do not (a bfcache restore observes none). |
 | `snapshot` | Full accessibility tree. |
 | `snapshot -i` | Interactive elements only — **start here** (cheapest). |
 | `snapshot -c` | Compact: only ref/value lines + their ancestor chain. |
@@ -376,13 +380,20 @@ independent reads.** Touching one shared account is not "independent."
   use the decoupled gate: `--two-phase-confirm` returns a `confirmation_id` (pending, **not run**)
   → inspect → `confirm <id>`/`deny <id>`. `--action-policy <file.json>` adds a hard **deny**
   (precedence deny > confirm > allow > default) no confirmation can lift. Full: `reference/security.md`.
+- **Never hand a human a URL silver has not itself loaded and status-checked.** `open` reports the
+  document's HTTP `status`; a link is "proven" only when silver observed a non-error status on
+  *that exact route* — not because a nav returned `success:true`. If it 404s, if `status` is
+  `null` (not observed), or if `auth_required`/`page_empty` fired, report the failure mode
+  instead of a link. See the `/preview` command doc.
 - **Detectors are advisory, not blockers** (a read path never blocks): `captcha_detected` /
   `auth_required` (now emitted — stop and hand off), `page_empty` (blank/interstitial shell),
   `sparse_tree` (canvas-dominant page, few refs — the a11y tree is blind; use `screenshot` +
   `get box`/`click --at`, see §4), `repetition_detected` (you're looping — re-plan).
   `navigation_failed` (site-side `net::ERR_*`, may retry) is distinct from policy
-  `navigation_blocked` (never retry). `retries_exhausted` means silver already spent its bounded
-  internal retries — **do not loop again.**
+  `navigation_blocked` (never retry) and from `http_error` (the server *answered* `>= 400` —
+  never retry unchanged, and never `reload`: the same request returns the same status).
+  `retries_exhausted` means silver already spent its bounded internal retries — **do not loop
+  again.**
 - **Secrets go on `--stdin`, never argv.** The `fill` echo is NOT redacted (snapshots/`get value`
   are) — treat it as sensitive.
 - **Navigation is egress-guarded; file paths are contained; output never silently truncates**
