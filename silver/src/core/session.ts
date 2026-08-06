@@ -457,6 +457,12 @@ export type Connection = {
   browser: Browser
   context: BrowserContext
   page: Page
+  /**
+   * The sidecar `connect()` read to reach this browser. Carried so a caller can
+   * decide how to LEAVE the session (see `parkPages`) without paying a second
+   * sidecar read on the hot path of every command.
+   */
+  info: SessionInfo
 }
 
 const SIDECAR = 'session.json'
@@ -773,6 +779,12 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
   // one idle-TTL's worth of sessions, instead of growing without bound until the
   // machine runs out of RAM. Excludes the session being opened, never throws.
   await reapIdleSessions(resolveIdleTtlMs(opts.idleTimeoutMs), name).catch(() => {})
+  // Then the hard bound. The idle sweep above only returns browsers nobody has
+  // touched for a TTL; this one bounds the count of browsers running RIGHT NOW,
+  // which is the number the machine actually feels. Stopped sessions are noted
+  // for the `open` envelope rather than dropped silently.
+  const stopped = await enforceBrowserCeiling(name).catch(() => [] as string[])
+  if (stopped.length > 0) evictionNotice = stopped
   const dir = sessionDir(name)
   // E2 real-Chrome-profile: `profile` (an EXISTING user-data-dir) wins over an
   // explicit userDataDir override, which wins over the throwaway per-session dir.
@@ -1489,6 +1501,110 @@ export async function reapIdleSessions(
   return { reaped, keptAlive }
 }
 
+// ---------------------------------------------------------------------------
+// Browser ceiling — the hard bound on how much of the machine silver may hold.
+//
+// The idle reaper bounds how LONG an abandoned browser lives (one TTL). Nothing
+// bounded how MANY run at once, and a session is a whole Chromium: measured on
+// this machine, one session parked on an animating page costs ~10 OS processes
+// and ~1.17 GB RSS. Three of them is 3.5 GB; a day's fleet is the machine. The
+// same three pages as three TABS of ONE session: 12 processes, 1.39 GB — which
+// is why the parallel guidance now leads with tabs, and why this ceiling exists
+// for the case where an agent opens sessions anyway.
+// ---------------------------------------------------------------------------
+
+/**
+ * Default number of silver-owned browsers allowed to run at once, machine-wide.
+ *
+ * Three, because that is the point where the shape stops being free on a laptop:
+ * ~3.5 GB of the 18 GB this was measured on, and the fourth is the one that
+ * starts swapping under an editor and a dev server. It is a CEILING, not a
+ * quota — a fleet still gets its parallelism, it just gets it as tabs (which
+ * cost ~100 MB each) instead of as browsers.
+ */
+export const DEFAULT_MAX_BROWSERS = 3
+
+/** Resolve the ceiling: `SILVER_MAX_BROWSERS` → default. `0` disables it. */
+export function resolveMaxBrowsers(): number {
+  const raw = process.env.SILVER_MAX_BROWSERS
+  if (raw !== undefined) {
+    const n = Number(raw)
+    if (Number.isFinite(n) && n >= 0) return Math.floor(n)
+  }
+  return DEFAULT_MAX_BROWSERS
+}
+
+/**
+ * The sessions the last `enforceBrowserCeiling` stopped, waiting to be reported.
+ *
+ * A cap that silently drops work is worse than no cap — the whole complaint
+ * this feature answers is "silver eats my machine and I cannot see why". The
+ * notice is read once by the `open` handler and cleared, so it lands on the
+ * envelope of the command that caused the eviction and never on a later one.
+ */
+let evictionNotice: string[] = []
+
+/** Take (and clear) the sessions the ceiling stopped for the current command. */
+export function takeEvictionNotice(): string[] {
+  const out = evictionNotice
+  evictionNotice = []
+  return out
+}
+
+/**
+ * Stop the least-recently-used silver browsers until spawning one more stays
+ * within `resolveMaxBrowsers()`, machine-wide across every namespace.
+ *
+ * "Stop", not "reap": the browser is SIGTERMed but its session dir — profile,
+ * cookies, sidecars — is left exactly where it is. That is the whole reason a
+ * ceiling is safe to enforce automatically. `ensureConnected` already treats a
+ * dead pid as "respawn me", so an evicted session's next command brings the
+ * browser back with its logged-in profile intact; the only thing lost is the
+ * page's in-memory state, the same thing lost to a machine going to sleep.
+ * (`reapIdleSessions` deletes the dir — correct for a session nobody has
+ * touched in an hour, far too destructive for one being pushed out by load.)
+ *
+ * NEVER stops: an external (`connect`ed) browser we do not own, a session whose
+ * lockfile shows a LIVE holder (a command is mid-flight — see `isSessionBusy`),
+ * or `exclude` (the caller's own session, mid-open). If everything over the cap
+ * is busy, nothing is stopped and the spawn proceeds: a real command in flight
+ * outranks a memory target. Returns the stopped sessions, namespace-qualified.
+ */
+export async function enforceBrowserCeiling(exclude?: string): Promise<string[]> {
+  const cap = resolveMaxBrowsers()
+  if (cap <= 0) return []
+  const activeNs = currentNamespace()
+  const live: Array<{ key: string; dir: string; pid: number; idle: number }> = []
+  for (const s of await discoverAllSessions()) {
+    if (exclude !== undefined && s.name === exclude && s.ns === activeNs) continue
+    let info: SessionInfo
+    try {
+      info = await readSidecarObject<SessionInfo>(path.join(s.dir, 'session.json'))
+    } catch {
+      continue // no/corrupt sidecar — `session gc`'s problem, not the ceiling's
+    }
+    if (info.external || !isPidAlive(info.pid)) continue
+    live.push({ key: s.key, dir: s.dir, pid: info.pid, idle: idleMsOf(info) })
+  }
+  // The caller is about to spawn one more, so the budget for everyone else is
+  // cap - 1. A cap of 1 therefore means "one browser at a time", not zero.
+  const over = live.length - (cap - 1)
+  if (over <= 0) return []
+  live.sort((a, b) => b.idle - a.idle) // most-idle first: LRU eviction
+  const stopped: string[] = []
+  for (const cand of live) {
+    if (stopped.length >= over) break
+    if (await isSessionBusy(cand.dir)) continue
+    try {
+      process.kill(cand.pid, 'SIGTERM')
+    } catch {
+      continue // already gone between the liveness check and here
+    }
+    stopped.push(cand.key)
+  }
+  return stopped
+}
+
 /**
  * How often the opportunistic safety-net sweep may actually run, machine-wide.
  * The sweep itself is a readdir over `~/.silver` plus a stat per session, so it
@@ -1675,7 +1791,98 @@ export async function connect(name: string): Promise<Connection> {
   // per-command reconnect model means it must be re-enabled each time). Never
   // blocks the connect itself — a failure to arm is swallowed.
   await enableFetchEgressGuard(context, fetchEgressPolicy).catch(() => {})
-  return { browser, context, page }
+  return { browser, context, page, info }
+}
+
+/**
+ * Freeze every page in a browser silver OWNS, right before dropping the CDP
+ * transport at the end of a command.
+ *
+ * Silver is command-scoped: `connect` → act → disconnect, and between commands
+ * NOBODY is looking at the page. A headless Chromium disagrees — it has no
+ * occluded windows, so every page it holds is "visible" and keeps its
+ * `requestAnimationFrame` loop, its timers and its compositor running at full
+ * rate for as long as the daemon lives. Measured on one canvas-animating page
+ * per browser, three browsers, nothing driving them: 48.6% of a CPU sustained,
+ * which is what an agent's parked sessions were quietly costing the machine.
+ * The same three, parked: 3.9%.
+ *
+ * `Page.setWebLifecycleState('frozen')` is Chromium's own Page Lifecycle
+ * transition (the one it applies to a backgrounded tab): task queues stop,
+ * state is kept. Attaching over CDP resumes the page — Playwright's connect
+ * re-focuses it — so a later command finds it running again with no
+ * bookkeeping of ours to get wrong. Parking is therefore invisible except in
+ * the CPU graph, and a page that never gets another command simply stays
+ * asleep instead of burning a core until the idle reaper arrives.
+ *
+ * NEVER parks a browser we do not own: an `external` (`connect`ed) session is
+ * the user's OWN browser, with their tabs in it, and a `headed` session is one
+ * a human asked to watch — freezing either would stop something in front of
+ * someone's eyes. Best-effort throughout; a page that cannot be frozen is left
+ * running rather than failing the command that just succeeded.
+ */
+export async function parkPages(conn: Connection): Promise<void> {
+  if (!parkingEnabled()) return
+  if (conn.info.external === true || conn.info.headed === true) return
+  const pages = conn.context.pages()
+  await Promise.all(
+    pages.map(async (page) => {
+      let cdp: import('playwright').CDPSession
+      try {
+        cdp = await conn.context.newCDPSession(page)
+      } catch {
+        return // page/target already gone
+      }
+      try {
+        await cdp.send('Page.setWebLifecycleState', { state: 'frozen' })
+      } catch {
+        /* a page that refuses to freeze (mid-navigation, crashed) keeps running */
+      }
+      await cdp.detach().catch(() => {})
+    }),
+  )
+}
+
+/**
+ * Is page parking on? `SILVER_NO_PARK=1` turns it off.
+ *
+ * The escape hatch exists for the one case parking genuinely changes: a page
+ * that must keep working while silver is NOT attached — a long poll the agent
+ * intends to leave running between commands, a socket the server drops if it
+ * goes quiet. Everything else only notices the CPU it stopped spending.
+ */
+function parkingEnabled(): boolean {
+  const raw = process.env.SILVER_NO_PARK?.trim()
+  return !(raw === '1' || raw === 'true')
+}
+
+/**
+ * Wake a parked page for the duration of a command — the inverse of `parkPages`.
+ *
+ * Attaching over CDP already resumes a frozen page in practice, but that is
+ * Playwright's side effect rather than a contract, and a verb that silently
+ * hangs because a future version stopped doing it is the worst failure this
+ * change could have. So the wake-up is stated. One CDP round-trip on the ONE
+ * page the command is about to drive, never the whole tab strip.
+ *
+ * The wake lasts as long as the transport does, which is exactly one command:
+ * measured, a page frozen once runs normally while silver is attached (30
+ * frames painted inside a 500ms in-command wait) and settles back to frozen
+ * when the transport drops. Chromium's asymmetry, and a convenient one — a
+ * parked session needs no re-parking bookkeeping, only a wake on the way in.
+ * The flip side is that `SILVER_NO_PARK=1` cannot revive a session that was
+ * already parked; it has to be set for the run that OPENS the session (or the
+ * session closed and reopened, which spawns a browser that never froze).
+ */
+export async function unparkPage(context: BrowserContext, page: Page): Promise<void> {
+  let cdp: import('playwright').CDPSession
+  try {
+    cdp = await context.newCDPSession(page)
+  } catch {
+    return
+  }
+  await cdp.send('Page.setWebLifecycleState', { state: 'active' }).catch(() => {})
+  await cdp.detach().catch(() => {})
 }
 
 /**

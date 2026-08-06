@@ -63,6 +63,9 @@ import {
   readRestoreSnapshot,
   writeRestoreSnapshot,
   captureRestoreSnapshot,
+  parkPages,
+  unparkPage,
+  takeEvictionNotice,
   type Connection,
   type OpenOptions,
   type SessionInfo,
@@ -679,6 +682,10 @@ async function withConnection<T>(
     const conn = await ensureConnected(flags.session, openOpts(flags))
     // Every verb operates on the ACTIVE tab, not blindly on pages()[0].
     const page = await resolveActivePage(conn.context, flags.session)
+    // Wake the tab we are about to drive — the last command parked it (see
+    // parkPages). Cheap, and it keeps the resume explicit rather than resting on
+    // the CDP attach happening to do it for us.
+    await unparkPage(conn.context, page).catch(() => {})
     // F8: re-apply persisted emulation overrides (viewport/offline/color-scheme/
     // extra-headers/basic-auth). The per-command reconnect otherwise drops them,
     // so a `set viewport`/`set headers`/`set credentials` made in an earlier
@@ -725,6 +732,11 @@ async function withConnection<T>(
       setBasicAuthResolver(null)
       // Flush any in-flight auto-download saves before dropping the transport.
       if (drainDownloads) await drainDownloads().catch(() => {})
+      // Park the pages before letting go of them. Nobody watches a silver page
+      // between commands, but a headless Chromium keeps rendering it anyway —
+      // see parkPages, which is where the measured cost is written down. Must
+      // run BEFORE close(): the CDP transport is how we say it.
+      await parkPages(conn).catch(() => {})
       await conn.browser.close().catch(() => {})
     }
   })
@@ -1126,6 +1138,11 @@ async function handleOpen(flags: ParsedFlags): Promise<Envelope<unknown>> {
     // interstitial / a bundle that never rendered — surface `page_empty` so the
     // host reloads or changes approach rather than acting on a blank page.
     const empty = await detectEmptyPage(page)
+    // Sessions the browser ceiling stopped to make room for this one. Reported
+    // on the envelope of the command that caused it — a cap nobody can see is
+    // indistinguishable from a bug. Their profiles are intact; the next command
+    // on one of them respawns its browser.
+    const evicted = takeEvictionNotice()
     return ok(
       {
         url: page.url(),
@@ -1138,6 +1155,7 @@ async function handleOpen(flags: ParsedFlags): Promise<Envelope<unknown>> {
         // Surfaced so the host knows navigation did NOT reuse whatever tab was
         // active — silver opened its own rather than overwrite someone else's.
         ...(openedTab ? { opened_tab: openedTab } : {}),
+        ...(evicted.length > 0 ? { evicted } : {}),
         ...(isHttpError(status) ? { http_error: true } : {}),
         ...(hz.captcha ? { captcha_detected: true } : {}),
         ...(hz.auth ? { auth_required: true } : {}),
@@ -3712,6 +3730,10 @@ async function handleDoctor(): Promise<Envelope<unknown>> {
   // actually connect to). No live session → skip (nothing to probe).
   checks.push(await doctorCdpReachable())
 
+  // 7. Is the code that is RUNNING the code in this checkout? Only meaningful
+  // for a linked clone; an installed package has no `src/` and skips.
+  checks.push(await doctorBuildFreshness())
+
   const passed = checks.filter((c) => c.status === 'pass').length
   const total = checks.length
   const firstFail = checks.find((c) => c.status === 'fail')
@@ -3730,6 +3752,72 @@ async function handleDoctor(): Promise<Envelope<unknown>> {
     return { success: false, data: payload, error: next }
   }
   return ok(payload)
+}
+
+/** Newest mtime under `dir` for files matching `ext`, or 0 if there are none. */
+async function newestMtime(dir: string, ext: string): Promise<number> {
+  let newest = 0
+  const walk = async (d: string): Promise<void> => {
+    let entries
+    try {
+      entries = await fs.readdir(d, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const e of entries) {
+      const p = path.join(d, e.name)
+      if (e.isDirectory()) {
+        if (e.name === 'node_modules' || e.name.startsWith('.')) continue
+        await walk(p)
+      } else if (e.name.endsWith(ext)) {
+        const st = await fs.stat(p).catch(() => null)
+        if (st && st.mtimeMs > newest) newest = st.mtimeMs
+      }
+    }
+  }
+  await walk(dir)
+  return newest
+}
+
+/**
+ * Is the `dist/` this process is running the `src/` sitting next to it?
+ *
+ * Silver is commonly run from a linked clone (`npm link`, or a global install
+ * symlinked at the package dir), and `dist/` is gitignored — so it is built
+ * once at link time and NEVER again by a `git pull` or a branch switch. The
+ * failure that produces is completely silent and arbitrarily large: on the
+ * machine this check was written for, the shipped CLI predated the idle reaper,
+ * the global sweep and the per-browser kill switch by three days, so every
+ * browser it spawned lived until the next reboot — 30 abandoned session dirs
+ * and 1.1 GB of profiles, with the source in the same checkout containing all
+ * three fixes. Nothing in the tool said a word.
+ *
+ * `warn`, not `fail`: a contributor mid-edit legitimately has a newer `src/`,
+ * and `silver doctor && npm start` should not break for them. Skipped entirely
+ * when there is no `src/` — an installed package has nothing to rebuild.
+ */
+async function doctorBuildFreshness(): Promise<DoctorCheck> {
+  const srcDir = path.join(PACKAGE_ROOT, 'src')
+  const distDir = path.join(PACKAGE_ROOT, 'dist')
+  if (!existsSync(srcDir) || !existsSync(distDir)) {
+    return {
+      name: 'build_fresh',
+      status: 'skip',
+      message: 'running an installed package — there is no source tree to be out of date with',
+    }
+  }
+  const [src, dist] = await Promise.all([newestMtime(srcDir, '.ts'), newestMtime(distDir, '.js')])
+  if (src === 0 || dist === 0 || src <= dist) {
+    return { name: 'build_fresh', status: 'pass', message: 'the built CLI matches this checkout' }
+  }
+  const days = Math.floor((src - dist) / 86_400_000)
+  const age = days >= 1 ? `${days} day${days === 1 ? '' : 's'}` : 'less than a day'
+  return {
+    name: 'build_fresh',
+    status: 'warn',
+    message: `the built CLI is older than this checkout's source by ${age} — you are running code you have already changed`,
+    fix: 'npm run build',
+  }
 }
 
 /** K4 check: scan session `.lock` files for a dead-holder (stale) lock. */
