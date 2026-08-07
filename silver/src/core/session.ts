@@ -474,7 +474,46 @@ const READY_BUDGET_MS = 8_000
  * and concurrent eval runs reproducible instead of inheriting a version-dependent
  * headless default. Applied both as a launch arg and (best-effort) per connect.
  */
-const VIEWPORT = { width: 1280, height: 900 } as const
+export const VIEWPORT = { width: 1280, height: 900 } as const
+
+/**
+ * May we override this session's CONTENT size to `VIEWPORT`?
+ *
+ * The launch arg `--window-size=1280,900` sizes the WINDOW; `setViewportSize`
+ * sizes the CONTENT box. Headless those two are legitimately identical — there is
+ * no tab strip and no omnibox to subtract — so forcing 1280×900 content into a
+ * 1280×900 window states something true, and we keep it for the determinism it
+ * buys (reproducible screenshots, stable scroll math across Chromium versions).
+ *
+ * HEADED, forcing it states something impossible. A real Chrome window spends
+ * ~80-140px on browser chrome, so `outerHeight` is always strictly greater than
+ * `innerHeight`; overriding the content box to the window's own height reports
+ * `outerHeight === innerHeight`, i.e. a window with no chrome at all. That
+ * combination is one of the cheapest automation signals there is — FingerprintJS
+ * reads it as a VM. Measured on macOS it came out worse than that: the WM clamped
+ * the window to 859px tall to fit the menu bar while the forced viewport stayed
+ * 900, so the page reported a 900px content box inside an 859px window — a
+ * viewport larger than the window containing it, which no browser can produce.
+ * Gated, the same session reads outer 859 / inner 716 — 143px of real chrome.
+ *
+ * Silver's stance is authenticity, not deception: rather than
+ * spoof the numbers we simply stop emitting a false one and let the real window
+ * answer. The cost is real and accepted: a headed session's viewport is whatever
+ * the window manager gave it, so headed screenshots are not pixel-comparable to
+ * headless ones. Determinism is worth less than not being obviously fake, and a
+ * host that needs an exact size can still ask for one with `set viewport w h`.
+ *
+ * EXTERNAL is not about tells at all. A `connect`ed browser is the USER'S, with
+ * their tabs in it; resizing it is reaching into a window a person is looking at,
+ * on every command. Same reasoning as `parkPages`, which refuses these two cases
+ * for the same reason: we do not own that browser.
+ *
+ * Takes the sidecar fields rather than a whole `SessionInfo` so both call sites
+ * (here and `tab new` in handlers.ts) can pass what they already hold.
+ */
+export function shouldEmulateViewport(info: Pick<SessionInfo, 'headed' | 'external'>): boolean {
+  return info.headed !== true && info.external !== true
+}
 
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
@@ -1833,8 +1872,15 @@ export async function connect(name: string): Promise<Connection> {
   // calls `open` again, so the last browsers were never reclaimed. Every command
   // sweeps now, throttled so the cost is amortized to ~nothing.
   await maybeSweepIdleSessions(name)
-  // Deterministic viewport (P0-8); best-effort over a CDP-connected page.
-  await page.setViewportSize({ width: VIEWPORT.width, height: VIEWPORT.height }).catch(() => {})
+  // Deterministic viewport (P0-8); best-effort over a CDP-connected page — but
+  // only where claiming it is TRUE. See `shouldEmulateViewport`: unconditionally
+  // this made a headed browser report a window with no chrome (an automation
+  // tell), and resized the user's own window on every command in a `connect`ed
+  // one. A persisted `set viewport` still applies afterwards via applyEmulation,
+  // so a host that explicitly wants a fixed size in a headed session still gets it.
+  if (shouldEmulateViewport(info)) {
+    await page.setViewportSize({ width: VIEWPORT.width, height: VIEWPORT.height }).catch(() => {})
+  }
   // S2: re-arm the CDP Fetch-layer subresource egress guard on EVERY connect (the
   // per-command reconnect model means it must be re-enabled each time). Never
   // blocks the connect itself — a failure to arm is swallowed.

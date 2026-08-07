@@ -66,6 +66,8 @@ import {
   parkPages,
   unparkPage,
   takeEvictionNotice,
+  shouldEmulateViewport,
+  VIEWPORT,
   type Connection,
   type OpenOptions,
   type SessionInfo,
@@ -1461,7 +1463,7 @@ async function handleTabNew(flags: ParsedFlags): Promise<Envelope<unknown>> {
     if (!nav.ok) return navBlocked(url)
   }
 
-  return withConnection(flags, async ({ context }) => {
+  return withConnection(flags, async ({ context, info }) => {
     const reg = (await loadTabRegistry(flags.session)) ?? emptyRegistry()
     const synced = await syncRegistry(context, reg)
     if (label !== undefined && synced.reg.tabs.some((t) => t.label === label)) {
@@ -1469,8 +1471,13 @@ async function handleTabNew(flags: ParsedFlags): Promise<Envelope<unknown>> {
     }
 
     const page = await context.newPage()
-    // Deterministic viewport (P0-8) for the new tab too.
-    await page.setViewportSize({ width: 1280, height: 900 }).catch(() => {})
+    // Deterministic viewport (P0-8) for the new tab too — under the same coherence
+    // gate as `connect` (see shouldEmulateViewport). A new tab in a headed window
+    // inherits that window's real content size; overriding it here would restore
+    // the outer===inner tell on exactly the tabs this session actually drives.
+    if (shouldEmulateViewport(info)) {
+      await page.setViewportSize({ width: VIEWPORT.width, height: VIEWPORT.height }).catch(() => {})
+    }
     await ensureCapture(page, flags.session).catch(() => {})
     if (url !== undefined) await page.goto(url, gotoOpts(flags))
     await ensureCapture(page, flags.session).catch(() => {})
@@ -1599,7 +1606,12 @@ async function navigationTarget(
 
   // Otherwise the active tab is a stranger's. Take our own and leave theirs alone.
   const page = await context.newPage()
-  await page.setViewportSize({ width: 1280, height: 900 }).catch(() => {})
+  // NO viewport override here, deliberately. Everything below this point runs ONLY
+  // for an EXTERNAL session (the early return above proves it), so this tab lives
+  // in the USER'S browser window — a window they sized, that a person may be
+  // watching. Forcing 1280×900 content into it both resized what they were looking
+  // at and reported a chrome-less window (see shouldEmulateViewport). A gate here
+  // would be statically false, so the call is gone rather than guarded.
   // This page did not exist when withConnection instrumented the session, so it
   // carries none of the per-page overrides yet. Without this it would run with no
   // dialog handler, no persisted routes, no storage seed and no emulation.
