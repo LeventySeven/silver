@@ -147,6 +147,34 @@ export type OpenOptions = {
    * applied at launch. Unauthenticated proxies only. */
   proxy?: string
   /**
+   * Detection coherence: the browser's content locale, applied at LAUNCH as
+   * Chromium's own `--lang` + `--accept-lang` instead of over CDP.
+   *
+   * `set locale` / `set timezone` reach for `Emulation.setLocaleOverride` /
+   * `setTimezoneOverride`, which patch a renderer that is already running. That is
+   * the layer a detector probes: the override itself is observable, and anything
+   * read before it lands (the first request's `Accept-Language`, a value cached at
+   * startup) still carries the OLD identity, so the two disagree. A launch flag is
+   * read before the first frame exists, so there is no earlier value to contradict.
+   *
+   * Cost, and it is a real one: launch-time means FRESH SESSION ONLY — exactly the
+   * constraint `proxy` above accepts. A session that is already open cannot adopt
+   * this, which is precisely why the CDP verbs stay as the mid-session fallback
+   * rather than being replaced by it.
+   *
+   * Silver never DERIVES this from a proxy, an IP, or a geo database: a guess that
+   * disagrees with the exit node is a louder tell than saying nothing. Operator-
+   * supplied or absent.
+   */
+  locale?: string
+  /**
+   * IANA timezone (`Europe/Berlin`), applied at LAUNCH as the child's `TZ` env var.
+   * Same mechanism, same trade-off, same fresh-session-only constraint as `locale`
+   * above — ICU and libc read `TZ` at process start, so `Date` and `Intl` agree
+   * from the first evaluation instead of being corrected by a CDP call later.
+   */
+  timezone?: string
+  /**
    * CloakHQ alignment (opt-in binary swap): an operator-supplied path to a
    * DIFFERENT Chromium executable to spawn instead of Playwright's bundled one —
    * e.g. a source-level stealth build (cloakbrowser.dev) whose C++ fingerprint
@@ -932,11 +960,46 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
     // page-derived, so it is safe to pass verbatim; the egress guard still governs
     // which hosts navigation may reach (the proxy is transport, not a policy bypass).
     ...(opts.proxy ? [`--proxy-server=${opts.proxy}`] : []),
+    // Detection coherence: the locale is set HERE, below CDP. `set locale` uses
+    // Emulation.setLocaleOverride, which corrects a renderer that already booted
+    // with another language — the correction is observable, and whatever was read
+    // before it (the first request's Accept-Language) still carries the old value,
+    // so a detector comparing the header against navigator.language finds a seam.
+    // These are stock switches read at startup, so there is no earlier value to
+    // contradict. Like --proxy above, this binds a FRESH session only; the CDP verb
+    // remains for a session already running. Operator-supplied argv passed verbatim
+    // — spawn takes an ARRAY, so there is no shell to escape for and nothing here
+    // can split into a second argument. Empty string is treated as absent (same
+    // truthiness gate --proxy uses): `--lang=` is worse than no flag at all.
+    //
+    // BOTH switches, because they are not redundant and neither alone is enough.
+    // MEASURED on macOS against this spawn path: `--lang` alone moves NOTHING —
+    // navigator.language, navigator.languages and Accept-Language all stay en-US,
+    // because Chromium takes its app locale from the OS there and ignores the
+    // switch. `--accept-lang` is what actually lands: header `de-DE,de;q=0.9`,
+    // navigator.language `de-DE`. `--lang` is kept because it IS the switch that
+    // carries the app/ICU locale on Linux and Windows, where silver mostly runs
+    // headless — dropping it would fix macOS by breaking the common case.
+    //
+    // Known residual, and it is honest rather than incoherent: on macOS
+    // `Intl.DateTimeFormat().resolvedOptions().locale` still reports the OS's
+    // en-US. That is a configuration a real person has — a German speaker on an
+    // English-language Mac — not an impossible one, so it is left alone. Forcing it
+    // would mean an Emulation override, i.e. the exact runtime patch this avoids.
+    ...(opts.locale ? [`--lang=${opts.locale}`, `--accept-lang=${opts.locale}`] : []),
     'about:blank',
   ]
 
   const child = spawn(execPath, args, {
     detached: true,
+    // The other half of the launch-layer identity (see --lang above): ICU and libc
+    // read TZ at process start, so Date/Intl in every renderer are born in the
+    // right zone rather than being moved there by Emulation.setTimezoneOverride.
+    // `env` REPLACES the child's environment instead of extending it, so ours has
+    // to be spread back in — a browser launched without PATH/HOME fails in ways
+    // nobody would trace to a timezone. Only passed when a timezone was asked for,
+    // so the default stays plain inheritance rather than a snapshot of process.env.
+    ...(opts.timezone ? { env: { ...process.env, TZ: opts.timezone } } : {}),
     // fds 3/4 carry `--remote-debugging-pipe` when the lifeline is on. Chromium
     // requires BOTH to be real pipes: pointing fd 4 at /dev/null instead makes
     // the browser exit the moment this CLI does (measured on Chrome 149).

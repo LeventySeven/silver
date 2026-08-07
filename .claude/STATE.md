@@ -29,12 +29,19 @@ headless, perception no longer reads via main-world primitives, and PR #3 is lan
   `tr -d '\000' | cmp`, NOT `grep $'\x00'` — bash cannot hold NUL in an argument, so that
   pattern is empty and matches every file).
 
+- **Batch 3 (B3 doc glob + B4 launch-layer locale/TZ) COMPLETE + rechecked APPROVED** —
+  evidence: `npm test` → "Test Files 72 passed (72) / Tests 777 passed (777)", build exit 0,
+  re-run independently by the reviewer; B3's matcher proven to bite against 16 install-line
+  spellings and NOT to fire on `agent-silver`; B4 proven *honored* on a live page
+  (tz=Europe/Berlin, navigator.language=de-DE, Accept-Language=de-DE,de;q=0.9), not merely
+  composed into argv. Two Minor findings recorded as a deferred task in the plan, not dropped.
+
 ## Next
-1. **B3+B4** (doc-contract glob + `--lang`/`TZ` at launch), then **B5 alone** (isolated-world
-   reads — riskiest, own rollback point, may land as reverted+documented).
-2. Recheck each batch before the next; full suite must stay at 769+ passing.
-3. Before finishing: one whole-subsystem pass for drift between batches (per-batch recheck is
-   structurally blind to it).
+1. **B5 alone** (isolated-world perception reads — riskiest, own rollback point; the plan
+   explicitly permits it to land as attempted+reverted+documented).
+2. Then one whole-subsystem pass for drift between batches (per-batch recheck is structurally
+   blind to it), then `compound-v:finishing`.
+3. Full suite must stay at 777+ passing.
 
 ## Open decisions
 - none (unattended; reversible defaults, no push/merge to origin without the run proving green).
