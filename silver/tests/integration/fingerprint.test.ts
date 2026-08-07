@@ -36,7 +36,8 @@ const SESSION = `silver-fp-${process.pid}-${Date.now()}`
 const HEADED = `${SESSION}-headed`
 const OTHER = `${SESSION}-other`
 const HOSTILE = `${SESSION}-hostile`
-const ALL = [SESSION, HEADED, OTHER, HOSTILE]
+const EMULATED = `${SESSION}-emulated`
+const ALL = [SESSION, HEADED, OTHER, HOSTILE, EMULATED]
 
 const NAMES = [
   'viewport_coherent',
@@ -190,6 +191,71 @@ describe('doctor --fingerprint: offline identity coherence', () => {
       // A host that reads only `next` still cannot mistake whose browser this is.
       expect(p.next).toContain('is not live')
       expect(p.next).toContain(p.session!)
+    })
+  })
+
+  /**
+   * The panel has to measure the state a REAL VERB runs in, not the state a bare
+   * `connect()` leaves behind.
+   *
+   * These two are not the same state, and the gap is precisely where the panel is
+   * pointed. `shouldEmulateViewport`'s own docstring routes a host that wants an
+   * exact size on a headed browser to `set viewport w h` — so the supported escape
+   * hatch is also the one way to persist a viewport the window cannot hold. Every
+   * real verb re-applies that override on connect (withConnection → instrumentPage
+   * → applyEmulation); the panel attached with a bare `connect()` and never did,
+   * so it measured 1280x900/1280x900 and reported `pass` about a session whose
+   * every actual command reported a 2000x1400 content box inside a 1280x900
+   * window. A health check that is blind to the one knob its sibling recommends is
+   * worse than no health check: it certifies the incoherence.
+   *
+   * Headless on purpose. The window is the launch arg's 1280x900 either way, so
+   * the impossible geometry is reproducible without a display server — and the
+   * check under test is `outer < inner`, which does not care how the window was
+   * made.
+   */
+  describe('a persisted `set viewport` is measured, not ignored', () => {
+    it('warns when the persisted viewport cannot fit the window it lives in', async () => {
+      expect((await run(['open', base, '--session', EMULATED])).env.success).toBe(true)
+      // Deliberately bigger than the 1280x900 launch window in BOTH axes:
+      // `set viewport` sizes the CONTENT box and cannot grow the window around it.
+      expect(
+        (await run(['set', 'viewport', '2000', '1400', '--session', EMULATED, '--enable-actions']))
+          .env.success,
+      ).toBe(true)
+
+      // Ground truth FIRST, through an ordinary verb on a later connection. Without
+      // this the panel assertion below could go green because the setup silently
+      // did nothing, which is the same false green in the other direction.
+      const geom = await run([
+        'eval',
+        '({outerW: window.outerWidth, outerH: window.outerHeight, innerW: window.innerWidth, innerH: window.innerHeight})',
+        '--session',
+        EMULATED,
+        '--enable-actions',
+      ])
+      expect(geom.env.success).toBe(true)
+      const real = JSON.parse(String(geom.env.data).replace(/⟦[^⟧]*⟧/g, '').trim())
+      expect(real.innerW).toBeGreaterThan(real.outerW)
+      expect(real.innerH).toBeGreaterThan(real.outerH)
+
+      const p = await panel(EMULATED)
+      // The panel must be describing the session we asked about, or the assertion
+      // below is about somebody else's browser.
+      expect(p.session).toBe(EMULATED)
+      const c = byName(p, 'viewport_coherent')
+      expect(c.status, `${c.message} | ${c.details}`).toBe('warn')
+      expect(c.details).toContain(`inner ${real.innerW}x${real.innerH}`)
+      assertClamped(c)
+    })
+
+    it('still never emits `fail` — the panel is advisory and `doctor` gates a build', async () => {
+      // `handleDoctor` exits non-zero on any `fail`, so a fail here would break
+      // `silver doctor && npm start` for every honest user. `warn` is the strongest
+      // status this panel is allowed to reach, incoherent viewport or not.
+      for (const c of (await panel(EMULATED)).checks) {
+        expect(['pass', 'warn', 'skip'], `${c.name} was ${c.status}`).toContain(c.status)
+      }
     })
   })
 

@@ -4321,6 +4321,32 @@ async function doctorFingerprint(flags: ParsedFlags): Promise<FingerprintPanel> 
     // contract (unparkPage says so itself), and a doctor probe that hangs forever
     // on a frozen page would be a poor way to find that out.
     await unparkPage(conn.context, page).catch(() => {})
+    // Re-apply the persisted emulation, exactly as instrumentPage does for every
+    // real verb — otherwise this panel measures a state NO verb ever runs in.
+    //
+    // The gap was not hypothetical and it pointed straight at this panel's own
+    // subject. `shouldEmulateViewport` refuses to force 1280x900 onto a headed
+    // window and, in the same docstring, routes a host that needs an exact size to
+    // `set viewport w h`. That override persists (emulation.json) and every verb
+    // re-applies it on connect, so a session set to 2000x1400 really does report a
+    // content box wider AND taller than the 1280x900 window holding it — the
+    // impossible geometry `viewport_coherent` exists to catch. Attaching with a
+    // bare `connect()` measured the pre-override state and reported `pass`, i.e.
+    // the check certified the one incoherence the supported escape hatch produces.
+    //
+    // Applying beats reporting-the-persisted-value-alongside: the panel's whole
+    // claim is that it OBSERVES a real browser rather than computing a verdict
+    // (`these checks observe a real browser, they are not computed`), and a
+    // second, inferred geometry would quietly break that. It costs one sidecar
+    // read plus the same CDP calls a verb pays, on a command that already launched
+    // a browser.
+    //
+    // `applyEmulation` whole, not just `emu.viewport`: any override a future batch
+    // persists is then measured for free, which is exactly the drift that produced
+    // this bug. Nothing here reaches `set locale`/`set timezone` — those are
+    // per-command CDP overrides that are never persisted, so `timezone_coherent`
+    // still has only `TZ` to compare against, as its own comment states.
+    await applyEmulation(page, conn.context, target, currentSecrets()).catch(() => {})
     m = sanitizeProbe(await page.evaluate(FINGERPRINT_EXPR))
   } catch {
     return skipAll('the live page could not be read (it may be mid-navigation or on a restricted origin)')
