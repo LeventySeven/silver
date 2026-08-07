@@ -12,12 +12,15 @@ Full detail is in the `Plan:`/`Recheck:` trailers on each batch commit — read 
 - Batch 1 — plan A (respawn notice, every-verb reporting, bounded eviction). APPROVED @ `89c979a`.
 - Batch 2 — B1 viewport gate + B2 `doctor --fingerprint`. APPROVED @ `a35b980`.
 - Batch 3 — B3 doc glob + B4 launch-layer locale/TZ. APPROVED @ `0f5fe33`.
-- Batch 4 — B5 isolated-world perception reads. APPROVED @ `95f0ff6`.
-- Baseline 748 → 783 tests, build exit 0, passK 100%, verified by me each time, not from a report.
+- Batch 4 — B5 isolated-world perception reads. APPROVED @ `165011e`.
+- Whole-subsystem seam pass — found 4 cross-batch defects no per-batch review could see; the
+  worst: the browser ceiling would SIGTERM a **headed** browser a human is watching, while
+  `parkPages` and `shouldEmulateViewport` both refuse headed for that exact reason. Fixed.
+- Baseline 748 → 787 tests, build exit 0, passK 100%, verified by me each time, not from a report.
 
 ## Next
-1. One whole-subsystem pass for drift between batches — per-batch recheck cannot see it.
-2. `compound-v:finishing`. Suite must stay at 783.
+1. `compound-v:finishing` — unattended, so take the reversible path: keep the branch, do NOT
+   push and do NOT merge PR #3 upstream (outward-facing, needs the user).
 
 ## Open decisions
 - none (unattended; nothing pushed to origin, no PR merged, all work on `run/detection-coherence`).

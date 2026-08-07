@@ -1710,9 +1710,9 @@ export async function enforceBrowserCeiling(exclude?: string): Promise<string[]>
     // window — so the ceiling, which SIGTERMs the process, must not be the single
     // mechanism that reaches into it. Worse than inconsistent: a watched window is
     // by construction the most IDLE session on the machine (nobody issues commands
-    // against a page they are reading), so LRU picked it FIRST and the user's
-    // visible browser vanished mid-look, with only the page's in-memory state lost
-    // — a `park` you cannot see through and a `close` nobody asked for.
+    // against a page they are reading), so LRU picked it FIRST — the window a
+    // human was looking at was the first one the cap took, and it took it with
+    // whatever was in the page (a half-filled form, a scroll position) still in it.
     //
     // The cost is real and accepted: a fleet that leaves headed sessions open can
     // hold the machine above the cap, because the ceiling has nothing left it may
@@ -1720,6 +1720,14 @@ export async function enforceBrowserCeiling(exclude?: string): Promise<string[]>
     // in flight outranks a memory target) — a headed window is a HUMAN in flight,
     // and the honest response to "everything is off-limits" is to leave the cap
     // unmet rather than to kill the one thing someone is looking at.
+    //
+    // It does NOT make a headed session immortal, which is the objection that
+    // would otherwise argue this line back out. `reapIdleSessions` still reclaims
+    // it after the idle TTL, deliberately without the same exclusion: the reaper
+    // fires on TIME (an hour with no command against this session is real evidence
+    // nobody is watching), while the ceiling fires because SOMEBODY ELSE wants
+    // memory right now — which is evidence about the fleet and none at all about
+    // whether a person is looking at this window.
     if (info.external || info.headed || !isPidAlive(info.pid)) continue
     live.push({ key: s.key, dir: s.dir, pid: info.pid, idle: idleMsOf(info) })
   }
