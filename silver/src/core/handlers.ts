@@ -4325,6 +4325,12 @@ async function doctorFingerprint(flags: ParsedFlags): Promise<FingerprintPanel> 
   }
 
   let m: FingerprintProbe
+  /**
+   * A persisted `set viewport` this run deliberately did NOT apply (fallback
+   * session — see the re-apply below). `null` when there is nothing persisted, or
+   * when it was applied and is therefore already in the measurement.
+   */
+  let unappliedViewport: { width: number; height: number } | null = null
   try {
     // Measure the ACTIVE tab, not `conn.page`. `connect()` hands back
     // `context.pages()[0]`, which after any `tab new` / `tab <ref>` is no longer
@@ -4372,7 +4378,29 @@ async function doctorFingerprint(flags: ParsedFlags): Promise<FingerprintPanel> 
     // this bug. Nothing here reaches `set locale`/`set timezone` — those are
     // per-command CDP overrides that are never persisted, so `timezone_coherent`
     // still has only `TZ` to compare against, as its own comment states.
-    await applyEmulation(page, conn.context, target, currentSecrets()).catch(() => {})
+    //
+    // ONLY on the session the operator NAMED, and that gate is load-bearing rather
+    // than tidiness. `page.setViewportSize` is not purely an Emulation override:
+    // Playwright 1.61's `_updateViewport` also sends `Browser.setWindowBounds`
+    // whenever the target has a UI window, and window bounds are a real
+    // window-manager change that does NOT revert when the transport drops (this is
+    // the same behaviour `connect()` records as "resized the user's own window on
+    // every command"). So on a headed or `connect`ed session this line physically
+    // resizes a window on somebody's screen, permanently.
+    //
+    // On the named session that cost is accepted and stated: a `set viewport` is
+    // an INSTRUCTION, `--session watch` names the target, and the very next
+    // `silver read --session watch` would resize it identically — measuring
+    // anything else would be measuring a fiction. But `pickFingerprintSession`
+    // FALLS BACK to any live session when the requested one is dead, and a
+    // diagnostic resizing a window the operator never mentioned is indefensible at
+    // any price. So the fallback path measures without applying, and reports what
+    // it did not apply rather than certifying the un-applied state as coherent.
+    if (picked.fellBack) {
+      unappliedViewport = (await loadEmulation(target).catch(() => null))?.viewport ?? null
+    } else {
+      await applyEmulation(page, conn.context, target, currentSecrets()).catch(() => {})
+    }
     m = sanitizeProbe(await page.evaluate(FINGERPRINT_EXPR))
   } catch {
     return skipAll('the live page could not be read (it may be mid-navigation or on a restricted origin)')
@@ -4446,8 +4474,20 @@ async function doctorFingerprint(flags: ParsedFlags): Promise<FingerprintPanel> 
       if (chrome === 'visible' && outerH <= innerH) {
         problems.push('a headed window reports no browser chrome (outerHeight <= innerHeight)')
       }
+      // A persisted override the fallback path declined to apply is a finding in
+      // its own right, and it must not be silently dropped: the geometry measured
+      // above is real, but it is NOT the geometry this session's own verbs run in,
+      // so reporting `pass` on it would certify a coherence nobody has checked —
+      // the exact failure the re-apply exists to remove, merely relocated. Only
+      // reported when it genuinely cannot fit; a persisted viewport SMALLER than
+      // its window is coherent and says nothing.
+      const unapplied =
+        unappliedViewport !== null &&
+        (unappliedViewport.width > outerW || unappliedViewport.height > outerH)
+          ? unappliedViewport
+          : null
       checks.push(
-        problems.length === 0
+        problems.length === 0 && unapplied === null
           ? {
               name: 'viewport_coherent',
               status: 'pass',
@@ -4464,9 +4504,16 @@ async function doctorFingerprint(flags: ParsedFlags): Promise<FingerprintPanel> 
           : {
               name: 'viewport_coherent',
               status: 'warn',
-              message: `structurally impossible window: ${problems.join('; ')}`,
+              message:
+                problems.length > 0
+                  ? `structurally impossible window: ${problems.join('; ')}`
+                  : 'this session persists a `set viewport` too large for its own window, which every one of its verbs re-applies — not applied here, because the panel fell back to a session you did not name and must not resize somebody’s window unasked',
               fix: 'stop overriding the viewport on this session (see shouldEmulateViewport), or set one that fits: silver set viewport <w> <h>',
-              details: geom,
+              details: unapplied
+                ? cookieField(
+                    `outer ${outerW}x${outerH}, inner ${innerW}x${innerH} (${mode}); persisted set viewport ${unapplied.width}x${unapplied.height} NOT applied`,
+                  )
+                : geom,
             },
       )
     }

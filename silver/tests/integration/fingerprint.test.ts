@@ -249,6 +249,50 @@ describe('doctor --fingerprint: offline identity coherence', () => {
       assertClamped(c)
     })
 
+    /**
+     * A DIAGNOSTIC must not mutate a session the operator never named.
+     *
+     * `page.setViewportSize` is not purely an Emulation override — Playwright
+     * 1.61's `_updateViewport` also sends `Browser.setWindowBounds` when the
+     * target has a UI window, and that is a real window-manager resize which does
+     * NOT revert when the transport drops. Combined with
+     * `pickFingerprintSession`'s fallback, a bare `doctor --fingerprint` whose
+     * requested session happened to be dead could have resized a headed or
+     * `connect`ed window belonging to somebody who never asked — while running a
+     * health check.
+     *
+     * Asserted headlessly via the geometry, which is what makes this a real lock
+     * rather than a message check: if the gate is deleted the override applies and
+     * `inner` becomes 2000x1400, so the `inner === outer` assertion below fails.
+     */
+    it('does NOT apply the override to a fallback session — and says it did not', async () => {
+      // EMULATED must be the ONLY live session, or the fallback could pick another
+      // and the assertions would be about the wrong browser.
+      for (const s of ALL) await closeSession(s).catch(() => {})
+      expect((await run(['open', base, '--session', EMULATED])).env.success).toBe(true)
+      expect(
+        (await run(['set', 'viewport', '2000', '1400', '--session', EMULATED, '--enable-actions']))
+          .env.success,
+      ).toBe(true)
+
+      // Ask about a session that does not exist, so the panel falls back.
+      const p = await panel(`${EMULATED}-never-opened`)
+      expect(p.session).toBe(EMULATED)
+      const c = byName(p, 'viewport_coherent')
+
+      // THE LOCK: the window was left exactly as it was. A 2000x1400 inner here
+      // would mean the diagnostic resized a session nobody named.
+      const [, outerW, outerH, innerW, innerH] = (c.details ?? '')
+        .match(/outer (\d+)x(\d+), inner (\d+)x(\d+)/)!
+        .slice(0, 5)
+      expect(`${innerW}x${innerH}`).toBe(`${outerW}x${outerH}`)
+
+      // ...and it still does not certify what it did not check.
+      expect(c.status, `${c.message} | ${c.details}`).toBe('warn')
+      expect(c.details).toContain('NOT applied')
+      assertClamped(c)
+    })
+
     it('still never emits `fail` — the panel is advisory and `doctor` gates a build', async () => {
       // `handleDoctor` exits non-zero on any `fail`, so a fail here would break
       // `silver doctor && npm start` for every honest user. `warn` is the strongest
