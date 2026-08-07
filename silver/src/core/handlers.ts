@@ -1117,7 +1117,12 @@ async function dispatch(flags: ParsedFlags): Promise<Envelope<unknown>> {
     case 'version':
       return ok({ name: 'silver', version: VERSION })
     case 'doctor':
-      return flags.trifecta ? doctorTrifecta(flags) : handleDoctor()
+      // Both sub-reports REPLACE the health checks rather than extending them:
+      // `--trifecta` reads flags only, `--fingerprint` needs a live browser, and
+      // neither should be paid for by the install check hosts run on every boot.
+      if (flags.trifecta) return doctorTrifecta(flags)
+      if (flags.fingerprint) return doctorFingerprintReport()
+      return handleDoctor()
     case 'skill':
     case 'skills':
       return handleSkill(flags)
@@ -4021,6 +4026,420 @@ async function doctorCdpReachable(): Promise<DoctorCheck> {
       fix: 'silver close --all  # then re-open',
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// doctor --fingerprint: the offline identity-coherence panel.
+// ---------------------------------------------------------------------------
+
+/** The names this panel always emits, in order — including when it skips. */
+const FINGERPRINT_CHECKS = [
+  'viewport_coherent',
+  'timezone_coherent',
+  'locale_coherent',
+  'platform_coherent',
+  'webdriver_absent',
+  'driver_globals_absent',
+] as const
+
+/** The honest remedy for anything stock Chromium cannot fix (never a UA patch). */
+const EXEC_PATH_FIX = 'silver open <url> --exec-path /path/to/your/chromium  # a stealth build you obtained yourself'
+
+/**
+ * What one `page.evaluate` brings back. Read as a STRING expression because the
+ * project compiles with `lib: ["ES2022"]` and no DOM lib — a callback form would
+ * not typecheck against `window`/`navigator` here (see walk.ts, same idiom).
+ */
+type FingerprintProbe = {
+  ua: string
+  platform: string
+  uaDataPlatform: string | null
+  webdriver: unknown
+  language: string
+  languages: string[]
+  timeZone: string
+  outerW: number
+  outerH: number
+  innerW: number
+  innerH: number
+  driverGlobals: string[]
+}
+
+const FINGERPRINT_EXPR = `(function () {
+  var d = ['__pwInitScripts', '__playwright__binding__'].filter(function (k) {
+    return Object.prototype.hasOwnProperty.call(window, k)
+  })
+  var uad = navigator.userAgentData
+  return {
+    ua: String(navigator.userAgent || ''),
+    platform: String(navigator.platform || ''),
+    uaDataPlatform: uad && uad.platform ? String(uad.platform) : null,
+    webdriver: navigator.webdriver,
+    language: String(navigator.language || ''),
+    languages: Array.prototype.slice.call(navigator.languages || []).map(String),
+    timeZone: String((Intl.DateTimeFormat().resolvedOptions().timeZone) || ''),
+    outerW: window.outerWidth, outerH: window.outerHeight,
+    innerW: window.innerWidth, innerH: window.innerHeight,
+    driverGlobals: d,
+  }
+})()`
+
+/**
+ * Normalize an OS claim from ANY of the three sources onto one family name, so
+ * the three can be compared at all.
+ *
+ * `null` means "not classified", and the comparison then simply skips that
+ * source — deliberately, because a wrong family is worse than no family. MOBILE
+ * UAs (Android/iOS) return `null` on purpose: Android reports `navigator.platform
+ * = "Linux armv8l"` against an `Android` UA token, which is perfectly coherent
+ * for Android and would read as a mismatch under any naive mapping. Silver drives
+ * a desktop Chromium on the host OS and never spoofs a mobile UA, so those cases
+ * only arise from someone else's emulation — not something to raise an alarm on.
+ *
+ * Chrome OS folds into Linux: `navigator.platform` there really is `Linux
+ * x86_64`, so treating `CrOS` / `Chrome OS` as its own family would manufacture a
+ * mismatch on a coherent machine.
+ */
+function osFamily(claim: string): 'macOS' | 'Windows' | 'Linux' | null {
+  if (/Android|iPhone|iPad|iPod/i.test(claim)) return null
+  if (/Windows|^Win\d/i.test(claim)) return 'Windows'
+  if (/Macintosh|Mac OS X|^Mac/i.test(claim)) return 'macOS'
+  if (/CrOS|Chrome OS|X11|Linux/i.test(claim)) return 'Linux'
+  return null
+}
+
+/**
+ * `doctor --fingerprint` — read the live browser's identity back and check it
+ * against ITSELF.
+ *
+ * Everything else in silver's anti-detection story SETS an attribute (a launch
+ * flag, a CDP override) and never reads it back, so nothing asserted that two
+ * attributes actually agree. That is the whole gap this closes: a browser is
+ * rarely caught by one value, it is caught by two values that cannot both be true
+ * of the same machine — a viewport larger than the window containing it, a
+ * `navigator.language` its own `languages[0]` contradicts, a macOS UA on a Win32
+ * platform. Those are computable with no network at all, which is why this is the
+ * shape the check takes: keyless, offline, no scanner site, no model.
+ *
+ * ATTACHES TO A LIVE SESSION via `connect()`, exactly like `doctorCdpReachable`,
+ * and `skip`s the whole panel when there is none. Launching a throwaway browser
+ * of its own would be easier and would also be worthless: that browser would
+ * never go through `connect()`, so it could not observe what silver actually does
+ * to a session (the B1 viewport override lived in `connect`), and the headed
+ * branch below would be unreachable because a throwaway is always headless.
+ *
+ * NEVER RETURNS `fail`. This is a regression DETECTOR, not a gate. Stock
+ * Playwright Chromium cannot pass every check — its headless UA carries a
+ * `HeadlessChrome` token that only a different binary can remove — so a `fail`
+ * would hand every honest user a non-zero exit for something they did not do and
+ * cannot fix. The cost of that choice is real: a coherence regression will not
+ * break anyone's build, so the integration test asserting `viewport_coherent ===
+ * 'pass'` is what actually catches one. That trade is deliberate.
+ *
+ * REPORTS, NEVER PATCHES. A UA problem is named, not fixed: rewriting the UA
+ * string desynchronizes it from the `Sec-CH-UA` client hints Chromium sends
+ * alongside, which is strictly MORE detectable than the token it hides. The
+ * honest remedy is a different binary (`--exec-path`), which is what the fix line
+ * says.
+ */
+async function doctorFingerprint(): Promise<DoctorCheck[]> {
+  const skipAll = (message: string, fix?: string): DoctorCheck[] =>
+    FINGERPRINT_CHECKS.map((name) => ({ name, status: 'skip' as const, message, ...(fix ? { fix } : {}) }))
+
+  // Same session-selection rule as doctorCdpReachable: the first session with a
+  // browser that could plausibly answer.
+  let target: string | null = null
+  try {
+    for (const name of await listSessionNames()) {
+      const info = await readSidecar(name).catch(() => null)
+      if (info && (info.external === true || isPidAlive(info.pid))) {
+        target = name
+        break
+      }
+    }
+  } catch {
+    /* fall through to skip */
+  }
+  if (!target) {
+    return skipAll(
+      'no live session to read attributes from — these checks observe a real browser, they are not computed',
+      'silver open <url>  # then re-run `silver doctor --fingerprint`',
+    )
+  }
+
+  let conn: Connection
+  try {
+    conn = await connect(target)
+  } catch {
+    // `cdp_reachable` in the main panel is what REPORTS an unreachable session;
+    // duplicating that failure six times here would be noise, so we observe
+    // nothing and say so.
+    return skipAll('a live session was found but could not be attached — see `silver doctor` (cdp_reachable)')
+  }
+
+  let m: FingerprintProbe
+  try {
+    m = (await conn.page.evaluate(FINGERPRINT_EXPR)) as FingerprintProbe
+  } catch {
+    return skipAll('the live page could not be read (it may be mid-navigation or on a restricted origin)')
+  } finally {
+    // Park before dropping the transport, for the same reason withConnection
+    // does: attaching over CDP RESUMES a frozen page, so a doctor run would
+    // otherwise quietly wake every parked session and leave it burning a core.
+    // Best-effort, and a no-op on the sessions parkPages refuses (headed/external).
+    await parkPages(conn).catch(() => {})
+    await conn.browser.close().catch(() => {})
+  }
+
+  const checks: DoctorCheck[] = []
+  const headed = conn.info.headed === true
+  const external = conn.info.external === true
+
+  // --- viewport_coherent: the check that would have caught B1. ---------------
+  // A content box can never be wider or taller than the window holding it, and a
+  // window with visible chrome always spends some height on it. Forcing the
+  // launch arg's 1280x900 onto a headed page violated both at once.
+  {
+    const geom = `outer ${m.outerW}x${m.outerH}, inner ${m.innerW}x${m.innerH}`
+    const problems: string[] = []
+    if (m.outerW < m.innerW) problems.push('the viewport is WIDER than its own window')
+    if (m.outerH < m.innerH) problems.push('the viewport is TALLER than its own window')
+    if (headed && m.outerH <= m.innerH) {
+      problems.push('a headed window reports no browser chrome (outerHeight <= innerHeight)')
+    }
+    checks.push(
+      problems.length === 0
+        ? {
+            name: 'viewport_coherent',
+            status: 'pass',
+            // Headless outer == inner is CORRECT, not a lucky pass: there is no
+            // tab strip or omnibox to subtract.
+            message: headed
+              ? 'the window is larger than its viewport by the height of real browser chrome'
+              : 'the headless window and its viewport agree (no chrome to subtract)',
+            details: `${geom} (${headed ? 'headed' : 'headless'})`,
+          }
+        : {
+            name: 'viewport_coherent',
+            status: 'warn',
+            message: `structurally impossible window: ${problems.join('; ')}`,
+            fix: 'stop overriding the viewport on this session (see shouldEmulateViewport), or set one that fits: silver set viewport <w> <h>',
+            details: `${geom} (${headed ? 'headed' : 'headless'})`,
+          },
+    )
+  }
+
+  // --- timezone_coherent -----------------------------------------------------
+  // The classic timezone tell is page-TZ vs the exit IP's geography, and that
+  // needs a network lookup we refuse to make. The offline half of it is still
+  // worth asserting: the browser must be in the zone the OPERATOR configured.
+  // `TZ` is the only configured source there is — `set timezone` applies a
+  // per-command CDP override that is not persisted, so there is nothing on disk
+  // to compare against.
+  {
+    const configured = (process.env.TZ ?? '').trim()
+    if (!m.timeZone) {
+      checks.push({
+        name: 'timezone_coherent',
+        status: 'warn',
+        message: 'the browser could not name its own time zone — real browsers always resolve one',
+      })
+    } else if (configured && external) {
+      // TZ is inherited by a browser we SPAWN. An external browser was started by
+      // someone else, so this process's TZ says nothing about it; comparing would
+      // report a mismatch that is not one.
+      checks.push({
+        name: 'timezone_coherent',
+        status: 'pass',
+        message: 'external browser — this process’s TZ does not govern it, so its zone is recorded, not judged',
+        details: m.timeZone,
+      })
+    } else if (configured && configured !== m.timeZone) {
+      checks.push({
+        name: 'timezone_coherent',
+        status: 'warn',
+        message: `the browser resolved a different time zone than TZ configures (${m.timeZone} vs ${configured})`,
+        // TZ is read at spawn, so an already-running browser keeps the old zone.
+        fix: 'silver close --session <name>  # then re-open, so the browser inherits TZ',
+        details: m.timeZone,
+      })
+    } else {
+      checks.push({
+        name: 'timezone_coherent',
+        status: 'pass',
+        message: configured
+          ? 'the browser is in the configured time zone'
+          : 'no TZ configured — the browser inherited the host zone, which is the coherent default',
+        details: m.timeZone,
+      })
+    }
+  }
+
+  // --- locale_coherent -------------------------------------------------------
+  // `navigator.language` and `navigator.languages[0]` come from one setting in a
+  // real browser and cannot disagree. They CAN be desynchronized by overriding
+  // one of them — which is precisely the shape of a botched spoof.
+  {
+    const first = m.languages[0]
+    if (!m.language || first === undefined) {
+      checks.push({
+        name: 'locale_coherent',
+        status: 'warn',
+        message: 'the browser reports no language or an empty languages list — every real browser has both',
+        details: `${m.language || '(none)'} / [${m.languages.join(', ')}]`,
+      })
+    } else {
+      checks.push({
+        name: 'locale_coherent',
+        status: m.language === first ? 'pass' : 'warn',
+        message:
+          m.language === first
+            ? 'navigator.language agrees with navigator.languages[0]'
+            : 'navigator.language contradicts navigator.languages[0] — one was overridden without the other',
+        ...(m.language === first ? {} : { fix: 'silver set locale <BCP47>  # sets both, or drop the override entirely' }),
+        details: `${m.language} / [${m.languages.join(', ')}]`,
+      })
+    }
+  }
+
+  // --- platform_coherent -----------------------------------------------------
+  // Three independent OS claims that a real machine derives from ONE fact: the UA
+  // string, `navigator.platform`, and the UA-CH `platform`. Also the home of the
+  // UA's own internal contradiction — a `HeadlessChrome` token, which the UA-CH
+  // brand list never carries, so the two halves of the same identity disagree.
+  {
+    const fams: Array<[string, 'macOS' | 'Windows' | 'Linux' | null]> = [
+      ['userAgent', osFamily(m.ua)],
+      ['navigator.platform', osFamily(m.platform)],
+      ...(m.uaDataPlatform !== null
+        ? ([['userAgentData.platform', osFamily(m.uaDataPlatform)]] as Array<[string, 'macOS' | 'Windows' | 'Linux' | null]>)
+        : []),
+    ]
+    const known = fams.filter((f): f is [string, 'macOS' | 'Windows' | 'Linux'] => f[1] !== null)
+    const disagree = known.length > 1 && known.some(([, f]) => f !== known[0][1])
+    const headlessToken = /Headless/i.test(m.ua)
+    const details = known.map(([k, f]) => `${k}=${f}`).join(', ') || 'unclassified'
+
+    if (disagree) {
+      checks.push({
+        name: 'platform_coherent',
+        status: 'warn',
+        message: `the OS claims contradict each other: ${known.map(([k, f]) => `${k}=${f}`).join(' vs ')}`,
+        // Emphatically NOT "rewrite the UA": that desynchronizes it from Sec-CH-UA
+        // and is strictly more detectable than the mismatch it hides.
+        fix: EXEC_PATH_FIX,
+        details,
+      })
+    } else if (headlessToken) {
+      checks.push({
+        name: 'platform_coherent',
+        status: 'warn',
+        message:
+          'the user-agent advertises HeadlessChrome, which the UA-CH brand list never carries — the two halves of the same identity disagree. Stock Chromium cannot be talked out of this token, and patching the UA string would only desynchronize it from Sec-CH-UA',
+        fix: EXEC_PATH_FIX,
+        details,
+      })
+    } else {
+      checks.push({
+        name: 'platform_coherent',
+        status: 'pass',
+        message:
+          known.length > 1
+            ? 'every OS claim the browser makes agrees'
+            : 'only one OS claim could be classified — nothing to contradict it',
+        details,
+      })
+    }
+  }
+
+  // --- webdriver_absent ------------------------------------------------------
+  // A real Chrome defines `navigator.webdriver` and sets it to FALSE. `true` means
+  // we are advertising automation; `undefined` means someone deleted the property,
+  // which is itself a tell (the absence is as loud as the flag).
+  {
+    const w = m.webdriver
+    checks.push(
+      w === false
+        ? {
+            name: 'webdriver_absent',
+            status: 'pass',
+            message: 'navigator.webdriver is false, as on any ordinary browser',
+          }
+        : {
+            name: 'webdriver_absent',
+            status: 'warn',
+            message:
+              w === true
+                ? 'navigator.webdriver is TRUE — this browser is advertising automation'
+                : 'navigator.webdriver is not the boolean false a real browser reports (it looks deleted or overwritten)',
+            // The launch flag is load-bearing and order-sensitive; see session.ts,
+            // where --remote-debugging-pipe turns the feature back on.
+            fix: 'reopen the session so it launches with --disable-blink-features=AutomationControlled',
+            details: String(w),
+          },
+    )
+  }
+
+  // --- driver_globals_absent -------------------------------------------------
+  // This one is OURS, not Chromium's: a driver that leaves its plumbing on
+  // `window` is self-inflicted, and unlike the UA token it is fixable.
+  //
+  // LIMITATION, stated because it bounds what a pass means: the probe runs in the
+  // MAIN world, which the page can write to, so a hostile page could define
+  // `window.__pwInitScripts` itself and make this warn. Reading from an isolated
+  // world is the fix and is the other half of this work. A broad `/playwright|
+  // selenium|webdriver/`-style scan over every global was rejected for the same
+  // reason — it would hand any page a way to make silver's own doctor cry wolf.
+  {
+    checks.push(
+      m.driverGlobals.length === 0
+        ? {
+            name: 'driver_globals_absent',
+            status: 'pass',
+            message: 'no driver plumbing is exposed on window',
+          }
+        : {
+            name: 'driver_globals_absent',
+            status: 'warn',
+            message:
+              'driver globals are visible to the page on window (note: the main world is page-writable, so a page can also plant these)',
+            fix: 'avoid page.addInitScript / exposeBinding on the main world for this session',
+            details: m.driverGlobals.join(', '),
+          },
+    )
+  }
+
+  return checks
+}
+
+/**
+ * Envelope wrapper for the panel. Mirrors `handleDoctor`'s payload shape so a
+ * host already parsing `{checks,…}` needs no second parser — but ALWAYS returns
+ * `ok()`, because this report is advisory (see doctorFingerprint) and must not
+ * become an exit-code gate on a browser the user cannot change.
+ */
+async function doctorFingerprintReport(): Promise<Envelope<unknown>> {
+  const checks = await doctorFingerprint()
+  const passed = checks.filter((c) => c.status === 'pass').length
+  const warned = checks.filter((c) => c.status === 'warn').length
+  const skipped = checks.filter((c) => c.status === 'skip').length
+  const firstWarn = checks.find((c) => c.status === 'warn')
+  const verdict = skipped === checks.length ? 'skipped' : firstWarn ? 'incoherent' : 'coherent'
+  return ok({
+    checks,
+    verdict,
+    next:
+      verdict === 'skipped'
+        ? 'open a session first — this panel observes a real browser'
+        : firstWarn
+          ? firstWarn.fix ?? firstWarn.message
+          : 'the browser does not contradict itself',
+    passed,
+    warned,
+    skipped,
+    total: checks.length,
+    note: 'keyless offline coherence self-report: silver reads its own live browser and compares it against itself. No scanner site, no network call, no model. Advisory only — it never changes the exit code, and it never patches a user-agent (that would desynchronize it from Sec-CH-UA and be more detectable, not less).',
+  })
 }
 
 function handleSkill(flags: ParsedFlags): Envelope<unknown> {
