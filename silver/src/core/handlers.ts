@@ -4315,11 +4315,20 @@ async function doctorFingerprint(flags: ParsedFlags): Promise<FingerprintPanel> 
     // the operator read it as a verdict on the tab they are looking at. Every
     // other verb resolves the active page (see withConnection); so does this.
     const page = await resolveActivePage(conn.context, target).catch(() => conn.page)
-    // Wake the page before reading it, exactly as withConnection does. The last
-    // command's teardown froze it, and `page.evaluate` has no timeout — relying
-    // on the CDP attach to resume it is Playwright's side effect rather than a
-    // contract (unparkPage says so itself), and a doctor probe that hangs forever
-    // on a frozen page would be a poor way to find that out.
+    // Wake the page before reading it, exactly as withConnection does — but for
+    // insurance, NOT because a frozen page would refuse to answer.
+    //
+    // It answers today: a frozen page still serves `Runtime.evaluate`, which
+    // park.test.ts states outright ("not merely answering Runtime.evaluate (which
+    // a frozen page does)") and which every reading in the measurement below
+    // relied on. So this call is not rescuing the probe from a hang; delete it and
+    // the panel still reports.
+    //
+    // It stays for the reason `unparkPage`'s own doc gives: resuming on CDP attach
+    // is Playwright's side effect rather than a contract, so a Chromium that
+    // stopped answering a frozen target would silently hang a `page.evaluate` that
+    // has no timeout. One CDP round-trip to state the wake-up explicitly is a
+    // cheap hedge against a future engine change — that is its whole job here.
     await unparkPage(conn.context, page).catch(() => {})
     // Re-apply the persisted emulation, exactly as instrumentPage does for every
     // real verb — otherwise this panel measures a state NO verb ever runs in.
@@ -4351,10 +4360,23 @@ async function doctorFingerprint(flags: ParsedFlags): Promise<FingerprintPanel> 
   } catch {
     return skipAll('the live page could not be read (it may be mid-navigation or on a restricted origin)')
   } finally {
-    // Park before dropping the transport, for the same reason withConnection
-    // does: attaching over CDP RESUMES a frozen page, so a doctor run would
-    // otherwise quietly wake every parked session and leave it burning a core.
-    // Best-effort, and a no-op on the sessions parkPages refuses (headed/external).
+    // Re-park before dropping the transport, for SYMMETRY with the wake above —
+    // this is not closing a live leak, and the earlier claim that it was is
+    // measured false.
+    //
+    // Measured against one session parked on a canvas that paints every frame,
+    // 1.5s windows: a plain parked gap 1 frame; a gap containing a `silver doctor`
+    // (which connects and closes at `doctorCdpReachable` with NO parkPages at all)
+    // 2 frames; a gap containing `doctor --fingerprint` 4 — against 90 for the
+    // same page held awake in-command. So a doctor run leaves nothing burning:
+    // Chromium re-freezes the page by itself when the transport drops, exactly as
+    // `unparkPage`'s doc describes ("settles back to frozen"), whether or not we
+    // say so first. The handful of frames is the attach/detach window either side.
+    //
+    // Kept anyway, on the same logic as the unpark: the re-freeze is engine
+    // behaviour we observe rather than a contract we are owed, and a command that
+    // explicitly woke a page should explicitly put it back. Best-effort, and a
+    // no-op on the sessions parkPages refuses (headed/external).
     await parkPages(conn).catch(() => {})
     await conn.browser.close().catch(() => {})
   }
