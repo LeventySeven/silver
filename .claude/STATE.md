@@ -20,11 +20,19 @@ headless, perception no longer reads via main-world primitives, and PR #3 is lan
   killed the next one too — 2 killed, `[]` reported); fixed by bounding on signals sent with one
   shared confirm budget, pinned by a new invariant test verified red first.
 
+- **Batch 2 (B1 viewport gate + B2 `doctor --fingerprint`) COMPLETE + rechecked APPROVED** —
+  evidence: `npm test` → "Test Files 71 passed (71) / Tests 769 passed (769)", build exit 0,
+  both re-run by me. Recheck found 7 issues incl. a real prompt-injection channel (page
+  `navigator.*` text flowed unclamped into doctor `details`, which reads in silver's own voice
+  with no `⟦page-content untrusted⟧` marker); fixed at one `sanitizeProbe` boundary via the
+  existing `cookieField`. NUL-byte scan clean on all 8 changed files (verified with
+  `tr -d '\000' | cmp`, NOT `grep $'\x00'` — bash cannot hold NUL in an argument, so that
+  pattern is empty and matches every file).
+
 ## Next
-1. Implement `docs/plans/2026-08-08-detection-coherence.md` as batches: **B1+B2** (viewport gate
-   + `doctor --fingerprint`), then **B3+B4** (doc glob + `--lang`/`TZ`), then **B5 alone**
-   (isolated-world reads — riskiest, own rollback point, may land as reverted+documented).
-2. Recheck each batch before the next; full suite must stay at 756+ passing.
+1. **B3+B4** (doc-contract glob + `--lang`/`TZ` at launch), then **B5 alone** (isolated-world
+   reads — riskiest, own rollback point, may land as reverted+documented).
+2. Recheck each batch before the next; full suite must stay at 769+ passing.
 3. Before finishing: one whole-subsystem pass for drift between batches (per-batch recheck is
    structurally blind to it).
 
