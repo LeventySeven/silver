@@ -996,13 +996,16 @@ function withSessionNotices<T>(env: Envelope<T>): Envelope<T> {
     const evicted = takeEvictionNotice()
     const notes: string[] = []
     if (restarted !== null) {
+      // "before this command" and not "the page it was on": `open`/`goto` take
+      // this path too, and they navigate AFTER the respawn — the page they
+      // report is real and current, only whatever preceded it is lost.
       notes.push(
-        `session "${restarted}" had no live browser and was respawned from its saved profile — the page it was on is gone`,
+        `session "${restarted}" had no live browser and was respawned from its saved profile — whatever page it held before this command is gone`,
       )
     }
     if (evicted.length > 0) {
       notes.push(
-        `the browser ceiling stopped ${evicted.length} idle browser(s) to make room: ${evicted.join(', ')} (profiles kept — the next command on one respawns it)`,
+        `the browser ceiling stopped ${evicted.length} idle ${evicted.length === 1 ? 'browser' : 'browsers'} to make room: ${evicted.join(', ')} (profiles kept — the next command on one respawns it)`,
       )
     }
     if (notes.length === 0) return env
