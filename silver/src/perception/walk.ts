@@ -9,10 +9,12 @@
  * `generic`).
  *
  * How it works (all via one CDP session over the connected page):
- *   1. Run one page.evaluate scan classifying every element as cursor-
- *      interactive and/or computed-hidden (adapted from browser-use's dom
- *      serializer + reference/agent-browser snapshot.rs:624-907). Matched
- *      elements are tagged `data-__uab-idx` for backendNodeId resolution.
+ *   1. Run one in-page scan classifying every element as cursor-interactive
+ *      and/or computed-hidden (adapted from browser-use's dom serializer +
+ *      reference/agent-browser snapshot.rs:624-907). Matched elements are
+ *      tagged `data-__uab-idx` for backendNodeId resolution. It runs in an
+ *      ISOLATED world (`evaluateIsolated`) so a page that monkey-patches
+ *      `document.querySelectorAll` cannot author what perception sees.
  *   2. `DOM.getDocument({depth:-1, pierce:true})` -> a backendNodeId -> DOM
  *      attributes map, and the idx -> backendNodeId map for the tagged scan.
  *   3. `Accessibility.getFullAXTree` -> the AX nodes, joined to DOM by
@@ -268,11 +270,43 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
     // best-effort — Aside sends the same at CDP bring-up "so [focused] is meaningful".
     await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {})
 
+    // frameId -> document base URL, so relative hrefs resolve per frame (P1-P2).
+    // Fetched HERE, ahead of the scan, because the isolated world the scan runs
+    // in is created per-FRAME and needs the main frame's REAL CDP frameId —
+    // `MAIN_FRAME_ID` is the literal string 'main', a RefEntry back-compat
+    // sentinel, not a frameId. It is the same response the href resolution
+    // already needed, so pulling it forward costs no extra round-trip.
+    const pageUrl = page.url()
+    const frameBaseUrl = new Map<string, string>()
+    let mainFrameId = ''
+    try {
+      const ft = (await cdp.send('Page.getFrameTree')) as { frameTree: FrameTreeNode }
+      mainFrameId = ft.frameTree.frame.id
+      collectFrameUrls(ft.frameTree, frameBaseUrl)
+    } catch {
+      /* best-effort — hrefs fall back to the page URL, the scan to the main world */
+    }
+
+    /**
+     * Run one perception expression in the frame's ISOLATED world, falling back
+     * to the page's own main world on ANY failure (no frameId, world creation
+     * refused, stale context, in-page throw). The fallback is not optional:
+     * perception IS the product, so a browser that will not hand us an isolated
+     * world has to degrade to the old behaviour, never to a blank page.
+     */
+    const evalPerception = async (expr: string): Promise<unknown> => {
+      try {
+        return await evaluateIsolated(cdp, mainFrameId, expr)
+      } catch {
+        return await page.evaluate(expr)
+      }
+    }
+
     // 1. Cursor + hidden scan (main frame only; tags matched elements with
     //    data-__uab-idx). Child frames rely on the AX tree for ref-eligibility
     //    (real controls: button/link/input/…), which the cursor cascade is not
     //    needed for — keeping the scan single-frame avoids idx collisions.
-    const scan = (await page.evaluate(SCAN_JS)) as {
+    const scan = (await evalPerception(SCAN_JS)) as {
       bail: boolean
       records: ScanRecord[]
       canvasCoverage?: number
@@ -289,8 +323,9 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
     const idxToBackend = new Map<number, number>()
     collectDom(doc.root, domByBackend, idxToBackend)
 
-    // Best-effort cleanup of the tags we injected.
-    await page.evaluate(CLEANUP_JS).catch(() => {})
+    // Best-effort cleanup of the tags we injected. Same world as the scan (the
+    // DOM is shared, so the isolated world finds and removes its own tags).
+    await evalPerception(CLEANUP_JS).catch(() => {})
 
     // Build cursor + prune + form-hint maps keyed by backendNodeId.
     const cursorByBackend = new Map<number, CursorInfo>()
@@ -318,16 +353,6 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
         if (rec.formHint) hintByBackend.set(backend, rec.formHint)
         if (rec.roleText) roleTextByBackend.set(backend, rec.roleText)
       })
-    }
-
-    // frameId -> document base URL, so relative hrefs resolve per frame (P1-P2).
-    const pageUrl = page.url()
-    const frameBaseUrl = new Map<string, string>()
-    try {
-      const ft = (await cdp.send('Page.getFrameTree')) as { frameTree: FrameTreeNode }
-      collectFrameUrls(ft.frameTree, frameBaseUrl)
-    } catch {
-      /* best-effort — falls back to the page URL */
     }
 
     // Optional selector scoping (main frame). Fail LOUD on zero/invalid match
@@ -673,6 +698,75 @@ async function resolveChildFrameId(
   }
 }
 
+/**
+ * Name of the isolated world. Page JS cannot enumerate worlds, so this is never
+ * observable from the page — it only labels the context in a CDP trace.
+ */
+const ISOLATED_WORLD_NAME = 'silver-perception'
+
+/**
+ * Per-WALK cache of the isolated world. `snapshotNodes` creates its CDP session
+ * and detaches it inside a single call, so keying on that session yields exactly
+ * one `Page.createIsolatedWorld` per walk without threading a context id through
+ * the scan/cleanup pair — and an executionContextId can never outlive the walk
+ * that made it (a world dies with its document; a stale id would evaluate
+ * against nothing). Weak so a detached session's entry is collectable.
+ */
+const isolatedWorlds = new WeakMap<CDPSession, Promise<number>>()
+
+/**
+ * Evaluate `expr` in an ISOLATED world of `frameId` — a second JS context that
+ * SHARES the frame's DOM but has its own globals and prototypes.
+ *
+ * WHY: the scan reads the page through `document.querySelectorAll`,
+ * `getComputedStyle`, `Element.prototype.getAttribute` and friends. Run in the
+ * page's MAIN world, every one of those is a function the page itself can
+ * replace — so a hostile page could author what perception sees, and "@refs are
+ * minted from what silver observed" would hold only as far as the page's
+ * goodwill. The isolated world's copies are pristine and unreachable from page
+ * JS. This is an integrity fix; any anti-detection benefit is incidental.
+ *
+ * MEASURED against real Chromium, so the next reader need not re-derive it:
+ *   - The DOM really is SHARED. `data-__uab-idx` written here reads back from
+ *     `DOM.getDocument` on the page target with a real backendNodeId, so the
+ *     idx -> backendNodeId join is untouched and cleanup still finds its tags.
+ *   - `el.onclick` is NOT shared: it is a per-world JS binding, and a handler
+ *     assigned by main-world JS reads back `null` here. See the `hasOnClick`
+ *     probe in SCAN_JS for what that costs and why it is accepted.
+ *
+ * Throws on ANY failure so the caller falls back to the main world. Universal
+ * access is deliberately not requested (the CDP default): the world should carry
+ * exactly the page's origin privileges, not more.
+ */
+async function evaluateIsolated(cdp: CDPSession, frameId: string, expr: string): Promise<unknown> {
+  if (!frameId) throw new Error('no frameId for an isolated world')
+  let world = isolatedWorlds.get(cdp)
+  if (!world) {
+    // Cached even when it rejects: a browser that refused once will refuse again,
+    // and retrying per expression would just pay the round-trip twice per walk.
+    world = cdp
+      .send('Page.createIsolatedWorld', { frameId, worldName: ISOLATED_WORLD_NAME })
+      .then((r) => {
+        const id = (r as { executionContextId?: number }).executionContextId
+        if (typeof id !== 'number') throw new Error('isolated world has no execution context')
+        return id
+      })
+    isolatedWorlds.set(cdp, world)
+  }
+  const contextId = await world
+  const res = (await cdp.send('Runtime.evaluate', {
+    expression: expr,
+    contextId,
+    returnByValue: true,
+  })) as { result?: { value?: unknown }; exceptionDetails?: { text?: string } }
+  // An in-page throw comes back as DATA, not a rejection — re-raise it so the
+  // caller's fallback fires instead of the scan silently reading `undefined`.
+  if (res.exceptionDetails) {
+    throw new Error(`isolated-world evaluate threw: ${res.exceptionDetails.text ?? ''}`)
+  }
+  return res.result?.value
+}
+
 /** Recursively index each frame's document URL by CDP frameId. */
 function collectFrameUrls(node: FrameTreeNode, out: Map<string, string>): void {
   if (node.frame.url) out.set(node.frame.id, node.frame.url)
@@ -884,6 +978,19 @@ const SCAN_JS = `(function () {
       if (role && interactiveRoles[role.toLowerCase()]) return;
       if (el.closest && el.closest('[hidden], [aria-hidden="true"]')) return;
       var hasPointer = style.cursor === 'pointer';
+      // This probe is HALF world-scoped, deliberately. hasAttribute reads real
+      // DOM and is identical in every world, so inline onclick="..." is caught
+      // exactly as before. el.onclick is a per-WORLD binding: measured on
+      // Chromium, a handler assigned by main-world JS reads back null in the
+      // isolated world this scan now runs in, so that half only ever fires on
+      // the main-world FALLBACK path -- keep it, dropping it would regress that
+      // path. Accepted cost: a legacy el.onclick = fn on an element with no
+      // pointer cursor, no tabindex and no contenteditable (one that looks
+      // unclickable to a human too). addEventListener handlers were ALREADY
+      // invisible here, and a real <a>/<button> is ref-eligible from the AX tree
+      // regardless. Recovering it would take a SECOND main-world walk: twice the
+      // scan cost, run in the world we just stopped trusting, and a page that
+      // lies about querySelectorAll would simply return [] there as well.
       var hasOnClick = el.hasAttribute('onclick') || el.onclick !== null;
       var ti = el.getAttribute('tabindex');
       var hasTab = ti !== null && ti !== '-1';
