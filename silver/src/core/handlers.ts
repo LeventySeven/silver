@@ -970,7 +970,69 @@ async function focusedElementName(page: Page): Promise<string> {
 // The dispatch entry the CLI calls.
 // ---------------------------------------------------------------------------
 
+/**
+ * Fold any pending session notice onto the envelope's `warning`.
+ *
+ * Both notices are set several frames below the handler — the ceiling fires from
+ * `openSession`, the respawn from `ensureConnected` — and EVERY verb reaches
+ * both through `withConnection`. Only `handleOpen` ever read the eviction
+ * notice, so a bare `silver read` would SIGTERM another session's browser and
+ * report nothing at all; doing it here catches every verb `handle` dispatches at
+ * the one place they all funnel through, instead of editing forty handlers.
+ *
+ * `warning` and not `data`: `data` is a bare string for `read`, null for some
+ * verbs, and a fixed shape the host destructures for others — there is no key a
+ * notice can always be added to. `warning` is optional on every envelope and is
+ * already printed in both JSON and human form.
+ *
+ * The command's own warning goes FIRST: the notice is context about the session,
+ * never more urgent than what the verb itself found (a CAPTCHA, an auth wall).
+ * `handleOpen` still takes the eviction notice into its `evicted` data key
+ * before returning, so `open` keeps its shape and cannot double-report.
+ */
+function withSessionNotices<T>(env: Envelope<T>): Envelope<T> {
+  try {
+    const restarted = takeRestartNotice()
+    const evicted = takeEvictionNotice()
+    const notes: string[] = []
+    if (restarted !== null) {
+      notes.push(
+        `session "${restarted}" had no live browser and was respawned from its saved profile — the page it was on is gone`,
+      )
+    }
+    if (evicted.length > 0) {
+      notes.push(
+        `the browser ceiling stopped ${evicted.length} idle browser(s) to make room: ${evicted.join(', ')} (profiles kept — the next command on one respawns it)`,
+      )
+    }
+    if (notes.length === 0) return env
+    const own = env.warning
+    return { ...env, warning: own ? `${own}; ${notes.join('; ')}` : notes.join('; ') }
+  } catch {
+    // Reporting is strictly best-effort: a command that did its work must not
+    // fail because we could not annotate it. Neither `take*` can actually throw
+    // today (both are module-local reads), so this costs nothing and keeps that
+    // from silently becoming untrue.
+    return env
+  }
+}
+
+/**
+ * The dispatch entry cli.ts calls: run the verb, then annotate what happened to
+ * the SESSION while it ran (see `withSessionNotices`). Split from `dispatch` so
+ * the annotation cannot be forgotten by a future verb — every `return` in the
+ * switch passes through here.
+ *
+ * NOT covered, deliberately: `batch` sub-envelopes (each sub-result is built
+ * inside `handleBatch`, below this wrapper) and the `dispatchLayer` verbs in
+ * cli.ts (`task`/`memory`/`subagent`), which never reach this function.
+ */
 export async function handle(flags: ParsedFlags): Promise<Envelope<unknown>> {
+  const env = await dispatch(flags)
+  return withSessionNotices(env)
+}
+
+async function dispatch(flags: ParsedFlags): Promise<Envelope<unknown>> {
   switch (flags.verb) {
     // lifecycle
     case 'open':
