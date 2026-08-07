@@ -1544,6 +1544,17 @@ export function resolveMaxBrowsers(): number {
  */
 let evictionNotice: string[] = []
 
+/**
+ * How long the ceiling waits for an evicted browser to actually exit, and how
+ * often it looks. Short on purpose: this sits on the `open` path, so the budget
+ * is the delay a user pays when a browser will not die. Half a second is enough
+ * for a Chromium that is going to exit (measured in the tens of ms) and short
+ * enough that a wedged one costs the command almost nothing before we give up on
+ * it and move on.
+ */
+const EVICT_EXIT_BUDGET_MS = 500
+const EVICT_POLL_MS = 50
+
 /** Take (and clear) the sessions the ceiling stopped for the current command. */
 export function takeEvictionNotice(): string[] {
   const out = evictionNotice
@@ -1568,7 +1579,8 @@ export function takeEvictionNotice(): string[] {
  * lockfile shows a LIVE holder (a command is mid-flight — see `isSessionBusy`),
  * or `exclude` (the caller's own session, mid-open). If everything over the cap
  * is busy, nothing is stopped and the spawn proceeds: a real command in flight
- * outranks a memory target. Returns the stopped sessions, namespace-qualified.
+ * outranks a memory target. Returns the stopped sessions, namespace-qualified —
+ * only the ones OBSERVED to have exited, never the ones merely signalled.
  */
 export async function enforceBrowserCeiling(exclude?: string): Promise<string[]> {
   const cap = resolveMaxBrowsers()
@@ -1600,9 +1612,42 @@ export async function enforceBrowserCeiling(exclude?: string): Promise<string[]>
     } catch {
       continue // already gone between the liveness check and here
     }
+    // `process.kill` reports that the signal was DELIVERED, not that anything
+    // died — a Chromium wedged in a `beforeunload` handler survives it. Without
+    // this wait the cap went unenforced while `open` reported the session
+    // `evicted`, which is worse than not evicting at all: the host is told memory
+    // was freed that is still held. So claim it only once the pid is truly gone.
+    //
+    // A survivor is skipped, NOT escalated. SIGKILL cannot be ignored, so
+    // escalating would make every candidate "succeed" — the same false report
+    // with extra steps — and it orphans the renderers (see `killProcessGroup`),
+    // which is the leak this whole area exists to stop; it also breaks the
+    // "SIGTERM, keep the profile" posture that makes automatic eviction safe.
+    // Skipping leaves the cap unmet, the same call the `isSessionBusy` skip above
+    // already makes: a real process that will not die outranks a memory target.
+    // The loop then simply tries the next-most-idle candidate.
+    if (!(await confirmExited(cand.pid))) continue
     stopped.push(cand.key)
   }
   return stopped
+}
+
+/**
+ * Poll until `pid` is gone, giving up after `EVICT_EXIT_BUDGET_MS`.
+ *
+ * Deliberately NOT `waitForExit`, which escalates to SIGKILL at the halfway mark
+ * — see the reasoning at the call site. The cost is up to the budget added to an
+ * `open` that has to evict, paid only when a browser will not exit: a healthy
+ * Chromium is gone in the first poll or two, so the normal path pays one 50ms
+ * tick at most.
+ */
+async function confirmExited(pid: number, budgetMs = EVICT_EXIT_BUDGET_MS): Promise<boolean> {
+  const deadline = Date.now() + budgetMs
+  while (isPidAlive(pid)) {
+    if (Date.now() >= deadline) return false
+    await delay(EVICT_POLL_MS)
+  }
+  return true
 }
 
 /**

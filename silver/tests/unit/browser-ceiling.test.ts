@@ -40,6 +40,32 @@ function spawnVictim(): ChildProcess {
   return child
 }
 
+/**
+ * A pid that SURVIVES SIGTERM — a browser wedged in a beforeunload handler, or
+ * one whose engine installed its own term handler. `process.kill` still returns
+ * cleanly for it: it reports that the signal was DELIVERED, never that anything
+ * died. The afterEach SIGKILLs it, which no handler can catch.
+ *
+ * Awaits the child's own "armed" line rather than returning immediately: Node
+ * needs ~40ms to boot, and a SIGTERM that lands before the handler is installed
+ * is taken by the DEFAULT disposition, which kills it. The test would then go
+ * green for the wrong reason — a browser that really died is one the ceiling may
+ * honestly claim.
+ */
+async function spawnStubborn(): Promise<ChildProcess> {
+  const child = spawn(
+    process.execPath,
+    ['-e', "process.on('SIGTERM', () => {}); console.log('armed'); setTimeout(() => {}, 60_000)"],
+    { stdio: ['ignore', 'pipe', 'ignore'] },
+  )
+  children.push(child)
+  await new Promise<void>((resolve, reject) => {
+    child.stdout!.once('data', () => resolve())
+    child.once('error', reject)
+  })
+  return child
+}
+
 const ago = (ms: number): string => new Date(Date.now() - ms).toISOString()
 
 async function seed(name: string, over: Partial<SessionInfo>): Promise<void> {
@@ -168,6 +194,36 @@ describe('enforceBrowserCeiling', () => {
     expect(await enforceBrowserCeiling()).toEqual([])
     expect(isPidAlive(a.pid!)).toBe(true)
     expect(isPidAlive(b.pid!)).toBe(true)
+  })
+
+  it('does not claim a browser that ignored the SIGTERM', async () => {
+    // The dishonest failure this pins: `process.kill` throws only when the signal
+    // cannot be DELIVERED, so a browser that ignores SIGTERM left the cap unmet
+    // while `open` reported it `evicted: [...]` — silver claiming it freed memory
+    // it did not free. Leaving the cap unmet is the acceptable half; lying about
+    // it is not. Nothing escalates to SIGKILL: a survivor is simply not claimed.
+    process.env.SILVER_MAX_BROWSERS = '1'
+    const stubborn = await spawnStubborn()
+    const name = uniq('stubborn')
+    await seed(name, { pid: stubborn.pid!, lastUsedAt: ago(60_000) })
+
+    expect(await enforceBrowserCeiling()).toEqual([])
+    expect(isPidAlive(stubborn.pid!)).toBe(true)
+  })
+
+  it('moves on to the next candidate when one refuses to die', async () => {
+    process.env.SILVER_MAX_BROWSERS = '1'
+    const stubborn = await spawnStubborn()
+    const killable = spawnVictim()
+    const stubbornName = uniq('stubborn2')
+    const killableName = uniq('killable')
+    // The stubborn one is the MORE idle of the two, so LRU reaches it first.
+    await seed(stubbornName, { pid: stubborn.pid!, lastUsedAt: ago(60_000) })
+    await seed(killableName, { pid: killable.pid!, lastUsedAt: ago(30_000) })
+
+    expect(await enforceBrowserCeiling()).toEqual([killableName])
+    expect(await waitDead(killable.pid!)).toBe(true)
+    expect(isPidAlive(stubborn.pid!)).toBe(true)
   })
 
   it('ignores a session whose browser is already dead', async () => {
