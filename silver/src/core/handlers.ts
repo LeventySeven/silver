@@ -640,6 +640,44 @@ async function lastKnownUrl(session: string): Promise<string | undefined> {
   return url && url !== 'about:blank' ? url : undefined
 }
 
+/**
+ * The session whose browser `ensureConnected` had to respawn, waiting to be
+ * reported. Mirrors `takeEvictionNotice` in session.ts: read once, then cleared,
+ * so a respawn lands on the envelope of the command that caused it and never on
+ * a later one.
+ *
+ * Why it has to be reported at all: the respawned browser comes back on
+ * about:blank, and the verbs disagree about how honest that is. `snapshot`
+ * degrades to `page_empty`; a bare `read` returns
+ * `{"success":true,"data":"⟦page-content untrusted⟧\n\n⟦/page-content⟧"}` — a
+ * page silver LOST, handed back as a page that has no text. The host cannot tell
+ * those apart from the envelope, so it acts on the blank one. The profile (and
+ * its logins) survived, so the recovery is just to navigate again — but only if
+ * the host is told there is something to recover from.
+ *
+ * A module-level slot rather than a return value because `ensureConnected` is
+ * four call-frames below the handler that builds the envelope, and threading a
+ * second channel through `withConnection` and every handler's return type to
+ * carry one advisory string is a far larger change than the advisory is worth.
+ */
+let restartNotice: string | null = null
+
+/**
+ * Note that `name` had a browser, it was gone, and we have spawned a new one.
+ * Exported for the test that pins the read-once contract; the only production
+ * caller is `ensureConnected` below.
+ */
+export function noteSessionRestarted(name: string): void {
+  restartNotice = name
+}
+
+/** Take (and clear) the pending respawn notice for the current command. */
+export function takeRestartNotice(): string | null {
+  const out = restartNotice
+  restartNotice = null
+  return out
+}
+
 /** Connect to the session, auto-spawning the detached browser if none is live.
  * EXTERNAL (connect'd) sessions are never auto-respawned into an owned browser —
  * a failed connect there is surfaced, since we do not own that process. */
@@ -650,6 +688,16 @@ async function ensureConnected(name: string, opts: OpenOptions): Promise<Connect
     const info = await readSidecar(name).catch(() => null)
     if (info?.external) throw err
     await openSession(name, opts)
+    // A sidecar we could read BEFORE the respawn is what separates "this session
+    // had a browser and it is gone" (crashed, OOM-killed, or evicted by the
+    // ceiling) from "this session is brand new". `connect()` throws on both — a
+    // session with no sidecar has nothing to connect to — so the catch block alone
+    // proves nothing. Without this gate the notice would fire on the first `open`
+    // of every session, i.e. on the single most common command in the tool, and a
+    // warning that is present every time is a warning the host learns to skip.
+    // Placed after the spawn so a failed respawn (which throws) reports the
+    // failure rather than a restart that did not happen.
+    if (info) noteSessionRestarted(name)
     // E4: the CDP attach to a FRESHLY-spawned browser is the flaky call site — the
     // detached Chromium is still bringing up its DevTools endpoint, so the first
     // connect can hit a connection-refused/reset the browser clears in a few ms.
