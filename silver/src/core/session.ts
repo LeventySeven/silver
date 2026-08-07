@@ -505,6 +505,42 @@ const READY_BUDGET_MS = 8_000
 export const VIEWPORT = { width: 1280, height: 900 } as const
 
 /**
+ * Is this a session silver may NOT disturb on its own initiative?
+ *
+ * The one invariant behind four separate mechanisms, stated here once so it stops
+ * being re-derived (and re-forgotten) per site. Two grounds, and they are
+ * genuinely different reasons that happen to produce the same answer:
+ *
+ *   - `external` — a `connect`ed browser is the USER'S PROCESS. We did not launch
+ *     it, we do not own its lifetime, and their own tabs are in it.
+ *   - `headed` — we launched it, but somebody ASKED FOR A WINDOW. The only reason
+ *     to pay for a visible window is that a human intends to look at it.
+ *
+ * What "disturb" covers, in escalating order — every one of these is a mechanism
+ * that used to decide this for itself:
+ *   `shouldEmulateViewport`  would RESIZE it  (and the resize outlives us: see below)
+ *   `parkPages`              would FREEZE it
+ *   `enforceBrowserCeiling`  would SIGTERM it
+ *   `reapIdleSessions`       would SIGTERM it AND `rm -rf` its profile
+ *
+ * A mechanism may still act on such a session when the OPERATOR asked for it by
+ * name — `set viewport`, `close`, an explicit `session gc` are all instructions,
+ * not initiatives. This predicate governs what silver does UNASKED: on a timer, on
+ * a memory threshold, on the way out of an unrelated command.
+ *
+ * The costs are real and accepted at each site; each states its own. What is not
+ * acceptable is a fifth mechanism quietly deciding differently, which is exactly
+ * how the ceiling came to be the only one of the four that would kill a window a
+ * human was reading.
+ *
+ * Takes the sidecar fields rather than a whole `SessionInfo` so every call site
+ * (including `tab new` in handlers.ts) can pass what it already holds.
+ */
+export function isHandsOffSession(info: Pick<SessionInfo, 'headed' | 'external'>): boolean {
+  return info.headed === true || info.external === true
+}
+
+/**
  * May we override this session's CONTENT size to `VIEWPORT`?
  *
  * The launch arg `--window-size=1280,900` sizes the WINDOW; `setViewportSize`
@@ -531,16 +567,20 @@ export const VIEWPORT = { width: 1280, height: 900 } as const
  * headless ones. Determinism is worth less than not being obviously fake, and a
  * host that needs an exact size can still ask for one with `set viewport w h`.
  *
- * EXTERNAL is not about tells at all. A `connect`ed browser is the USER'S, with
- * their tabs in it; resizing it is reaching into a window a person is looking at,
- * on every command. Same reasoning as `parkPages`, which refuses these two cases
- * for the same reason: we do not own that browser.
+ * EXTERNAL is not about tells at all — see `isHandsOffSession`, which is where
+ * both grounds now live. Worth spelling out what the resize actually IS, because
+ * it is the reason this is not merely cosmetic: `page.setViewportSize` is not
+ * only an Emulation override. Playwright 1.61 (`_updateViewport`) also sends
+ * `Browser.setWindowBounds` whenever the target has a UI window, and window
+ * bounds are a real window-manager change that does NOT revert when the CDP
+ * transport drops. So on a headed or `connect`ed session this call physically
+ * resizes a window on someone's screen, permanently.
  *
  * Takes the sidecar fields rather than a whole `SessionInfo` so both call sites
  * (here and `tab new` in handlers.ts) can pass what they already hold.
  */
 export function shouldEmulateViewport(info: Pick<SessionInfo, 'headed' | 'external'>): boolean {
-  return info.headed !== true && info.external !== true
+  return !isHandsOffSession(info)
 }
 
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
@@ -1535,8 +1575,10 @@ async function isSessionBusy(dir: string): Promise<boolean> {
  * boundary over each other's OS processes, and treating them as one is what let
  * the machine fill up.
  *
- * NEVER reaps: external (`connect`ed) sessions — we do not own that process — a
- * session whose lockfile shows a LIVE holder (a command is mid-flight), the
+ * NEVER reaps: a hands-off session (see `isHandsOffSession` — an `external`
+ * browser whose process we do not own, or a `headed` one someone is watching; the
+ * filter below states why a TTL is not evidence of abandonment for the second),
+ * a session whose lockfile shows a LIVE holder (a command is mid-flight), the
  * caller's own session (`exclude`, matched within the caller's namespace only),
  * or anything when `ttlMs <= 0`. Entirely best-effort: a failure to reap one
  * session must not fail the command that opportunistically triggered the sweep.
@@ -1565,8 +1607,36 @@ export async function reapIdleSessions(
     } catch {
       continue // no/corrupt sidecar — that is plain `session gc`'s job, not ours
     }
-    // We only reap browsers we own and that are still running.
-    if (info.external || !isPidAlive(info.pid)) continue
+    // We only reap browsers we own, that are still running, and that nobody is
+    // watching. See `isHandsOffSession` for the shared invariant; this is the most
+    // destructive of the four sites, so the site-specific part is worth stating.
+    //
+    // Two things make the `headed` exclusion necessary here even though a TTL
+    // sounds like fair evidence of abandonment:
+    //
+    // 1. THE CLOCK CANNOT SEE THE HUMAN. `idleMsOf` reads `lastUsedAt`, which only
+    //    `connect()` ever stamps — i.e. it measures how long since an AGENT drove
+    //    this session. A headed session exists precisely so a PERSON can use the
+    //    window directly, and that never touches the clock. So "idle 30 minutes"
+    //    is not evidence a headed session was abandoned; it is the normal reading
+    //    for one someone is reading. The reaper's signal is simply blind here.
+    // 2. THE ACTION IS THE WORST ONE WE HAVE. Unlike the ceiling, this SIGTERMs
+    //    the browser AND `rm -rf`s the session dir below — profile, cookies,
+    //    logins — and it fires AMBIENTLY, from any unrelated agent's command in
+    //    any namespace (`maybeSweepIdleSessions`). A human reading a page for
+    //    longer than the TTL lost the window and the login, to a command they had
+    //    no part in.
+    //
+    // This does NOT make a headed session immortal, which is the objection that
+    // would otherwise argue the line back out. The lifeline holder still ends the
+    // browser at its deadline, independently of this sweep — measured with a 6s
+    // TTL and NO silver command run at all (so no sweep could fire): all 10
+    // Chromium processes gone in 10s, session dir intact. Memory is bounded by the
+    // lifeline; what this exclusion preserves is the PROFILE. And it leaks no
+    // disk either: the line below already skips any session whose pid is dead, so
+    // reclaiming a dead session's dir was always `session gc`'s job, never this
+    // one's.
+    if (isHandsOffSession(info) || !isPidAlive(info.pid)) continue
     // The session's OWN TTL wins over the sweeping process's — but only for an
     // AMBIENT sweep. The sweep is global, so without this the shortest TTL anywhere
     // on the machine would govern every namespace, and a session opened with
@@ -1679,16 +1749,17 @@ export function takeEvictionNotice(): string[] {
  * dead pid as "respawn me", so an evicted session's next command brings the
  * browser back with its logged-in profile intact; the only thing lost is the
  * page's in-memory state, the same thing lost to a machine going to sleep.
- * (`reapIdleSessions` deletes the dir — correct for a session nobody has
- * touched in an hour, far too destructive for one being pushed out by load.)
+ * (`reapIdleSessions` deletes the dir — defensible for a session nobody has
+ * touched in a full idle TTL (`DEFAULT_SESSION_IDLE_MS`, 30 minutes), far too
+ * destructive for one being pushed out by load.)
  *
- * NEVER stops: an external (`connect`ed) browser we do not own, a HEADED session
- * a human is watching (see the filter below), a session whose lockfile shows a
- * LIVE holder (a command is mid-flight — see `isSessionBusy`), or `exclude` (the
- * caller's own session, mid-open). If everything over the cap is busy, nothing is
- * stopped and the spawn proceeds: a real command in flight outranks a memory
- * target. Returns the stopped sessions, namespace-qualified — only the ones
- * OBSERVED to have exited, never the ones merely signalled.
+ * NEVER stops: a hands-off session (see `isHandsOffSession` — an `external`
+ * browser we do not own, or a `headed` one someone is watching), a session whose
+ * lockfile shows a LIVE holder (a command is mid-flight — see `isSessionBusy`),
+ * or `exclude` (the caller's own session, mid-open). If everything over the cap
+ * is busy, nothing is stopped and the spawn proceeds: a real command in flight
+ * outranks a memory target. Returns the stopped sessions, namespace-qualified —
+ * only the ones OBSERVED to have exited, never the ones merely signalled.
  */
 export async function enforceBrowserCeiling(exclude?: string): Promise<string[]> {
   const cap = resolveMaxBrowsers()
@@ -1703,32 +1774,20 @@ export async function enforceBrowserCeiling(exclude?: string): Promise<string[]>
     } catch {
       continue // no/corrupt sidecar — `session gc`'s problem, not the ceiling's
     }
-    // `headed` sits beside `external` because the other two mechanisms on this
-    // path already refuse it, and this is the one that cannot be undone.
-    // `parkPages` will not FREEZE a headed session and `shouldEmulateViewport`
-    // will not RESIZE one, both on the ground that a human asked to watch that
-    // window — so the ceiling, which SIGTERMs the process, must not be the single
-    // mechanism that reaches into it. Worse than inconsistent: a watched window is
-    // by construction the most IDLE session on the machine (nobody issues commands
-    // against a page they are reading), so LRU picked it FIRST — the window a
-    // human was looking at was the first one the cap took, and it took it with
-    // whatever was in the page (a half-filled form, a scroll position) still in it.
+    // See `isHandsOffSession` for the shared invariant. The site-specific part:
+    // this mechanism fires because SOMEBODY ELSE wants memory right now, which is
+    // evidence about the fleet and none whatever about whether a person is looking
+    // at this window. Worse, a watched window is by construction the most IDLE
+    // session on the machine — nobody issues commands against a page they are
+    // reading — so LRU reached it FIRST, and the cap took the one window a human
+    // had open along with whatever was in it (a half-filled form, a scroll
+    // position).
     //
     // The cost is real and accepted: a fleet that leaves headed sessions open can
     // hold the machine above the cap, because the ceiling has nothing left it may
-    // stop. That is the same trade `isSessionBusy` already makes (a real command
-    // in flight outranks a memory target) — a headed window is a HUMAN in flight,
-    // and the honest response to "everything is off-limits" is to leave the cap
-    // unmet rather than to kill the one thing someone is looking at.
-    //
-    // It does NOT make a headed session immortal, which is the objection that
-    // would otherwise argue this line back out. `reapIdleSessions` still reclaims
-    // it after the idle TTL, deliberately without the same exclusion: the reaper
-    // fires on TIME (an hour with no command against this session is real evidence
-    // nobody is watching), while the ceiling fires because SOMEBODY ELSE wants
-    // memory right now — which is evidence about the fleet and none at all about
-    // whether a person is looking at this window.
-    if (info.external || info.headed || !isPidAlive(info.pid)) continue
+    // stop. Same trade `isSessionBusy` already makes — a command in flight
+    // outranks a memory target, and a headed window is a HUMAN in flight.
+    if (isHandsOffSession(info) || !isPidAlive(info.pid)) continue
     live.push({ key: s.key, dir: s.dir, pid: info.pid, idle: idleMsOf(info) })
   }
   // The caller is about to spawn one more, so the budget for everyone else is
@@ -1998,15 +2057,15 @@ export async function connect(name: string): Promise<Connection> {
  * the CPU graph, and a page that never gets another command simply stays
  * asleep instead of burning a core until the idle reaper arrives.
  *
- * NEVER parks a browser we do not own: an `external` (`connect`ed) session is
- * the user's OWN browser, with their tabs in it, and a `headed` session is one
- * a human asked to watch — freezing either would stop something in front of
- * someone's eyes. Best-effort throughout; a page that cannot be frozen is left
- * running rather than failing the command that just succeeded.
+ * NEVER parks a hands-off session (see `isHandsOffSession`): freezing one would
+ * stop something in front of someone's eyes. The mildest of the four refusals —
+ * this one is undone by the next command's `unparkPage` — and still correct.
+ * Best-effort throughout; a page that cannot be frozen is left running rather
+ * than failing the command that just succeeded.
  */
 export async function parkPages(conn: Connection): Promise<void> {
   if (!parkingEnabled()) return
-  if (conn.info.external === true || conn.info.headed === true) return
+  if (isHandsOffSession(conn.info)) return
   const pages = conn.context.pages()
   await Promise.all(
     pages.map(async (page) => {
