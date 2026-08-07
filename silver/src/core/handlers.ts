@@ -1026,9 +1026,17 @@ function withSessionNotices<T>(env: Envelope<T>): Envelope<T> {
  * the annotation cannot be forgotten by a future verb — every `return` in the
  * switch passes through here.
  *
- * NOT covered, deliberately: `batch` sub-envelopes (each sub-result is built
- * inside `handleBatch`, below this wrapper) and the `dispatchLayer` verbs in
- * cli.ts (`task`/`memory`/`subagent`), which never reach this function.
+ * NOT covered, deliberately, and the two are not uncovered the same way. The
+ * `dispatchLayer` verbs in cli.ts (`task`/`memory`/`subagent`) never reach this
+ * function at all, so a notice they leave pending is still here for whatever
+ * command runs next. `batch` is worse: each sub-command re-enters `run()`
+ * (`handleBatch` → cli.ts → `handle`), so it DOES pass through this wrapper —
+ * the notice is taken, folded into the sub-envelope's `warning`, and then thrown
+ * away by `handleBatch`'s `{command, success, error, data}` projection, which has
+ * no `warning` field. Inside a batch the notice is therefore DESTROYED, not
+ * merely uncovered: it cannot be recovered on the outer envelope either, because
+ * by then it has already been consumed. Propagating it means widening that
+ * projection, which is out of scope here.
  */
 export async function handle(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const env = await dispatch(flags)

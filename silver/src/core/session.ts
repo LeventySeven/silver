@@ -1545,12 +1545,17 @@ export function resolveMaxBrowsers(): number {
 let evictionNotice: string[] = []
 
 /**
- * How long the ceiling waits for an evicted browser to actually exit, and how
- * often it looks. Short on purpose: this sits on the `open` path, so the budget
- * is the delay a user pays when a browser will not die. Half a second is enough
- * for a Chromium that is going to exit (measured in the tens of ms) and short
- * enough that a wedged one costs the command almost nothing before we give up on
- * it and move on.
+ * How long the ceiling waits for the browsers it SIGTERMed to actually exit, and
+ * how often it looks. Short on purpose: this sits on the `open` path, so the
+ * budget is the delay a user pays when a browser will not die. It is paid ONCE
+ * per `enforceBrowserCeiling` call, not once per evicted browser — they shut
+ * down in parallel and are waited on together.
+ *
+ * Half a second is enough for a Chromium that is going to exit at all, and short
+ * enough that a wedged one costs the command almost nothing. A browser that is
+ * merely SLOW (a heavy page's unload handlers) is simply not reported — the
+ * eviction still happened, so this trades a false negative in the notice for a
+ * bounded delay, which is the right way round.
  */
 const EVICT_EXIT_BUDGET_MS = 500
 const EVICT_POLL_MS = 50
@@ -1603,51 +1608,49 @@ export async function enforceBrowserCeiling(exclude?: string): Promise<string[]>
   const over = live.length - (cap - 1)
   if (over <= 0) return []
   live.sort((a, b) => b.idle - a.idle) // most-idle first: LRU eviction
-  const stopped: string[] = []
+
+  // PHASE 1 — signal, at most `over` of them.
+  //
+  // The SIGTERM is what costs a session its page, so the SIGTERM is what counts
+  // against `over`. Counting CONFIRMED EXITS instead is a real bug that shipped
+  // here: a healthy browser that took longer than the budget to shut down fell
+  // through to the next candidate and got it killed too, so a cap needing one
+  // eviction stopped two browsers and reported neither. Nothing below this loop
+  // sends a signal, which is what makes the bound checkable.
+  const signalled: Array<{ key: string; pid: number }> = []
   for (const cand of live) {
-    if (stopped.length >= over) break
+    if (signalled.length >= over) break
     if (await isSessionBusy(cand.dir)) continue
     try {
       process.kill(cand.pid, 'SIGTERM')
     } catch {
-      continue // already gone between the liveness check and here
+      continue // already gone between the liveness check and here: no signal, no cost
     }
-    // `process.kill` reports that the signal was DELIVERED, not that anything
-    // died — a Chromium wedged in a `beforeunload` handler survives it. Without
-    // this wait the cap went unenforced while `open` reported the session
-    // `evicted`, which is worse than not evicting at all: the host is told memory
-    // was freed that is still held. So claim it only once the pid is truly gone.
-    //
-    // A survivor is skipped, NOT escalated. SIGKILL cannot be ignored, so
-    // escalating would make every candidate "succeed" — the same false report
-    // with extra steps — and it orphans the renderers (see `killProcessGroup`),
-    // which is the leak this whole area exists to stop; it also breaks the
-    // "SIGTERM, keep the profile" posture that makes automatic eviction safe.
-    // Skipping leaves the cap unmet, the same call the `isSessionBusy` skip above
-    // already makes: a real process that will not die outranks a memory target.
-    // The loop then simply tries the next-most-idle candidate.
-    if (!(await confirmExited(cand.pid))) continue
-    stopped.push(cand.key)
+    signalled.push({ key: cand.key, pid: cand.pid })
   }
-  return stopped
-}
 
-/**
- * Poll until `pid` is gone, giving up after `EVICT_EXIT_BUDGET_MS`.
- *
- * Deliberately NOT `waitForExit`, which escalates to SIGKILL at the halfway mark
- * — see the reasoning at the call site. The cost is up to the budget added to an
- * `open` that has to evict, paid only when a browser will not exit: a healthy
- * Chromium is gone in the first poll or two, so the normal path pays one 50ms
- * tick at most.
- */
-async function confirmExited(pid: number, budgetMs = EVICT_EXIT_BUDGET_MS): Promise<boolean> {
-  const deadline = Date.now() + budgetMs
-  while (isPidAlive(pid)) {
-    if (Date.now() >= deadline) return false
+  // PHASE 2 — confirm, under ONE budget shared by all of them.
+  //
+  // `process.kill` reports that the signal was DELIVERED, not that anything died:
+  // a Chromium wedged in a `beforeunload` handler survives it. Reporting on
+  // delivery told the host memory was freed that is still held, so a browser is
+  // claimed only once its pid is observed gone. The budget is shared because the
+  // browsers are shutting down in PARALLEL — waiting on each in turn would
+  // multiply this delay on the `open` path by the number evicted.
+  //
+  // A survivor is dropped from the report, NOT escalated. SIGKILL cannot be
+  // ignored, so escalating would make every candidate "succeed" — the same false
+  // report with extra steps — and it orphans the renderers (see
+  // `killProcessGroup`), the leak this whole area exists to stop; it also breaks
+  // the "SIGTERM, keep the profile" posture that makes automatic eviction safe.
+  // The cost of dropping it is a cap left unmet by one browser, which is the
+  // cheaper error: the alternative is to keep killing until something dies, and
+  // the ceiling is not worth an unbounded body count.
+  const deadline = Date.now() + EVICT_EXIT_BUDGET_MS
+  while (Date.now() < deadline && signalled.some((s) => isPidAlive(s.pid))) {
     await delay(EVICT_POLL_MS)
   }
-  return true
+  return signalled.filter((s) => !isPidAlive(s.pid)).map((s) => s.key)
 }
 
 /**
