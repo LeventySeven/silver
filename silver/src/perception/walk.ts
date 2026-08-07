@@ -12,7 +12,8 @@
  *   1. Run one in-page scan classifying every element as cursor-interactive
  *      and/or computed-hidden (adapted from browser-use's dom serializer +
  *      reference/agent-browser snapshot.rs:624-907). Matched elements are
- *      tagged `data-__uab-idx` for backendNodeId resolution. It runs in an
+ *      tagged with a per-walk random attribute for backendNodeId resolution
+ *      (random so the page cannot ship its own tag and capture a record). It runs in an
  *      ISOLATED world (`evaluateIsolated`) so a page that monkey-patches
  *      `document.querySelectorAll` cannot author what perception sees.
  *   2. `DOM.getDocument({depth:-1, pierce:true})` -> a backendNodeId -> DOM
@@ -27,6 +28,7 @@
  * Ref MINTING and line formatting happen later, in serialize.ts. This module
  * only produces nodes. No model calls.
  */
+import { randomBytes } from 'node:crypto'
 import type { Page, CDPSession } from 'playwright'
 import { INTERACTIVE_ROLES, CONTENT_ROLES } from './roles.js'
 import { accessibleName } from './accessible-name.js'
@@ -218,6 +220,14 @@ type ScanRecord = {
   /** Aside-alignment: this element is a real scroll container (overflow scroll/auto
    * with content overflow), so it should get a ref + a `[scrollable]` enrichment. */
   scroll: boolean
+  /**
+   * The element is cursor-interactive ONLY by a cursor inherited from a parent
+   * that is itself cursor-interactive — i.e. the parent-cursor dedup applies
+   * unless it turns out to be independently click-wired. The scan cannot answer
+   * that (event wiring is invisible to it), so it reports the ambiguity and the
+   * walk resolves it against the CDP listener registry. See `clickWired`.
+   */
+  dedup: boolean
   /** C1: present iff this element is a hint-bearing form control (select / typed input). */
   formHint: FormHint | null
   /** P1 (ARIA-paradox): text of an element whose ARIA `role` is interactive, used
@@ -287,6 +297,10 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
       /* best-effort — hrefs fall back to the page URL, the scan to the main world */
     }
 
+    // The isolated world for this walk: `undefined` = not created yet, `null` =
+    // the browser refused, so do not ask again for the rest of this walk.
+    let isolatedContextId: number | null | undefined
+
     /**
      * Run one perception expression in the frame's ISOLATED world, falling back
      * to the page's own main world on ANY failure (no frameId, world creation
@@ -296,17 +310,22 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
      */
     const evalPerception = async (expr: string): Promise<unknown> => {
       try {
-        return await evaluateIsolated(cdp, mainFrameId, expr)
+        if (isolatedContextId === undefined) {
+          isolatedContextId = await createIsolatedWorld(cdp, mainFrameId).catch(() => null)
+        }
+        if (isolatedContextId === null) throw new Error('no isolated world')
+        return await evaluateIsolated(cdp, isolatedContextId, expr)
       } catch {
         return await page.evaluate(expr)
       }
     }
 
-    // 1. Cursor + hidden scan (main frame only; tags matched elements with
-    //    data-__uab-idx). Child frames rely on the AX tree for ref-eligibility
+    // 1. Cursor + hidden scan (main frame only; tags matched elements with a
+    //    per-walk random attribute). Child frames rely on the AX tree for ref-eligibility
     //    (real controls: button/link/input/…), which the cursor cascade is not
     //    needed for — keeping the scan single-frame avoids idx collisions.
-    const scan = (await evalPerception(SCAN_JS)) as {
+    const scanTag = freshScanTag()
+    const scan = (await evalPerception(scanJs(scanTag))) as {
       bail: boolean
       records: ScanRecord[]
       canvasCoverage?: number
@@ -321,11 +340,21 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
     }
     const domByBackend = new Map<number, { nodeName: string; attrs: Record<string, string> }>()
     const idxToBackend = new Map<number, number>()
-    collectDom(doc.root, domByBackend, idxToBackend)
+    collectDom(doc.root, domByBackend, idxToBackend, scanTag)
+
+    // 2b. Which elements are actually click-wired, straight from Chromium's
+    //     listener registry. Settles the inherited-cursor dedup the scan can no
+    //     longer settle itself, world-independently and in one round-trip.
+    //     Skipped when the scan bailed: there are no records to settle, and a
+    //     page over the element cap is exactly the one whose listener map would
+    //     be biggest (3000 listeners already serialize to ~400KB).
+    const clickWired = scan.bail
+      ? new Set<number>()
+      : await collectClickWiredBackends(cdp, doc.root.backendNodeId)
 
     // Best-effort cleanup of the tags we injected. Same world as the scan (the
     // DOM is shared, so the isolated world finds and removes its own tags).
-    await evalPerception(CLEANUP_JS).catch(() => {})
+    await evalPerception(cleanupJs(scanTag)).catch(() => {})
 
     // Build cursor + prune + form-hint maps keyed by backendNodeId.
     const cursorByBackend = new Map<number, CursorInfo>()
@@ -338,8 +367,13 @@ export async function snapshotNodes(page: Page, opts: SnapshotOptions = {}): Pro
     if (!scan.bail) {
       scan.records.forEach((rec, idx) => {
         const backend = idxToBackend.get(idx)
-        if (backend === undefined) return
-        if (rec.cur) {
+        // < 0 marks an idx claimed by more than one element — page-authored, so
+        // ambiguous. Grounding the wrong element is worse than not grounding.
+        if (backend === undefined || backend < 0) return
+        // A node the scan could only call cursor-interactive through a cursor it
+        // INHERITED is kept only if it is independently click-wired; otherwise
+        // every child of a clickable card would mint its own ref.
+        if (rec.cur && (!rec.dedup || clickWired.has(backend))) {
           cursorByBackend.set(backend, {
             kind: rec.kind,
             hints: rec.hints,
@@ -639,7 +673,7 @@ async function buildFrameDom(
     const doc = (await session.send('DOM.getDocument', { depth: -1, pierce: true })) as {
       root: DomNode
     }
-    collectDom(doc.root, byBackend, new Map())
+    collectDom(doc.root, byBackend, new Map(), '')
   } catch {
     /* best-effort — names still come from the AX tree */
   }
@@ -705,17 +739,24 @@ async function resolveChildFrameId(
 const ISOLATED_WORLD_NAME = 'silver-perception'
 
 /**
- * Per-WALK cache of the isolated world. `snapshotNodes` creates its CDP session
- * and detaches it inside a single call, so keying on that session yields exactly
- * one `Page.createIsolatedWorld` per walk without threading a context id through
- * the scan/cleanup pair — and an executionContextId can never outlive the walk
- * that made it (a world dies with its document; a stale id would evaluate
- * against nothing). Weak so a detached session's entry is collectable.
+ * Create the isolated world for one frame and return its executionContextId.
+ * The caller holds it for the walk's lifetime — a world dies with its document,
+ * so an id must never be cached beyond the walk that made it.
  */
-const isolatedWorlds = new WeakMap<CDPSession, Promise<number>>()
+async function createIsolatedWorld(cdp: CDPSession, frameId: string): Promise<number> {
+  if (!frameId) throw new Error('no frameId for an isolated world')
+  const r = (await cdp.send('Page.createIsolatedWorld', {
+    frameId,
+    worldName: ISOLATED_WORLD_NAME,
+  })) as { executionContextId?: number }
+  if (typeof r.executionContextId !== 'number') {
+    throw new Error('isolated world has no execution context')
+  }
+  return r.executionContextId
+}
 
 /**
- * Evaluate `expr` in an ISOLATED world of `frameId` — a second JS context that
+ * Evaluate `expr` in the ISOLATED world `contextId` — a second JS context that
  * SHARES the frame's DOM but has its own globals and prototypes.
  *
  * WHY: the scan reads the page through `document.querySelectorAll`,
@@ -727,33 +768,22 @@ const isolatedWorlds = new WeakMap<CDPSession, Promise<number>>()
  * JS. This is an integrity fix; any anti-detection benefit is incidental.
  *
  * MEASURED against real Chromium, so the next reader need not re-derive it:
- *   - The DOM really is SHARED. `data-__uab-idx` written here reads back from
+ *   - The DOM really is SHARED. The scan tag written here reads back from
  *     `DOM.getDocument` on the page target with a real backendNodeId, so the
  *     idx -> backendNodeId join is untouched and cleanup still finds its tags.
  *   - `el.onclick` is NOT shared: it is a per-world JS binding, and a handler
- *     assigned by main-world JS reads back `null` here. See the `hasOnClick`
- *     probe in SCAN_JS for what that costs and why it is accepted.
+ *     assigned by main-world JS reads back `null` here. That is why click wiring
+ *     is read from CDP instead — see `collectClickWiredBackends`.
  *
  * Throws on ANY failure so the caller falls back to the main world. Universal
  * access is deliberately not requested (the CDP default): the world should carry
  * exactly the page's origin privileges, not more.
  */
-async function evaluateIsolated(cdp: CDPSession, frameId: string, expr: string): Promise<unknown> {
-  if (!frameId) throw new Error('no frameId for an isolated world')
-  let world = isolatedWorlds.get(cdp)
-  if (!world) {
-    // Cached even when it rejects: a browser that refused once will refuse again,
-    // and retrying per expression would just pay the round-trip twice per walk.
-    world = cdp
-      .send('Page.createIsolatedWorld', { frameId, worldName: ISOLATED_WORLD_NAME })
-      .then((r) => {
-        const id = (r as { executionContextId?: number }).executionContextId
-        if (typeof id !== 'number') throw new Error('isolated world has no execution context')
-        return id
-      })
-    isolatedWorlds.set(cdp, world)
-  }
-  const contextId = await world
+async function evaluateIsolated(
+  cdp: CDPSession,
+  contextId: number,
+  expr: string,
+): Promise<unknown> {
   const res = (await cdp.send('Runtime.evaluate', {
     expression: expr,
     contextId,
@@ -796,25 +826,33 @@ function findRoots(
   return nodes.filter((n) => !n.parentId || !byId.has(n.parentId)).map((n) => n.nodeId)
 }
 
-/** Recursively index every DOM element by backendNodeId, and pick up scan tags. */
+/**
+ * Recursively index every DOM element by backendNodeId, and pick up scan tags.
+ * `scanTag` is the per-walk random attribute name; pass '' when no scan ran
+ * (the OOPIF DOM map, which is attribute-only).
+ */
 function collectDom(
   node: DomNode,
   byBackend: Map<number, { nodeName: string; attrs: Record<string, string> }>,
   idxToBackend: Map<number, number>,
+  scanTag: string,
 ): void {
   const backend = node.backendNodeId
   if (backend !== undefined) {
     const attrs = flatAttrs(node.attributes)
     byBackend.set(backend, { nodeName: node.nodeName ?? '', attrs })
-    const idx = attrs['data-__uab-idx']
+    const idx = scanTag === '' ? undefined : attrs[scanTag]
     if (idx !== undefined) {
       const n = Number.parseInt(idx, 10)
-      if (Number.isInteger(n)) idxToBackend.set(n, backend)
+      // The scan writes each idx exactly once, so a SECOND element claiming one
+      // is the page racing us for the record. Poison it with -1 rather than
+      // letting document order pick a winner — see `scanJs` for what that cost.
+      if (Number.isInteger(n)) idxToBackend.set(n, idxToBackend.has(n) ? -1 : backend)
     }
   }
-  for (const child of node.children ?? []) collectDom(child, byBackend, idxToBackend)
-  if (node.contentDocument) collectDom(node.contentDocument, byBackend, idxToBackend)
-  for (const sr of node.shadowRoots ?? []) collectDom(sr, byBackend, idxToBackend)
+  for (const child of node.children ?? []) collectDom(child, byBackend, idxToBackend, scanTag)
+  if (node.contentDocument) collectDom(node.contentDocument, byBackend, idxToBackend, scanTag)
+  for (const sr of node.shadowRoots ?? []) collectDom(sr, byBackend, idxToBackend, scanTag)
 }
 
 /** CDP attributes come as a flat [name, value, name, value, ...] array. */
@@ -896,10 +934,24 @@ export function cleanUrl(href: string, base?: string): string {
 // ------------------------- in-page scan (string) ----------------------------
 // Written as a string so the Node/TS build never pulls in the DOM lib. Runs in
 // the page: classifies every element as cursor-interactive and/or hidden, tags
-// matches with data-__uab-idx for backendNodeId resolution.
-const SCAN_JS = `(function () {
+// matches with `tagAttr` for backendNodeId resolution. (Named `tagAttr`, not
+// `tag`: the in-page loop below already uses `tag` for an element's tag NAME.)
+//
+// `tagAttr` is a fresh random attribute name PER WALK, not a constant. With the old
+// fixed `data-__uab-idx`, a page could ship its own copy of the tag: the idx ->
+// backendNodeId map is built from the DOM in document order, last write wins, so
+// a page-authored `data-__uab-idx="0"` later in the document CAPTURED record 0
+// and the real element's enrichment landed on the decoy — verified, the genuine
+// clickable lost its ref and the decoy gained one. A name the page cannot know
+// ahead of time closes that; the strip below closes the leftover-tag case.
+const scanJs = (tagAttr: string): string => `(function () {
   var out = [];
   var all = document.querySelectorAll('*');
+
+  // Remove any tag we did not just write (a leaked name from a walk whose
+  // cleanup failed, or a page copying one it observed). Ours are written below.
+  var stale = document.querySelectorAll('[${tagAttr}]');
+  for (var si = 0; si < stale.length; si++) stale[si].removeAttribute('${tagAttr}');
 
   // sparse_tree signal: fraction of the viewport covered by visible <canvas>
   // surfaces. Computed here (zero extra round-trip) and returned alongside the
@@ -972,34 +1024,42 @@ const SCAN_JS = `(function () {
     }
 
     var cur = false, kind = '', hints = [], text = '', hiddenInputType = null, hiddenInputChecked = null;
+    var dedup = false;
     (function () {
       if (interactiveTags[tag]) return;
       var role = el.getAttribute('role');
       if (role && interactiveRoles[role.toLowerCase()]) return;
       if (el.closest && el.closest('[hidden], [aria-hidden="true"]')) return;
       var hasPointer = style.cursor === 'pointer';
-      // This probe is HALF world-scoped, deliberately. hasAttribute reads real
-      // DOM and is identical in every world, so inline onclick="..." is caught
-      // exactly as before. el.onclick is a per-WORLD binding: measured on
-      // Chromium, a handler assigned by main-world JS reads back null in the
-      // isolated world this scan now runs in, so that half only ever fires on
-      // the main-world FALLBACK path -- keep it, dropping it would regress that
-      // path. Accepted cost: a legacy el.onclick = fn on an element with no
-      // pointer cursor, no tabindex and no contenteditable (one that looks
-      // unclickable to a human too). addEventListener handlers were ALREADY
-      // invisible here, and a real <a>/<button> is ref-eligible from the AX tree
-      // regardless. Recovering it would take a SECOND main-world walk: twice the
-      // scan cost, run in the world we just stopped trusting, and a page that
-      // lies about querySelectorAll would simply return [] there as well.
+      // HALF of this probe is world-scoped. hasAttribute reads real DOM and is
+      // identical in every world, so inline onclick="..." is caught as before.
+      // el.onclick is a per-WORLD binding: measured on Chromium, a handler
+      // assigned by main-world JS reads back null in the isolated world this
+      // scan runs in, so that half only ever fires on the main-world FALLBACK
+      // path -- keep it, dropping it would regress that path. What it can no
+      // longer decide on its own is the dedup below; the walk settles that from
+      // the CDP listener registry instead, which is world-independent and also
+      // sees addEventListener. The residual gap is an element whose ONLY signal
+      // is a JS-assigned onclick -- no pointer cursor, no tabindex, no
+      // contenteditable, no inline attribute -- which looks unclickable to a
+      // human too, and which is not worth tagging every element on the page to
+      // recover (that is what letting the walk decide would cost here).
       var hasOnClick = el.hasAttribute('onclick') || el.onclick !== null;
       var ti = el.getAttribute('tabindex');
       var hasTab = ti !== null && ti !== '-1';
       var ce = el.getAttribute('contenteditable');
       var editable = ce === '' || ce === 'true';
       if (!hasPointer && !hasOnClick && !hasTab && !editable) return;
+      // cursor INHERITS, so every descendant of a cursor:pointer card computes
+      // pointer and would otherwise become its own ref. Dropping them outright
+      // is what kept the tree clean -- but it also dropped genuinely separate
+      // targets (the rows inside a clickable card), because independent wiring
+      // was the only thing telling the two apart, and this scan can no longer
+      // see it. So REPORT the ambiguity instead of resolving it: the walk keeps
+      // these only when the CDP listener registry says they are click-wired.
       if (hasPointer && !hasOnClick && !hasTab && !editable) {
         var p = el.parentElement;
-        if (p && getComputedStyle(p).cursor === 'pointer') return;
+        if (p && getComputedStyle(p).cursor === 'pointer') dedup = true;
       }
       var rect = el.getBoundingClientRect();
       if (rect.width === 0 || rect.height === 0) return;
@@ -1050,15 +1110,75 @@ const SCAN_JS = `(function () {
     }
 
     if (cur || prune || fh || roleText || scroll) {
-      el.setAttribute('data-__uab-idx', String(out.length));
-      out.push({ cur: cur, kind: kind, hints: hints, text: text, hiddenInputType: hiddenInputType, hiddenInputChecked: hiddenInputChecked, prune: prune, scroll: scroll, formHint: fh, roleText: roleText });
+      el.setAttribute('${tagAttr}', String(out.length));
+      out.push({ cur: cur, kind: kind, hints: hints, text: text, hiddenInputType: hiddenInputType, hiddenInputChecked: hiddenInputChecked, prune: prune, scroll: scroll, dedup: dedup, formHint: fh, roleText: roleText });
     }
   }
   return { bail: false, records: out, canvasCoverage: canvasCoverage, canvasCount: canvasCount };
 })()`
 
-const CLEANUP_JS = `(function () {
-  var els = document.querySelectorAll('[data-__uab-idx]');
-  for (var i = 0; i < els.length; i++) els[i].removeAttribute('data-__uab-idx');
+const cleanupJs = (tagAttr: string): string => `(function () {
+  var els = document.querySelectorAll('[${tagAttr}]');
+  for (var i = 0; i < els.length; i++) els[i].removeAttribute('${tagAttr}');
   return els.length;
 })()`
+
+/**
+ * A fresh scan-tag attribute name for one walk. Random so a page cannot
+ * pre-author the tag and capture a record (see `scanJs`); `randomBytes` rather
+ * than `Math.random` because the whole point is that it is not predictable.
+ */
+function freshScanTag(): string {
+  return `data-__uab-${randomBytes(8).toString('hex')}`
+}
+
+/**
+ * backendNodeIds that have a real `click` listener, read from Chromium's own
+ * registry — `DOM.resolveNode` (no executionContextId, so the main world) for
+ * the document, then ONE `DOMDebugger.getEventListeners` over the whole subtree.
+ *
+ * This is the world-independent replacement for the `el.onclick` half of the
+ * scan's click probe, and it is strictly better than what it replaces: it sees
+ * `addEventListener` handlers, which the JS probe never could, on any commit.
+ * No page JS participates — the enumeration is CDP's, so a page cannot suppress
+ * or forge an entry.
+ *
+ * MEASURED, because the obvious per-node shape of this is a trap: resolving and
+ * querying each candidate individually cost 329ms on a 21ms snapshot (+1547%) on
+ * a 60-card page, and asking from an ISOLATED-world objectId returns `[]` —
+ * listeners are world-scoped too. Whole-subtree `depth:-1` instead costs 0.5ms
+ * on that page and 3.8ms on a pathological one with 3000 listeners.
+ *
+ * Best-effort: an empty set on failure just means the dedup keeps its old
+ * behaviour, never that perception breaks.
+ */
+async function collectClickWiredBackends(
+  cdp: CDPSession,
+  rootBackendNodeId: number | undefined,
+): Promise<Set<number>> {
+  const out = new Set<number>()
+  if (rootBackendNodeId === undefined) return out
+  let objectId: string | undefined
+  try {
+    const resolved = (await cdp.send('DOM.resolveNode', {
+      backendNodeId: rootBackendNodeId,
+    })) as { object?: { objectId?: string } }
+    objectId = resolved.object?.objectId
+    if (objectId === undefined) return out
+    const res = (await cdp.send('DOMDebugger.getEventListeners', {
+      objectId,
+      depth: -1,
+      pierce: true,
+    })) as { listeners?: Array<{ type?: string; backendNodeId?: number }> }
+    for (const l of res.listeners ?? []) {
+      if (l.type === 'click' && typeof l.backendNodeId === 'number') out.add(l.backendNodeId)
+    }
+  } catch {
+    /* best-effort — the dedup falls back to dropping inherited-cursor children */
+  } finally {
+    if (objectId !== undefined) {
+      await cdp.send('Runtime.releaseObject', { objectId }).catch(() => {})
+    }
+  }
+  return out
+}

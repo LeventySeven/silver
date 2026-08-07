@@ -11,19 +11,18 @@ import { sanitizeNamespace, silverHome, setNamespace } from '../../src/core/sess
  *
  * Silver's whole claim is that fabricated data is structurally impossible: the
  * host acts on `@ref` handles minted from what silver actually OBSERVED. That
- * holds only if the observation cannot be authored by the observed. Running the
- * in-page scan in the page's MAIN world broke exactly that — a page that
- * monkey-patches `document.querySelectorAll` (or `Element.prototype.getAttribute`)
- * hands the perception layer a DOM of its choosing. This is an INTEGRITY test;
- * any anti-detection benefit is incidental.
+ * holds only if the observation cannot be authored by the observed. Two ways a
+ * page could author it, both closed here:
+ *   - INTERCEPT the read — monkey-patch `document.querySelectorAll` or
+ *     `Element.prototype.getAttribute` and hand the scan a DOM of its choosing.
+ *     Closed by running the scan in an isolated world.
+ *   - REDIRECT the result — ship a copy of the scan's own idx tag and capture
+ *     another element's record. Closed by a per-walk random tag name.
  *
- * The fixture below has to attack the SCAN, not the tree. Refs themselves come
- * from `Accessibility.getFullAXTree` over CDP, which never runs page JS, so a
- * test on a real `<button>` would pass before the fix and prove nothing — the
- * `<button>` here is the CONTROL that shows the fixture has not simply broken
- * the page. The assertion targets a `cursor:pointer` div, which is ref-eligible
- * ONLY through the SCAN_JS cursor cascade (its AX role is generic and it has no
- * name of its own).
+ * The fixtures have to attack the SCAN, not the tree. Refs themselves come from
+ * `Accessibility.getFullAXTree` over CDP, which never runs page JS, so a test on
+ * a real `<button>` would pass before the fix and prove nothing — the `<button>`
+ * below is the CONTROL that shows the fixture has not simply broken the page.
  */
 
 const SUFFIX = `${process.pid}-${Date.now()}`
@@ -45,12 +44,11 @@ const PATCHED_PAGE = `<!doctype html><html><body>
 </body></html>`
 
 /**
- * An HONEST page that pins the one measured COST of moving to an isolated world.
+ * An HONEST page pinning the one measured COST of the isolated world.
  * `el.onclick` is a PER-WORLD JS binding: a handler assigned from main-world JS
  * reads back `null` from an isolated world (measured on Chromium 1.61 — main
  * `[onclick!==null]=true`, isolated `false`). The `onclick=""` CONTENT attribute
- * is real DOM and survives the boundary via `hasAttribute` (measured: `true` in
- * both worlds), so the common inline case is unaffected.
+ * is real DOM and survives via `hasAttribute` (measured `true` in both worlds).
  */
 const ONCLICK_PAGE = `<!doctype html><html><body>
   <div id="attr" onclick="void 0">Inline Attr Div</div>
@@ -58,11 +56,58 @@ const ONCLICK_PAGE = `<!doctype html><html><body>
   <script>document.getElementById('oc').onclick = function () { return 1 }</script>
 </body></html>`
 
+/**
+ * The shape that made the `el.onclick` loss expensive, and the reason click
+ * wiring is now read from CDP rather than from page JS.
+ *
+ * `cursor` INHERITS, so every row below computes `pointer` from the container
+ * and meets the parent-cursor dedup — which exists to stop every child of a
+ * clickable card minting its own ref. Independent wiring is the only thing that
+ * tells a real row from decoration, so when the scan lost sight of `el.onclick`
+ * the rows collapsed INTO the container: one ref, named with the concatenated
+ * child text, and a click landing on the container's centre. Measured against
+ * base `0f5fe33`: 4 refs became 1.
+ *
+ * `Beta Row` uses `addEventListener`, which the old JS probe never saw on ANY
+ * commit. It is here because the CDP listener registry does see it — this path
+ * is not just restored, it is better than what it replaced.
+ */
+const ROWS_PAGE = `<!doctype html><html><body>
+  <div id="card" style="cursor:pointer">
+    <div id="a">Alpha Row</div>
+    <div id="b">Beta Row</div>
+    <div id="p">Plain Decoration</div>
+  </div>
+  <script>
+    document.getElementById('a').onclick = function () { return 1 }
+    document.getElementById('b').addEventListener('click', function () { return 1 })
+  </script>
+</body></html>`
+
+/**
+ * REDIRECTING the result. The scan tags matched elements and the walk joins
+ * idx -> backendNodeId from the DOM in document order, last write wins — so a
+ * page shipping its own copy of a FIXED tag captured a record. Measured before
+ * the fix, on base and on the first cut of the isolated-world change alike: the
+ * real clickable lost its ref and the decoy was offered in its place.
+ */
+const DECOY_PAGE = `<!doctype html><html><body>
+  <div style="cursor:pointer">Real Clickable</div>
+  <div data-__uab-idx="0" aria-label="DECOY ELEMENT">x</div>
+  <div data-__uab-idx="1" aria-label="DECOY TWO">y</div>
+</body></html>`
+
+const PAGES: Record<string, string> = {
+  '/': PATCHED_PAGE,
+  '/onclick': ONCLICK_PAGE,
+  '/rows': ROWS_PAGE,
+  '/decoy': DECOY_PAGE,
+}
+
 let server: Server
 let base: string
 /** Snapshot ONCE per session: a re-snapshot returns a diff, not the tree. */
-let patchedSnap = ''
-let onclickSnap = ''
+const snaps: Record<string, string> = {}
 
 /** The rendered line carrying `name`, or '' — so a ref can be asserted per line. */
 function lineFor(snap: string, name: string): string {
@@ -73,20 +118,22 @@ describe('perception reads an isolated world the page cannot patch (real Chromiu
   beforeAll(async () => {
     server = createServer((req, res) => {
       res.writeHead(200, { 'content-type': 'text/html' })
-      res.end(req.url === '/onclick' ? ONCLICK_PAGE : PATCHED_PAGE)
+      res.end(PAGES[req.url ?? '/'] ?? PATCHED_PAGE)
     })
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
-    base = `http://localhost:${(server.address() as AddressInfo).port}/`
+    base = `http://localhost:${(server.address() as AddressInfo).port}`
 
-    await run(['open', base, '--session', 'p', '--namespace', NS])
-    const a = await run(['snapshot', '-i', '--session', 'p', '--namespace', NS])
-    expect(a.env.success).toBe(true)
-    patchedSnap = String(a.env.data)
-
-    await run(['open', `${base}onclick`, '--session', 'o', '--namespace', NS])
-    const b = await run(['snapshot', '-i', '--session', 'o', '--namespace', NS])
-    expect(b.env.success).toBe(true)
-    onclickSnap = String(b.env.data)
+    for (const [route, session] of [
+      ['/', 'p'],
+      ['/onclick', 'o'],
+      ['/rows', 'r'],
+      ['/decoy', 'd'],
+    ]) {
+      await run(['open', `${base}${route}`, '--session', session, '--namespace', NS])
+      const res = await run(['snapshot', '-i', '--session', session, '--namespace', NS])
+      expect(res.env.success, `snapshot ${route}`).toBe(true)
+      snaps[route] = String(res.env.data)
+    }
   })
 
   afterAll(async () => {
@@ -101,35 +148,54 @@ describe('perception reads an isolated world the page cannot patch (real Chromiu
   it('CONTROL: the AX-derived button survives — the fixture did not break the page', () => {
     // Refs come from CDP's AX tree, which runs no page JS. If this fails, the
     // fixture broke the page itself and the real assertion below means nothing.
-    expect(patchedSnap).toContain('Genuine Button')
+    expect(snaps['/']).toContain('Genuine Button')
   })
 
   it('still sees a cursor:pointer div on a page that lies to main-world DOM reads', () => {
     // The enrichment SCAN_JS alone provides. With the scan in the main world the
     // patched `querySelectorAll` returns [], the cursor cascade records nothing,
     // and this clickable div silently stops being offered to the host.
-    expect(patchedSnap).toContain('Order Now Please')
-    expect(lineFor(patchedSnap, 'Order Now Please')).toMatch(/ref=e\d+/)
+    expect(snaps['/']).toContain('Order Now Please')
+    expect(lineFor(snaps['/'], 'Order Now Please')).toMatch(/ref=e\d+/)
   })
 
   it('keeps the inline onclick="" attribute signal — it is real DOM, not a JS binding', () => {
-    expect(lineFor(onclickSnap, 'Inline Attr Div')).toMatch(/ref=e\d+/)
+    expect(lineFor(snaps['/onclick'], 'Inline Attr Div')).toMatch(/ref=e\d+/)
   })
 
-  it('DOCUMENTED COST: a JS-assigned el.onclick is invisible from the isolated world', () => {
-    // Deliberate, measured trade. `el.onclick` is per-world, so a handler set by
-    // main-world JS cannot be seen from the isolated world. Recovering it would
-    // mean a SECOND full main-world walk — double the per-snapshot scan cost, run
-    // in the very world we stopped trusting, and a page that lies about
-    // `querySelectorAll` would simply return [] there too. So it buys nothing
-    // against the attack and only helps benign pages, in a narrow case:
-    // `addEventListener` handlers were ALREADY invisible to this probe, inline
-    // `onclick=""` still works (test above), and a real <a>/<button> is
-    // ref-eligible from the AX tree regardless. What is left is a legacy
-    // JS-assigned handler on an element with no pointer cursor, no tabindex and
-    // no contenteditable — i.e. one that does not look clickable to a human
-    // either. If that signal is ever recovered world-independently, DELETE this
-    // test rather than weakening it.
-    expect(onclickSnap).not.toContain('Legacy Handler Div')
+  it('keeps per-row refs inside a cursor:pointer card (JS onclick AND addEventListener)', () => {
+    // The regression this file exists to prevent: rows wired independently must
+    // stay individually addressable, or the host gets one ref named with the
+    // concatenated child text and clicks the container's centre instead.
+    expect(lineFor(snaps['/rows'], 'Alpha Row')).toMatch(/ref=e\d+/)
+    expect(lineFor(snaps['/rows'], 'Beta Row')).toMatch(/ref=e\d+/)
+    // Decoration inheriting the same cursor must NOT get its own ref — the
+    // dedup still has to earn its keep, or every card floods the tree. Matched
+    // on the QUOTED whole name: the container's own name is the concatenated
+    // child text, so a substring test would find "Plain Decoration" inside it.
+    expect(snaps['/rows']).not.toContain('"Plain Decoration"')
+    // Exactly three: the card, and the two wired rows. Nothing else.
+    expect(snaps['/rows'].match(/ref=e\d+/g) ?? []).toHaveLength(3)
+  })
+
+  it('a page-authored scan tag cannot capture a real element ref', () => {
+    // REDIRECTING the read: the decoys ship the old fixed tag name.
+    expect(lineFor(snaps['/decoy'], 'Real Clickable')).toMatch(/ref=e\d+/)
+    expect(snaps['/decoy']).not.toContain('DECOY ELEMENT')
+    expect(snaps['/decoy']).not.toContain('DECOY TWO')
+  })
+
+  it('DOCUMENTED COST: an element wired ONLY by a JS onclick, with no other signal', () => {
+    // Deliberate, measured, and narrow. `el.onclick` is per-world, so a handler
+    // set by main-world JS is invisible to the isolated scan. Everything that
+    // LOOKS clickable is still caught: inline `onclick=""` (real DOM), a pointer
+    // cursor, tabindex, contenteditable, a real <a>/<button> from the AX tree,
+    // and — via the CDP listener registry — any element the dedup would drop.
+    // What is left is an element with a JS-assigned handler and NO other signal
+    // at all, which looks unclickable to a human too. Catching it would mean
+    // tagging every element on the page so the walk could re-decide, which is
+    // not worth it for that case. If it is ever recovered, DELETE this test
+    // rather than weakening it.
+    expect(snaps['/onclick']).not.toContain('Legacy Handler Div')
   })
 })
