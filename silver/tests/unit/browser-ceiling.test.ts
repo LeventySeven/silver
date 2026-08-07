@@ -182,6 +182,32 @@ describe('enforceBrowserCeiling', () => {
     expect(isPidAlive(ext.pid!)).toBe(true)
   })
 
+  it('never stops a HEADED browser — a human is watching that window', async () => {
+    // The seam this pins: three mechanisms on this branch decide whether they may
+    // touch a session, and only this one is IRREVERSIBLE. `parkPages` refuses to
+    // freeze a headed session and `shouldEmulateViewport` refuses to resize one,
+    // both on the ground that a human asked to watch it — while the ceiling, which
+    // SIGTERMs the process, would happily make the window vanish off their screen.
+    // `open --headed <url> --session watch` is by construction the most IDLE
+    // session on the machine (nobody is issuing commands against a window they are
+    // reading), so LRU reaches it FIRST: the exact session a human is looking at is
+    // the exact one the cap picks. Hence the headed session here is deliberately
+    // the most-idle candidate — the eviction must land on the headless one instead.
+    process.env.SILVER_MAX_BROWSERS = '1'
+    const watched = spawnVictim()
+    const spare = spawnVictim()
+    const watchedName = uniq('headed')
+    const spareName = uniq('spare')
+    await seed(watchedName, { pid: watched.pid!, headed: true, lastUsedAt: ago(60_000) })
+    await seed(spareName, { pid: spare.pid!, lastUsedAt: ago(30_000) })
+
+    // cap 1 with two live browsers ⇒ over = 2, so both are in scope by the numbers:
+    // only the headed exclusion keeps the watched window alive.
+    expect(await enforceBrowserCeiling()).toEqual([spareName])
+    expect(await waitDead(spare.pid!)).toBe(true)
+    expect(isPidAlive(watched.pid!)).toBe(true)
+  })
+
   it('never stops a session a live command is holding', async () => {
     process.env.SILVER_MAX_BROWSERS = '1'
     const busy = spawnVictim()

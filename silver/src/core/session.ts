@@ -1682,12 +1682,13 @@ export function takeEvictionNotice(): string[] {
  * (`reapIdleSessions` deletes the dir — correct for a session nobody has
  * touched in an hour, far too destructive for one being pushed out by load.)
  *
- * NEVER stops: an external (`connect`ed) browser we do not own, a session whose
- * lockfile shows a LIVE holder (a command is mid-flight — see `isSessionBusy`),
- * or `exclude` (the caller's own session, mid-open). If everything over the cap
- * is busy, nothing is stopped and the spawn proceeds: a real command in flight
- * outranks a memory target. Returns the stopped sessions, namespace-qualified —
- * only the ones OBSERVED to have exited, never the ones merely signalled.
+ * NEVER stops: an external (`connect`ed) browser we do not own, a HEADED session
+ * a human is watching (see the filter below), a session whose lockfile shows a
+ * LIVE holder (a command is mid-flight — see `isSessionBusy`), or `exclude` (the
+ * caller's own session, mid-open). If everything over the cap is busy, nothing is
+ * stopped and the spawn proceeds: a real command in flight outranks a memory
+ * target. Returns the stopped sessions, namespace-qualified — only the ones
+ * OBSERVED to have exited, never the ones merely signalled.
  */
 export async function enforceBrowserCeiling(exclude?: string): Promise<string[]> {
   const cap = resolveMaxBrowsers()
@@ -1702,7 +1703,24 @@ export async function enforceBrowserCeiling(exclude?: string): Promise<string[]>
     } catch {
       continue // no/corrupt sidecar — `session gc`'s problem, not the ceiling's
     }
-    if (info.external || !isPidAlive(info.pid)) continue
+    // `headed` sits beside `external` because the other two mechanisms on this
+    // path already refuse it, and this is the one that cannot be undone.
+    // `parkPages` will not FREEZE a headed session and `shouldEmulateViewport`
+    // will not RESIZE one, both on the ground that a human asked to watch that
+    // window — so the ceiling, which SIGTERMs the process, must not be the single
+    // mechanism that reaches into it. Worse than inconsistent: a watched window is
+    // by construction the most IDLE session on the machine (nobody issues commands
+    // against a page they are reading), so LRU picked it FIRST and the user's
+    // visible browser vanished mid-look, with only the page's in-memory state lost
+    // — a `park` you cannot see through and a `close` nobody asked for.
+    //
+    // The cost is real and accepted: a fleet that leaves headed sessions open can
+    // hold the machine above the cap, because the ceiling has nothing left it may
+    // stop. That is the same trade `isSessionBusy` already makes (a real command
+    // in flight outranks a memory target) — a headed window is a HUMAN in flight,
+    // and the honest response to "everything is off-limits" is to leave the cap
+    // unmet rather than to kill the one thing someone is looking at.
+    if (info.external || info.headed || !isPidAlive(info.pid)) continue
     live.push({ key: s.key, dir: s.dir, pid: info.pid, idle: idleMsOf(info) })
   }
   // The caller is about to spawn one more, so the budget for everyone else is
