@@ -991,8 +991,14 @@ async function focusedElementName(page: Page): Promise<string> {
  * never more urgent than what the verb itself found (a CAPTCHA, an auth wall).
  * `handleOpen` still takes the eviction notice into its `evicted` data key
  * before returning, so `open` keeps its shape and cannot double-report.
+ *
+ * Exported for cli.ts, which has to run it over the envelope `mapThrow` builds:
+ * a verb that THROWS never reaches `handle`'s return, so that envelope is the one
+ * place a pending notice used to die. Both `take*` calls CLEAR, so exactly one of
+ * the two call sites can ever see a given notice — the return path and the throw
+ * path are mutually exclusive for one command, and neither can report it twice.
  */
-function withSessionNotices<T>(env: Envelope<T>): Envelope<T> {
+export function withSessionNotices<T>(env: Envelope<T>): Envelope<T> {
   try {
     const restarted = takeRestartNotice()
     const evicted = takeEvictionNotice()
@@ -1028,17 +1034,28 @@ function withSessionNotices<T>(env: Envelope<T>): Envelope<T> {
  * the annotation cannot be forgotten by a future verb — every `return` in the
  * switch passes through here.
  *
+ * Covers the RETURN path only — a verb that throws never gets here. cli.ts runs
+ * the same wrapper over `mapThrow`'s envelope for that case, which is where an
+ * eviction is most likely to matter: the command that stopped another session's
+ * browser is the same command that then had nowhere to report it.
+ *
  * NOT covered, deliberately, and the two are not uncovered the same way. The
  * `dispatchLayer` verbs in cli.ts (`task`/`memory`/`subagent`) never reach this
  * function at all, so a notice they leave pending is still here for whatever
- * command runs next. `batch` is worse: each sub-command re-enters `run()`
+ * command runs next (unless one of them throws — cli.ts's catch folds it then).
+ * `batch` is worse: each sub-command re-enters `run()`
  * (`handleBatch` → cli.ts → `handle`), so it DOES pass through this wrapper —
  * the notice is taken, folded into the sub-envelope's `warning`, and then thrown
  * away by `handleBatch`'s `{command, success, error, data}` projection, which has
  * no `warning` field. Inside a batch the notice is therefore DESTROYED, not
  * merely uncovered: it cannot be recovered on the outer envelope either, because
  * by then it has already been consumed. Propagating it means widening that
- * projection, which is out of scope here.
+ * projection, which is out of scope here. That now holds for a sub-command that
+ * THROWS as well — before cli.ts annotated its catch, such a notice happened to
+ * survive to the outer batch envelope, but only for the arbitrary subset of
+ * sub-commands that throw, and it arrived attributed to the batch as a whole
+ * rather than to the sub-command that caused it. Uniformly destroyed is the
+ * honest description of batch today; widening the projection is what fixes it.
  */
 export async function handle(flags: ParsedFlags): Promise<Envelope<unknown>> {
   const env = await dispatch(flags)

@@ -5,6 +5,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import * as path from 'node:path'
 import type { AddressInfo } from 'node:net'
 import { parseFlags } from '../../src/core/flags.js'
+import { run } from '../../src/cli.js'
 import { handle, noteSessionRestarted, takeRestartNotice } from '../../src/core/handlers.js'
 import {
   closeSession,
@@ -169,5 +170,52 @@ describe('a lost browser and an eviction reach EVERY verb, not just `open`', () 
     const env = await handle(parseFlags(['version']))
     expect(env.success).toBe(true)
     expect(env.warning).toBeUndefined()
+  })
+})
+
+/**
+ * A verb that THROWS builds its envelope somewhere else entirely.
+ *
+ * `handle` folds the notices on its way out (see `withSessionNotices`), so every
+ * verb that RETURNS is covered. A verb that throws never reaches that line: the
+ * envelope is built by `mapThrow` up in cli.ts, and the module-global notice was
+ * simply discarded — which is the one case where an eviction is most likely,
+ * because the command that evicted a browser is the same command that then had
+ * nowhere to put the failure.
+ */
+describe('the notice reaches the envelope on the THROW path too', () => {
+  /** A port nothing is listening on — bound to learn its number, then released. */
+  async function deadPort(): Promise<number> {
+    const s = createServer(() => {})
+    await new Promise<void>((r) => s.listen(0, '127.0.0.1', () => r()))
+    const port = (s.address() as AddressInfo).port
+    await new Promise<void>((r) => s.close(() => r()))
+    return port
+  }
+
+  it('names the browser it stopped on a command that then failed to navigate', async () => {
+    const name = uniq('throws')
+    // Another live session for the ceiling to evict, and a cap that leaves this
+    // `open` no room — the eviction happens INSIDE openSession, before the goto.
+    const bystander = uniq('bystander')
+    const victim = spawnVictim()
+    await seed(bystander, victim.pid!)
+    process.env.SILVER_MAX_BROWSERS = '1'
+
+    // `openSession` succeeds (and evicts); `page.goto` then cannot reach the
+    // target and the engine error propagates as a THROW — `handle` never returns,
+    // so cli.ts's catch is what has to carry the notice.
+    const { env } = await run(['open', `http://localhost:${await deadPort()}/`, '--session', name])
+    expect(env.success).toBe(false)
+    // The host is told the navigation failed...
+    expect(env.error ?? '').toContain('navigation could not reach the target')
+    // ...and, on the SAME envelope, that another session's browser was SIGTERMed
+    // on the way. Without this a host sees only `navigation_failed` and never
+    // learns why an unrelated session is about to come back on about:blank.
+    expect(env.warning ?? '').toContain(bystander)
+    expect(await waitDead(victim.pid!)).toBe(true)
+    // Read-once, so the failing command consumed it: nothing is left to bleed
+    // onto whatever the host runs next.
+    expect(takeEvictionNotice()).toEqual([])
   })
 })
