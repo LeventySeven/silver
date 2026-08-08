@@ -52,6 +52,10 @@ export type ParsedFlags = {
   /** `doctor --trifecta`: emit the keyless lethal-trifecta self-report (which of
    * actor / exfil / secret legs are armed this invocation) instead of health checks. */
   trifecta?: boolean
+  /** `doctor --fingerprint`: emit the offline identity-coherence panel (does the
+   * live browser contradict itself?) instead of health checks. Reads a live
+   * session over CDP; no network, no scanner site, no model. */
+  fingerprint?: boolean
   /** Opt in to registering an UNSCOPED (`*`-domain) secret. Off by default
    * (fail-closed): an unscoped `--secret` is blocked from resolving unless set. */
   allowUnscopedSecrets?: boolean
@@ -363,6 +367,8 @@ const BOOL_FLAGS: Record<string, keyof ParsedFlags> = {
   'no-config': 'noConfig',
   // `doctor --trifecta`: the keyless lethal-trifecta self-report (actor/exfil/secret).
   trifecta: 'trifecta',
+  // `doctor --fingerprint`: the keyless offline identity-coherence panel.
+  fingerprint: 'fingerprint',
   // Fail-closed secrets: opt IN to registering an UNSCOPED (`*`) secret (one that
   // would resolve on ANY host). Without it, an unscoped `--secret` never resolves.
   'allow-unscoped-secrets': 'allowUnscopedSecrets',

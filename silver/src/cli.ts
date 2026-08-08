@@ -29,7 +29,7 @@ import { loadConfig, mergeConfig } from './core/config.js'
 import { suggestVerb, sanitizeToken } from './core/suggest.js'
 import { buildRegistry } from './security/registry.js'
 import { buildSecretRegistry } from './security/secret.js'
-import { handle, setProcessSecrets } from './core/handlers.js'
+import { handle, setProcessSecrets, withSessionNotices } from './core/handlers.js'
 import { setNamespace, setFetchEgressPolicy } from './core/session.js'
 import { setStateEncryption } from './core/state-crypto.js'
 // Task-artifact / memory / subagent layers — dispatched here (NOT in
@@ -201,7 +201,26 @@ export async function run(argv: string[]): Promise<RunResult> {
     const env = LAYER_VERBS.has(flags.verb) ? await dispatchLayer(flags) : await handle(flags)
     return { env: withConfigWarning(env), code: env.success ? 0 : 1, json }
   } catch (err) {
-    return { env: withConfigWarning(mapThrow(err)), code: 1, json }
+    // A thrown verb gets the SAME session annotation a returned one does.
+    //
+    // `handle` folds the pending eviction/respawn notice on its way out, so every
+    // verb that RETURNS is covered — and a verb that throws was covered by
+    // nothing, because this envelope is built here rather than there. That is the
+    // case where it matters most: the ceiling fires inside `openSession`, which
+    // runs BEFORE the navigation, so `silver open` past the cap can SIGTERM
+    // another session's browser and then exhaust `page.goto`'s retries. The host
+    // saw `navigation_failed` and was never told a bystander session had just
+    // been stopped and would come back on about:blank. That defeats both the
+    // notice's premise ("surface eviction and respawn on EVERY verb's envelope")
+    // and the ceiling's ("a cap that silently drops work is worse than no cap").
+    //
+    // Cannot double-report: both `take*` reads CLEAR the module-global slot, and
+    // for one command exactly one of the two paths runs — if `handle` returned,
+    // it already consumed the notice and there is nothing left here.
+    //
+    // Same ORDER as the success path (notices folded first, config warning
+    // prepended after) so a failing envelope reads like a succeeding one.
+    return { env: withConfigWarning(withSessionNotices(mapThrow(err))), code: 1, json }
   }
 }
 

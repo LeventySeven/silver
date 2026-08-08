@@ -131,6 +131,32 @@ describe('reapIdleSessions', () => {
     expect(isPidAlive(victim.pid!)).toBe(true)
   })
 
+  it('never reaps a HEADED session — and its PROFILE survives, not just the pid', async () => {
+    // The most destructive of the four hands-off sites (see `isHandsOffSession`),
+    // and the one where the exclusion is least obvious, because a TTL sounds like
+    // fair evidence of abandonment. It is not, for a headed session: `idleMsOf`
+    // reads `lastUsedAt`, which only `connect()` stamps — so it measures how long
+    // since an AGENT drove the session, and a headed session exists precisely so a
+    // PERSON can use the window directly, which never touches that clock. A human
+    // reading a page past the TTL therefore looks exactly like an abandoned one.
+    //
+    // What the reaper would have done to them is the other half: unlike the
+    // ceiling it SIGTERMs the browser AND deletes the dir, so they lose the window
+    // AND the logged-in profile — to an ambient sweep from an unrelated agent's
+    // command in an unrelated namespace.
+    const name = uniq('headed')
+    const victim = spawnVictim()
+    await seed(name, { pid: victim.pid!, headed: true, lastUsedAt: ago(BRIEF_IDLE_MS) })
+
+    const res = await reapIdleSessions(TINY_TTL_MS)
+
+    expect(res.reaped).not.toContain(name)
+    expect(isPidAlive(victim.pid!)).toBe(true)
+    // The assertion the `external` test above does NOT make, and the one that
+    // separates this from the ceiling: the profile is still on disk.
+    expect(await fs.stat(sessionDir(name)).then(() => true).catch(() => false)).toBe(true)
+  })
+
   it('skips sessions whose process is already dead (that is plain gc’s job)', async () => {
     const name = uniq('dead')
     await seed(name, { pid: 0x7ffffff0, lastUsedAt: ago(48 * 60 * 60 * 1000) })

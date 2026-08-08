@@ -115,6 +115,14 @@ describe('adopt-list-v2 (F2 doctor · G5 skill · B1 coord · E4 download)', () 
     // The new K4 checks are present.
     expect(by('session_locks')).toBeDefined()
     expect(by('cdp_reachable')).toBeDefined()
+    // Build freshness: the tests run from src, so this is a linked checkout and
+    // the check must have an opinion (pass or warn) rather than skip. It exists
+    // because a `dist/` built once at link time and never rebuilt silently ran a
+    // CLI three days behind its own source — reaper and all.
+    const fresh = by('build_fresh')
+    expect(fresh).toBeDefined()
+    expect(['pass', 'warn']).toContain(fresh?.status)
+    if (fresh?.status === 'warn') expect(fresh.fix).toBe('npm run build')
     // The REAL launch probe ran (a status, not just existsSync). On an unloaded box
     // it passes; under peak parallel test load a fresh full-Chromium launch can lose
     // the resource race, in which case a remediation command is attached.

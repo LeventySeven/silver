@@ -147,6 +147,34 @@ export type OpenOptions = {
    * applied at launch. Unauthenticated proxies only. */
   proxy?: string
   /**
+   * Detection coherence: the browser's content locale, applied at LAUNCH as
+   * Chromium's own `--lang` + `--accept-lang` instead of over CDP.
+   *
+   * `set locale` / `set timezone` reach for `Emulation.setLocaleOverride` /
+   * `setTimezoneOverride`, which patch a renderer that is already running. That is
+   * the layer a detector probes: the override itself is observable, and anything
+   * read before it lands (the first request's `Accept-Language`, a value cached at
+   * startup) still carries the OLD identity, so the two disagree. A launch flag is
+   * read before the first frame exists, so there is no earlier value to contradict.
+   *
+   * Cost, and it is a real one: launch-time means FRESH SESSION ONLY — exactly the
+   * constraint `proxy` above accepts. A session that is already open cannot adopt
+   * this, which is precisely why the CDP verbs stay as the mid-session fallback
+   * rather than being replaced by it.
+   *
+   * Silver never DERIVES this from a proxy, an IP, or a geo database: a guess that
+   * disagrees with the exit node is a louder tell than saying nothing. Operator-
+   * supplied or absent.
+   */
+  locale?: string
+  /**
+   * IANA timezone (`Europe/Berlin`), applied at LAUNCH as the child's `TZ` env var.
+   * Same mechanism, same trade-off, same fresh-session-only constraint as `locale`
+   * above — ICU and libc read `TZ` at process start, so `Date` and `Intl` agree
+   * from the first evaluation instead of being corrected by a CDP call later.
+   */
+  timezone?: string
+  /**
    * CloakHQ alignment (opt-in binary swap): an operator-supplied path to a
    * DIFFERENT Chromium executable to spawn instead of Playwright's bundled one —
    * e.g. a source-level stealth build (cloakbrowser.dev) whose C++ fingerprint
@@ -457,6 +485,12 @@ export type Connection = {
   browser: Browser
   context: BrowserContext
   page: Page
+  /**
+   * The sidecar `connect()` read to reach this browser. Carried so a caller can
+   * decide how to LEAVE the session (see `parkPages`) without paying a second
+   * sidecar read on the hot path of every command.
+   */
+  info: SessionInfo
 }
 
 const SIDECAR = 'session.json'
@@ -468,7 +502,86 @@ const READY_BUDGET_MS = 8_000
  * and concurrent eval runs reproducible instead of inheriting a version-dependent
  * headless default. Applied both as a launch arg and (best-effort) per connect.
  */
-const VIEWPORT = { width: 1280, height: 900 } as const
+export const VIEWPORT = { width: 1280, height: 900 } as const
+
+/**
+ * Is this a session silver may NOT disturb on its own initiative?
+ *
+ * The one invariant behind four separate mechanisms, stated here once so it stops
+ * being re-derived (and re-forgotten) per site. Two grounds, and they are
+ * genuinely different reasons that happen to produce the same answer:
+ *
+ *   - `external` — a `connect`ed browser is the USER'S PROCESS. We did not launch
+ *     it, we do not own its lifetime, and their own tabs are in it.
+ *   - `headed` — we launched it, but somebody ASKED FOR A WINDOW. The only reason
+ *     to pay for a visible window is that a human intends to look at it.
+ *
+ * What "disturb" covers, in escalating order — every one of these is a mechanism
+ * that used to decide this for itself:
+ *   `shouldEmulateViewport`  would RESIZE it  (and the resize outlives us: see below)
+ *   `parkPages`              would FREEZE it
+ *   `enforceBrowserCeiling`  would SIGTERM it
+ *   `reapIdleSessions`       would SIGTERM it AND `rm -rf` its profile
+ *
+ * A mechanism may still act on such a session when the OPERATOR asked for it by
+ * name — `set viewport`, `close`, an explicit `session gc` are all instructions,
+ * not initiatives. This predicate governs what silver does UNASKED: on a timer, on
+ * a memory threshold, on the way out of an unrelated command.
+ *
+ * The costs are real and accepted at each site; each states its own. What is not
+ * acceptable is a fifth mechanism quietly deciding differently, which is exactly
+ * how the ceiling came to be the only one of the four that would kill a window a
+ * human was reading.
+ *
+ * Takes the sidecar fields rather than a whole `SessionInfo` so every call site
+ * (including `tab new` in handlers.ts) can pass what it already holds.
+ */
+export function isHandsOffSession(info: Pick<SessionInfo, 'headed' | 'external'>): boolean {
+  return info.headed === true || info.external === true
+}
+
+/**
+ * May we override this session's CONTENT size to `VIEWPORT`?
+ *
+ * The launch arg `--window-size=1280,900` sizes the WINDOW; `setViewportSize`
+ * sizes the CONTENT box. Headless those two are legitimately identical — there is
+ * no tab strip and no omnibox to subtract — so forcing 1280×900 content into a
+ * 1280×900 window states something true, and we keep it for the determinism it
+ * buys (reproducible screenshots, stable scroll math across Chromium versions).
+ *
+ * HEADED, forcing it states something impossible. A real Chrome window spends
+ * ~80-140px on browser chrome, so `outerHeight` is always strictly greater than
+ * `innerHeight`; overriding the content box to the window's own height reports
+ * `outerHeight === innerHeight`, i.e. a window with no chrome at all. That
+ * combination is one of the cheapest automation signals there is — FingerprintJS
+ * reads it as a VM. Measured on macOS it came out worse than that: the WM clamped
+ * the window to 859px tall to fit the menu bar while the forced viewport stayed
+ * 900, so the page reported a 900px content box inside an 859px window — a
+ * viewport larger than the window containing it, which no browser can produce.
+ * Gated, the same session reads outer 859 / inner 716 — 143px of real chrome.
+ *
+ * Silver's stance is authenticity, not deception: rather than
+ * spoof the numbers we simply stop emitting a false one and let the real window
+ * answer. The cost is real and accepted: a headed session's viewport is whatever
+ * the window manager gave it, so headed screenshots are not pixel-comparable to
+ * headless ones. Determinism is worth less than not being obviously fake, and a
+ * host that needs an exact size can still ask for one with `set viewport w h`.
+ *
+ * EXTERNAL is not about tells at all — see `isHandsOffSession`, which is where
+ * both grounds now live. Worth spelling out what the resize actually IS, because
+ * it is the reason this is not merely cosmetic: `page.setViewportSize` is not
+ * only an Emulation override. Playwright 1.61 (`_updateViewport`) also sends
+ * `Browser.setWindowBounds` whenever the target has a UI window, and window
+ * bounds are a real window-manager change that does NOT revert when the CDP
+ * transport drops. So on a headed or `connect`ed session this call physically
+ * resizes a window on someone's screen, permanently.
+ *
+ * Takes the sidecar fields rather than a whole `SessionInfo` so both call sites
+ * (here and `tab new` in handlers.ts) can pass what they already hold.
+ */
+export function shouldEmulateViewport(info: Pick<SessionInfo, 'headed' | 'external'>): boolean {
+  return !isHandsOffSession(info)
+}
 
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
@@ -773,6 +886,12 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
   // one idle-TTL's worth of sessions, instead of growing without bound until the
   // machine runs out of RAM. Excludes the session being opened, never throws.
   await reapIdleSessions(resolveIdleTtlMs(opts.idleTimeoutMs), name).catch(() => {})
+  // Then the hard bound. The idle sweep above only returns browsers nobody has
+  // touched for a TTL; this one bounds the count of browsers running RIGHT NOW,
+  // which is the number the machine actually feels. Stopped sessions are noted
+  // for the `open` envelope rather than dropped silently.
+  const stopped = await enforceBrowserCeiling(name).catch(() => [] as string[])
+  if (stopped.length > 0) evictionNotice = stopped
   const dir = sessionDir(name)
   // E2 real-Chrome-profile: `profile` (an EXISTING user-data-dir) wins over an
   // explicit userDataDir override, which wins over the throwaway per-session dir.
@@ -881,11 +1000,46 @@ export async function openSession(name: string, opts: OpenOptions = {}): Promise
     // page-derived, so it is safe to pass verbatim; the egress guard still governs
     // which hosts navigation may reach (the proxy is transport, not a policy bypass).
     ...(opts.proxy ? [`--proxy-server=${opts.proxy}`] : []),
+    // Detection coherence: the locale is set HERE, below CDP. `set locale` uses
+    // Emulation.setLocaleOverride, which corrects a renderer that already booted
+    // with another language — the correction is observable, and whatever was read
+    // before it (the first request's Accept-Language) still carries the old value,
+    // so a detector comparing the header against navigator.language finds a seam.
+    // These are stock switches read at startup, so there is no earlier value to
+    // contradict. Like --proxy above, this binds a FRESH session only; the CDP verb
+    // remains for a session already running. Operator-supplied argv passed verbatim
+    // — spawn takes an ARRAY, so there is no shell to escape for and nothing here
+    // can split into a second argument. Empty string is treated as absent (same
+    // truthiness gate --proxy uses): `--lang=` is worse than no flag at all.
+    //
+    // BOTH switches, because they are not redundant and neither alone is enough.
+    // MEASURED on macOS against this spawn path: `--lang` alone moves NOTHING —
+    // navigator.language, navigator.languages and Accept-Language all stay en-US,
+    // because Chromium takes its app locale from the OS there and ignores the
+    // switch. `--accept-lang` is what actually lands: header `de-DE,de;q=0.9`,
+    // navigator.language `de-DE`. `--lang` is kept because it IS the switch that
+    // carries the app/ICU locale on Linux and Windows, where silver mostly runs
+    // headless — dropping it would fix macOS by breaking the common case.
+    //
+    // Known residual, and it is honest rather than incoherent: on macOS
+    // `Intl.DateTimeFormat().resolvedOptions().locale` still reports the OS's
+    // en-US. That is a configuration a real person has — a German speaker on an
+    // English-language Mac — not an impossible one, so it is left alone. Forcing it
+    // would mean an Emulation override, i.e. the exact runtime patch this avoids.
+    ...(opts.locale ? [`--lang=${opts.locale}`, `--accept-lang=${opts.locale}`] : []),
     'about:blank',
   ]
 
   const child = spawn(execPath, args, {
     detached: true,
+    // The other half of the launch-layer identity (see --lang above): ICU and libc
+    // read TZ at process start, so Date/Intl in every renderer are born in the
+    // right zone rather than being moved there by Emulation.setTimezoneOverride.
+    // `env` REPLACES the child's environment instead of extending it, so ours has
+    // to be spread back in — a browser launched without PATH/HOME fails in ways
+    // nobody would trace to a timezone. Only passed when a timezone was asked for,
+    // so the default stays plain inheritance rather than a snapshot of process.env.
+    ...(opts.timezone ? { env: { ...process.env, TZ: opts.timezone } } : {}),
     // fds 3/4 carry `--remote-debugging-pipe` when the lifeline is on. Chromium
     // requires BOTH to be real pipes: pointing fd 4 at /dev/null instead makes
     // the browser exit the moment this CLI does (measured on Chrome 149).
@@ -1421,8 +1575,10 @@ async function isSessionBusy(dir: string): Promise<boolean> {
  * boundary over each other's OS processes, and treating them as one is what let
  * the machine fill up.
  *
- * NEVER reaps: external (`connect`ed) sessions — we do not own that process — a
- * session whose lockfile shows a LIVE holder (a command is mid-flight), the
+ * NEVER reaps: a hands-off session (see `isHandsOffSession` — an `external`
+ * browser whose process we do not own, or a `headed` one someone is watching; the
+ * filter below states why a TTL is not evidence of abandonment for the second),
+ * a session whose lockfile shows a LIVE holder (a command is mid-flight), the
  * caller's own session (`exclude`, matched within the caller's namespace only),
  * or anything when `ttlMs <= 0`. Entirely best-effort: a failure to reap one
  * session must not fail the command that opportunistically triggered the sweep.
@@ -1451,8 +1607,36 @@ export async function reapIdleSessions(
     } catch {
       continue // no/corrupt sidecar — that is plain `session gc`'s job, not ours
     }
-    // We only reap browsers we own and that are still running.
-    if (info.external || !isPidAlive(info.pid)) continue
+    // We only reap browsers we own, that are still running, and that nobody is
+    // watching. See `isHandsOffSession` for the shared invariant; this is the most
+    // destructive of the four sites, so the site-specific part is worth stating.
+    //
+    // Two things make the `headed` exclusion necessary here even though a TTL
+    // sounds like fair evidence of abandonment:
+    //
+    // 1. THE CLOCK CANNOT SEE THE HUMAN. `idleMsOf` reads `lastUsedAt`, which only
+    //    `connect()` ever stamps — i.e. it measures how long since an AGENT drove
+    //    this session. A headed session exists precisely so a PERSON can use the
+    //    window directly, and that never touches the clock. So "idle 30 minutes"
+    //    is not evidence a headed session was abandoned; it is the normal reading
+    //    for one someone is reading. The reaper's signal is simply blind here.
+    // 2. THE ACTION IS THE WORST ONE WE HAVE. Unlike the ceiling, this SIGTERMs
+    //    the browser AND `rm -rf`s the session dir below — profile, cookies,
+    //    logins — and it fires AMBIENTLY, from any unrelated agent's command in
+    //    any namespace (`maybeSweepIdleSessions`). A human reading a page for
+    //    longer than the TTL lost the window and the login, to a command they had
+    //    no part in.
+    //
+    // This does NOT make a headed session immortal, which is the objection that
+    // would otherwise argue the line back out. The lifeline holder still ends the
+    // browser at its deadline, independently of this sweep — measured with a 6s
+    // TTL and NO silver command run at all (so no sweep could fire): all 10
+    // Chromium processes gone in 10s, session dir intact. Memory is bounded by the
+    // lifeline; what this exclusion preserves is the PROFILE. And it leaks no
+    // disk either: the line below already skips any session whose pid is dead, so
+    // reclaiming a dead session's dir was always `session gc`'s job, never this
+    // one's.
+    if (isHandsOffSession(info) || !isPidAlive(info.pid)) continue
     // The session's OWN TTL wins over the sweeping process's — but only for an
     // AMBIENT sweep. The sweep is global, so without this the shortest TTL anywhere
     // on the machine would govern every namespace, and a session opened with
@@ -1487,6 +1671,173 @@ export async function reapIdleSessions(
     reaped.push(s.key)
   }
   return { reaped, keptAlive }
+}
+
+// ---------------------------------------------------------------------------
+// Browser ceiling — the hard bound on how much of the machine silver may hold.
+//
+// The idle reaper bounds how LONG an abandoned browser lives (one TTL). Nothing
+// bounded how MANY run at once, and a session is a whole Chromium: measured on
+// this machine, one session parked on an animating page costs ~10 OS processes
+// and ~1.17 GB RSS. Three of them is 3.5 GB; a day's fleet is the machine. The
+// same three pages as three TABS of ONE session: 12 processes, 1.39 GB — which
+// is why the parallel guidance now leads with tabs, and why this ceiling exists
+// for the case where an agent opens sessions anyway.
+// ---------------------------------------------------------------------------
+
+/**
+ * Default number of silver-owned browsers allowed to run at once, machine-wide.
+ *
+ * Three, because that is the point where the shape stops being free on a laptop:
+ * ~3.5 GB of the 18 GB this was measured on, and the fourth is the one that
+ * starts swapping under an editor and a dev server. It is a CEILING, not a
+ * quota — a fleet still gets its parallelism, it just gets it as tabs (which
+ * cost ~100 MB each) instead of as browsers.
+ */
+export const DEFAULT_MAX_BROWSERS = 3
+
+/** Resolve the ceiling: `SILVER_MAX_BROWSERS` → default. `0` disables it. */
+export function resolveMaxBrowsers(): number {
+  const raw = process.env.SILVER_MAX_BROWSERS
+  if (raw !== undefined) {
+    const n = Number(raw)
+    if (Number.isFinite(n) && n >= 0) return Math.floor(n)
+  }
+  return DEFAULT_MAX_BROWSERS
+}
+
+/**
+ * The sessions the last `enforceBrowserCeiling` stopped, waiting to be reported.
+ *
+ * A cap that silently drops work is worse than no cap — the whole complaint
+ * this feature answers is "silver eats my machine and I cannot see why". The
+ * notice is read once by the `open` handler and cleared, so it lands on the
+ * envelope of the command that caused the eviction and never on a later one.
+ */
+let evictionNotice: string[] = []
+
+/**
+ * How long the ceiling waits for the browsers it SIGTERMed to actually exit, and
+ * how often it looks. Short on purpose: this sits on the `open` path, so the
+ * budget is the delay a user pays when a browser will not die. It is paid ONCE
+ * per `enforceBrowserCeiling` call, not once per evicted browser — they shut
+ * down in parallel and are waited on together.
+ *
+ * Half a second is enough for a Chromium that is going to exit at all, and short
+ * enough that a wedged one costs the command almost nothing. A browser that is
+ * merely SLOW (a heavy page's unload handlers) is simply not reported — the
+ * eviction still happened, so this trades a false negative in the notice for a
+ * bounded delay, which is the right way round.
+ */
+const EVICT_EXIT_BUDGET_MS = 500
+const EVICT_POLL_MS = 50
+
+/** Take (and clear) the sessions the ceiling stopped for the current command. */
+export function takeEvictionNotice(): string[] {
+  const out = evictionNotice
+  evictionNotice = []
+  return out
+}
+
+/**
+ * Stop the least-recently-used silver browsers until spawning one more stays
+ * within `resolveMaxBrowsers()`, machine-wide across every namespace.
+ *
+ * "Stop", not "reap": the browser is SIGTERMed but its session dir — profile,
+ * cookies, sidecars — is left exactly where it is. That is the whole reason a
+ * ceiling is safe to enforce automatically. `ensureConnected` already treats a
+ * dead pid as "respawn me", so an evicted session's next command brings the
+ * browser back with its logged-in profile intact; the only thing lost is the
+ * page's in-memory state, the same thing lost to a machine going to sleep.
+ * (`reapIdleSessions` deletes the dir — defensible for a session nobody has
+ * touched in a full idle TTL (`DEFAULT_SESSION_IDLE_MS`, 30 minutes), far too
+ * destructive for one being pushed out by load.)
+ *
+ * NEVER stops: a hands-off session (see `isHandsOffSession` — an `external`
+ * browser we do not own, or a `headed` one someone is watching), a session whose
+ * lockfile shows a LIVE holder (a command is mid-flight — see `isSessionBusy`),
+ * or `exclude` (the caller's own session, mid-open). If everything over the cap
+ * is busy, nothing is stopped and the spawn proceeds: a real command in flight
+ * outranks a memory target. Returns the stopped sessions, namespace-qualified —
+ * only the ones OBSERVED to have exited, never the ones merely signalled.
+ */
+export async function enforceBrowserCeiling(exclude?: string): Promise<string[]> {
+  const cap = resolveMaxBrowsers()
+  if (cap <= 0) return []
+  const activeNs = currentNamespace()
+  const live: Array<{ key: string; dir: string; pid: number; idle: number }> = []
+  for (const s of await discoverAllSessions()) {
+    if (exclude !== undefined && s.name === exclude && s.ns === activeNs) continue
+    let info: SessionInfo
+    try {
+      info = await readSidecarObject<SessionInfo>(path.join(s.dir, 'session.json'))
+    } catch {
+      continue // no/corrupt sidecar — `session gc`'s problem, not the ceiling's
+    }
+    // See `isHandsOffSession` for the shared invariant. The site-specific part:
+    // this mechanism fires because SOMEBODY ELSE wants memory right now, which is
+    // evidence about the fleet and none whatever about whether a person is looking
+    // at this window. Worse, a watched window is by construction the most IDLE
+    // session on the machine — nobody issues commands against a page they are
+    // reading — so LRU reached it FIRST, and the cap took the one window a human
+    // had open along with whatever was in it (a half-filled form, a scroll
+    // position).
+    //
+    // The cost is real and accepted: a fleet that leaves headed sessions open can
+    // hold the machine above the cap, because the ceiling has nothing left it may
+    // stop. Same trade `isSessionBusy` already makes — a command in flight
+    // outranks a memory target, and a headed window is a HUMAN in flight.
+    if (isHandsOffSession(info) || !isPidAlive(info.pid)) continue
+    live.push({ key: s.key, dir: s.dir, pid: info.pid, idle: idleMsOf(info) })
+  }
+  // The caller is about to spawn one more, so the budget for everyone else is
+  // cap - 1. A cap of 1 therefore means "one browser at a time", not zero.
+  const over = live.length - (cap - 1)
+  if (over <= 0) return []
+  live.sort((a, b) => b.idle - a.idle) // most-idle first: LRU eviction
+
+  // PHASE 1 — signal, at most `over` of them.
+  //
+  // The SIGTERM is what costs a session its page, so the SIGTERM is what counts
+  // against `over`. Counting CONFIRMED EXITS instead is a real bug that shipped
+  // here: a healthy browser that took longer than the budget to shut down fell
+  // through to the next candidate and got it killed too, so a cap needing one
+  // eviction stopped two browsers and reported neither. Nothing below this loop
+  // sends a signal, which is what makes the bound checkable.
+  const signalled: Array<{ key: string; pid: number }> = []
+  for (const cand of live) {
+    if (signalled.length >= over) break
+    if (await isSessionBusy(cand.dir)) continue
+    try {
+      process.kill(cand.pid, 'SIGTERM')
+    } catch {
+      continue // already gone between the liveness check and here: no signal, no cost
+    }
+    signalled.push({ key: cand.key, pid: cand.pid })
+  }
+
+  // PHASE 2 — confirm, under ONE budget shared by all of them.
+  //
+  // `process.kill` reports that the signal was DELIVERED, not that anything died:
+  // a Chromium wedged in a `beforeunload` handler survives it. Reporting on
+  // delivery told the host memory was freed that is still held, so a browser is
+  // claimed only once its pid is observed gone. The budget is shared because the
+  // browsers are shutting down in PARALLEL — waiting on each in turn would
+  // multiply this delay on the `open` path by the number evicted.
+  //
+  // A survivor is dropped from the report, NOT escalated. SIGKILL cannot be
+  // ignored, so escalating would make every candidate "succeed" — the same false
+  // report with extra steps — and it orphans the renderers (see
+  // `killProcessGroup`), the leak this whole area exists to stop; it also breaks
+  // the "SIGTERM, keep the profile" posture that makes automatic eviction safe.
+  // The cost of dropping it is a cap left unmet by one browser, which is the
+  // cheaper error: the alternative is to keep killing until something dies, and
+  // the ceiling is not worth an unbounded body count.
+  const deadline = Date.now() + EVICT_EXIT_BUDGET_MS
+  while (Date.now() < deadline && signalled.some((s) => isPidAlive(s.pid))) {
+    await delay(EVICT_POLL_MS)
+  }
+  return signalled.filter((s) => !isPidAlive(s.pid)).map((s) => s.key)
 }
 
 /**
@@ -1669,13 +2020,111 @@ export async function connect(name: string): Promise<Connection> {
   // calls `open` again, so the last browsers were never reclaimed. Every command
   // sweeps now, throttled so the cost is amortized to ~nothing.
   await maybeSweepIdleSessions(name)
-  // Deterministic viewport (P0-8); best-effort over a CDP-connected page.
-  await page.setViewportSize({ width: VIEWPORT.width, height: VIEWPORT.height }).catch(() => {})
+  // Deterministic viewport (P0-8); best-effort over a CDP-connected page — but
+  // only where claiming it is TRUE. See `shouldEmulateViewport`: unconditionally
+  // this made a headed browser report a window with no chrome (an automation
+  // tell), and resized the user's own window on every command in a `connect`ed
+  // one. A persisted `set viewport` still applies afterwards via applyEmulation,
+  // so a host that explicitly wants a fixed size in a headed session still gets it.
+  if (shouldEmulateViewport(info)) {
+    await page.setViewportSize({ width: VIEWPORT.width, height: VIEWPORT.height }).catch(() => {})
+  }
   // S2: re-arm the CDP Fetch-layer subresource egress guard on EVERY connect (the
   // per-command reconnect model means it must be re-enabled each time). Never
   // blocks the connect itself — a failure to arm is swallowed.
   await enableFetchEgressGuard(context, fetchEgressPolicy).catch(() => {})
-  return { browser, context, page }
+  return { browser, context, page, info }
+}
+
+/**
+ * Freeze every page in a browser silver OWNS, right before dropping the CDP
+ * transport at the end of a command.
+ *
+ * Silver is command-scoped: `connect` → act → disconnect, and between commands
+ * NOBODY is looking at the page. A headless Chromium disagrees — it has no
+ * occluded windows, so every page it holds is "visible" and keeps its
+ * `requestAnimationFrame` loop, its timers and its compositor running at full
+ * rate for as long as the daemon lives. Measured on one canvas-animating page
+ * per browser, three browsers, nothing driving them: 48.6% of a CPU sustained,
+ * which is what an agent's parked sessions were quietly costing the machine.
+ * The same three, parked: 3.9%.
+ *
+ * `Page.setWebLifecycleState('frozen')` is Chromium's own Page Lifecycle
+ * transition (the one it applies to a backgrounded tab): task queues stop,
+ * state is kept. Attaching over CDP resumes the page — Playwright's connect
+ * re-focuses it — so a later command finds it running again with no
+ * bookkeeping of ours to get wrong. Parking is therefore invisible except in
+ * the CPU graph, and a page that never gets another command simply stays
+ * asleep instead of burning a core until the idle reaper arrives.
+ *
+ * NEVER parks a hands-off session (see `isHandsOffSession`): freezing one would
+ * stop something in front of someone's eyes. The mildest of the four refusals —
+ * this one is undone by the next command's `unparkPage` — and still correct.
+ * Best-effort throughout; a page that cannot be frozen is left running rather
+ * than failing the command that just succeeded.
+ */
+export async function parkPages(conn: Connection): Promise<void> {
+  if (!parkingEnabled()) return
+  if (isHandsOffSession(conn.info)) return
+  const pages = conn.context.pages()
+  await Promise.all(
+    pages.map(async (page) => {
+      let cdp: import('playwright').CDPSession
+      try {
+        cdp = await conn.context.newCDPSession(page)
+      } catch {
+        return // page/target already gone
+      }
+      try {
+        await cdp.send('Page.setWebLifecycleState', { state: 'frozen' })
+      } catch {
+        /* a page that refuses to freeze (mid-navigation, crashed) keeps running */
+      }
+      await cdp.detach().catch(() => {})
+    }),
+  )
+}
+
+/**
+ * Is page parking on? `SILVER_NO_PARK=1` turns it off.
+ *
+ * The escape hatch exists for the one case parking genuinely changes: a page
+ * that must keep working while silver is NOT attached — a long poll the agent
+ * intends to leave running between commands, a socket the server drops if it
+ * goes quiet. Everything else only notices the CPU it stopped spending.
+ */
+function parkingEnabled(): boolean {
+  const raw = process.env.SILVER_NO_PARK?.trim()
+  return !(raw === '1' || raw === 'true')
+}
+
+/**
+ * Wake a parked page for the duration of a command — the inverse of `parkPages`.
+ *
+ * Attaching over CDP already resumes a frozen page in practice, but that is
+ * Playwright's side effect rather than a contract, and a verb that silently
+ * hangs because a future version stopped doing it is the worst failure this
+ * change could have. So the wake-up is stated. One CDP round-trip on the ONE
+ * page the command is about to drive, never the whole tab strip.
+ *
+ * The wake lasts as long as the transport does, which is exactly one command:
+ * measured, a page frozen once runs normally while silver is attached (30
+ * frames painted inside a 500ms in-command wait) and settles back to frozen
+ * when the transport drops. Chromium's asymmetry, and a convenient one — a
+ * parked session needs no re-parking bookkeeping, only a wake on the way in.
+ * The flip side is that `SILVER_NO_PARK=1` cannot revive a session that was
+ * already parked; it has to be set for the run that OPENS the session (or the
+ * session closed and reopened, which spawns a browser that never froze).
+ */
+export async function unparkPage(context: BrowserContext, page: Page): Promise<void> {
+  let cdp: import('playwright').CDPSession
+  try {
+    cdp = await context.newCDPSession(page)
+  } catch {
+    return
+  }
+  await cdp.send('Page.setWebLifecycleState', { state: 'active' }).catch(() => {})
+  await cdp.detach().catch(() => {})
 }
 
 /**
