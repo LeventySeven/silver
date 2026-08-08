@@ -414,22 +414,24 @@ async function applyEmulation(
   secrets: SecretRegistry,
 ): Promise<void> {
   const emu = await loadEmulation(name)
-  // Clear the media emulation Playwright imposes UNASKED before anything else.
+  // Nothing to re-apply. Note this returns BEFORE any emulateMedia call, which is
+  // deliberate: undoing the media emulation Playwright imposes unasked
+  // (`colorScheme: 'light'` and friends, pushed to every page by `connectOverCDP`)
+  // is NOT this function's job and no longer happens here.
   //
-  // `connectOverCDP` applies Playwright's context defaults to the pages it drives
-  // — `colorScheme: 'light'`, `reducedMotion: 'no-preference'`, `forcedColors:
-  // 'none'` — even though silver never requested them. On a browser silver owns
-  // that is invisible; on the user's REAL browser it is not: their pages flipped
-  // to light for the duration of every command and back to dark on disconnect, so
-  // a working agent made the whole browser strobe. Measured on this machine:
-  // system Dark, raw CDP reports `dark`, the same page through Playwright reports
-  // `light`.
+  // It moved to `connect()` in session.ts, which does a strictly better thing:
+  // it probes the browser's REAL scheme over raw CDP *before* Playwright attaches
+  // and overwrites the answer, then asserts that value back onto the open pages.
+  // Clearing the override with `null` could only say "stop lying"; connect() can
+  // say what the truth actually was, which is the only way to put a user's dark
+  // browser back to dark after we made it flash light.
   //
-  // It is also an authenticity tell — a browser insisting it prefers light while
-  // the OS is in dark mode is exactly the kind of mismatch fingerprinting looks
-  // for. `null` disables the override and restores what the browser actually
-  // reports. Done unconditionally so a session that never set anything behaves
-  // like an ordinary browser; a persisted override below then re-applies on top.
+  // Scoped to `external` sessions there, and that scope is the whole point rather
+  // than an oversight: the cost being paid for is a human watching their own
+  // browser strobe once per command. On a browser silver owns there is no such
+  // human, and clearing is measurably a no-op — a headless Chromium we launched
+  // reports `light` both with Playwright's override in force and after `null`
+  // clears it, so there is no mismatch left for a fingerprinter to read either.
   if (!emu) return
   if (emu.viewport) await page.setViewportSize(emu.viewport).catch(() => {})
   if (emu.colorScheme) await page.emulateMedia({ colorScheme: emu.colorScheme }).catch(() => {})
